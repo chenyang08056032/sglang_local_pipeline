@@ -48,9 +48,9 @@ class DockerConfig:
 
 @dataclass
 class PrepareConfig:
-    pull_image: bool = True
-    clone_repo: bool = True
-    fetch: bool = True
+    """节点准备。online=true 需节点可达 registry/git remote;
+    false 则完全使用节点现状 (镜像/代码已手动就位, 不联网不动代码)。"""
+    online: bool = True
 
 
 @dataclass
@@ -101,15 +101,10 @@ def load_config(path):
         net=docker_raw.get("net", "host"),
         shm_size=docker_raw.get("shm_size", "16g"),
     )
-    prep_raw = run_raw.get("prepare", {})
-    prepare = PrepareConfig(
-        pull_image=prep_raw.get("pull_image", True),
-        clone_repo=prep_raw.get("clone_repo", True),
-        fetch=prep_raw.get("fetch", True),
-    )
+    prepare = PrepareConfig(online=run_raw.get("prepare", True))
     git_remote = run_raw.get("code", {}).get("git_remote")
-    if prepare.clone_repo and not git_remote:
-        raise ValueError("prepare.clone_repo 为 true 时必须配置 run.code.git_remote")
+    if prepare.online and not git_remote:
+        raise ValueError("联网模式 (prepare: true) 必须配置 run.code.git_remote")
 
     run = RunConfig(
         workspace=run_raw["workspace"],
@@ -146,6 +141,10 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    print(f"[配置] {args.config}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
+          f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
+          f"repo={cfg.run.repo}")
+    print(f"[配置] 镜像: {cfg.run.docker.image}")
 
     if args.suite:
         names = set(args.suite)
@@ -153,6 +152,7 @@ def main():
         if not cfg.suites:
             print(f"[错误] 没有匹配的用例: {', '.join(names)}")
             return 2
+        print(f"[过滤] --suite 命中 {len(cfg.suites)} 个用例: {', '.join(s.name for s in cfg.suites)}")
 
     run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(cfg.output_dir, run_id)
@@ -176,6 +176,7 @@ def main():
     for i, suite in enumerate(cfg.suites):
         print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
         if not prepared.get(suite.node):
+            print(f"[错误] 节点 {suite.node} 未就绪, {suite.name} 记为 error 不执行")
             res = {"name": suite.name, "type": suite.type, "node": suite.node,
                    "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "duration_sec": 0, "error": "节点准备失败, 未执行"}
@@ -190,6 +191,7 @@ def main():
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
+        print(f"[结果] {suite.name}: {res['status']} (详情: {p})")
 
     # 汇总
     passed = [r for r in results if r["status"] == "pass"]

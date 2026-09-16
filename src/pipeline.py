@@ -5,6 +5,7 @@
 """
 
 import os
+import shlex
 import socket
 import subprocess
 import time
@@ -27,12 +28,12 @@ def _local_ips():
     ips = {"127.0.0.1", "localhost", "::1"}
     try:
         ips.add(socket.gethostbyname(socket.gethostname()))
-    except (socket.gaierror, Exception):
+    except Exception:
         pass
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
             ips.add(info[4][0])
-    except (socket.gaierror, Exception):
+    except Exception:
         pass
     return ips
 
@@ -104,39 +105,55 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
     return rc
 
 
-def prepare_node(cfg, node, dry_run=False):
-    """执行前准备一个节点: 镜像就位 + 代码就位 + 切到目标 ref。返回 True=就绪。
+def _log(msg):
+    """带时间戳的流水线日志。"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
-    需要节点网络可达 (docker registry / git remote), 代理由节点环境预置。
+
+def prepare_node(cfg, node, dry_run=False):
+    """执行前准备一个节点。online=true: 镜像/代码自动就位+切到目标 ref;
+    false: 完全使用节点现状 (离线模式, 镜像/代码已手动准备好)。
+
+    online 模式需节点网络可达 (docker registry / git remote), 代理由节点环境预置。
     """
     repo = cfg.run.repo
-    p = cfg.run.prepare
+    where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
     lines = ["set -e"]
-    if p.pull_image:
-        lines.append(f"docker image inspect {cfg.run.docker.image} >/dev/null 2>&1 "
-                     f"|| docker pull {cfg.run.docker.image}")
-    if p.clone_repo:
-        remote = cfg.run.git_remote
-        # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
-        lines.append(
-            f"if [ -d {repo}/.git ]; then\n"
-            f"  cd {repo}\n"
-            f"  [ \"$(git remote get-url origin)\" = '{remote}' ] || git remote set-url origin '{remote}'\n"
-            f"  cd - >/dev/null\n"
-            f"else\n"
-            f"  git clone {remote} {repo}\n"
-            f"fi"
-        )
-    if p.fetch:
-        # fetch 只更新 origin/* 指针; checkout 切版本; 分支还需 reset --hard 对齐远端
-        # (否则本地分支停在旧提交, checkout 到的是旧代码)。tag/commit 不 reset。
-        lines.append(f"cd {repo} && git fetch origin --tags --force")
-        lines.append(f"git checkout --force {cfg.run.ref}")
-        lines.append(f"if git show-ref --verify --quiet refs/remotes/origin/{cfg.run.ref}; then "
-                     f"git reset --hard origin/{cfg.run.ref}; fi")
-    else:
-        lines.append(f"cd {repo} && git checkout --force {cfg.run.ref}")
+    if not cfg.run.prepare.online:
+        # 离线: 不 pull / 不 clone / 不 fetch / 不 checkout
+        _log(f"[prepare] {where} 离线模式: 跳过镜像/代码准备, 直接使用节点现状")
+        _log(f"[prepare] repo={repo} (请自行确认代码已就位)")
+        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+        _log(f"[prepare] {where} 就绪 (rc={rc})")
+        return rc == 0
+    remote = cfg.run.git_remote
+    # 镜像不存在才 pull
+    _log(f"[prepare] {where} 检查镜像 (不存在则 pull): {cfg.run.docker.image}")
+    lines.append(f"docker image inspect {cfg.run.docker.image} >/dev/null 2>&1 "
+                 f"|| docker pull {cfg.run.docker.image}")
+    # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
+    _log(f"[prepare] {where} 确保仓库就位: {repo} (remote={remote})")
+    lines.append(
+        f"if [ -d {repo}/.git ]; then\n"
+        f"  cd {repo}\n"
+        f"  [ \"$(git remote get-url origin)\" = '{remote}' ] || git remote set-url origin '{remote}'\n"
+        f"  cd - >/dev/null\n"
+        f"else\n"
+        f"  git clone {remote} {repo}\n"
+        f"fi"
+    )
+    # fetch 只更新 origin/* 指针; checkout 切版本; 分支还需 reset --hard 对齐远端
+    # (否则本地分支停在旧提交, checkout 到的是旧代码)。tag/commit 不 reset。
+    _log(f"[prepare] {where} git fetch + checkout {cfg.run.ref}")
+    lines.append(f"cd {repo} && git fetch origin --tags --force")
+    lines.append(f"git checkout --force {cfg.run.ref}")
+    lines.append(f"if git show-ref --verify --quiet refs/remotes/origin/{cfg.run.ref}; then "
+                 f"git reset --hard origin/{cfg.run.ref}; fi")
     rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    if rc == 0:
+        _log(f"[prepare] {where} 就绪: 镜像+代码已对齐 ref={cfg.run.ref}")
+    else:
+        _log(f"[prepare] {where} 失败 (rc={rc}), 详见上方节点输出")
     return rc == 0
 
 
@@ -184,7 +201,9 @@ def _build_cmd(cfg, suite, node, node_run_dir):
         "-v", f"{node_run_dir}/plog:/root/ascend/log",
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
 
-    env_args = [v for k, val in cfg.run.env.items() for v in ("-e", f"{k}={val}")]
+    # shlex.quote: 值含空格等 shell 特殊字符时自动加引号, 保证 " ".join 后不被拆断
+    env_args = [v for k, val in cfg.run.env.items()
+                for v in ("-e", f"{k}={shlex.quote(str(val))}")]
 
     inner_escaped = inner.replace("'", "'\"'\"'")
     docker_args = (["docker", "run", "--rm", "--privileged",
@@ -217,17 +236,34 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
               "duration_sec": 0, "error": None}
     node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}"
     local_suite_dir = os.path.join(local_run_dir, suite.name)
+    where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
 
     tic = time.perf_counter()
     try:
         cmd = _build_cmd(cfg, suite, node, node_run_dir)
+        _log(f"[execute] {suite.name} @ {where} 启动容器 "
+             f"(超时={suite.timeout_minutes or '无'}分钟, 节点输出目录={node_run_dir})")
         rc = ssh_run(node, cmd, log_path=os.path.join(local_suite_dir, "suite.log"), dry_run=dry_run)
         result["status"] = "pass" if rc == 0 else "fail"
         result["error"] = None if rc == 0 else f"exit code {rc}"
+        dur = round(time.perf_counter() - tic, 1)
+        if rc == 0:
+            _log(f"[execute] {suite.name} 容器正常结束 (rc=0, 耗时 {dur}s)")
+        elif dry_run:
+            _log(f"[execute] {suite.name} dry-run 完成命令打印")
+        else:
+            _log(f"[execute] {suite.name} 容器异常结束 (rc={rc}, 耗时 {dur}s), "
+                 f"日志: {local_suite_dir}/suite.log")
         if not dry_run:
-            ssh_fetch_dir(node, node_run_dir, local_suite_dir)
+            _log(f"[fetch] {suite.name} 拉回节点产物: {node_run_dir} -> {local_suite_dir}")
+            frc = ssh_fetch_dir(node, node_run_dir, local_suite_dir)
+            if frc == 0:
+                _log(f"[fetch] {suite.name} 拉回完成 (suite.log/case.log + tmp/ + plog/)")
+            else:
+                _log(f"[fetch] {suite.name} 拉回失败 (rc={frc}), 结果目录可能不完整")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
+        _log(f"[execute] {suite.name} 流水线异常: {type(e).__name__}: {e}")
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
     return result

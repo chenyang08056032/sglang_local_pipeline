@@ -52,10 +52,8 @@ run:
     repo: /root/.cache/sglang           # 节点上的 sglang 源码路径
     git_remote: https://github.com/sgl-project/sglang.git   # clone 来源
     ref: main                           # 目标版本: 分支名 / tag / commit SHA
-  prepare:                              # 执行前每节点自动准备一次
-    pull_image: true                    # 镜像不存在则 docker pull
-    clone_repo: true                    # 仓库不存在则 clone（clone_repo 为 true 时必须配 git_remote）
-    fetch: true                         # 每次 run 前 git fetch 测最新代码
+  prepare: true                         # true=联网: 镜像 pull + 代码 clone/fetch/checkout
+                                        # false=离线: 镜像/代码已手动就位, 不联网不动代码
   docker:
     image: <镜像地址>                    # 测试容器镜像
     devices: auto                       # auto=按节点 npus 映射; 或列表 [0,1,2,3]
@@ -251,7 +249,7 @@ output:
 不会。`prepare` 阶段会 `git remote set-url` 切到新 remote 再 fetch；分支用 `reset --hard origin/{ref}` 对齐，只影响当前 checkout 的分支，不影响其他本地分支。
 
 **Q: 节点无法访问 GitHub / 镜像仓库怎么办？**
-节点预配代理；或提前手动 `git clone` + `docker pull`，配置里 `prepare` 各项设为 `false`（fetch=false 时仅 checkout，不再联网）。
+节点预配代理；或用离线模式：提前手动 `git clone` + `docker pull`，配置里 `prepare: false`——pipeline 不联网、不动代码，完全使用节点现状。
 gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前放到节点 `~/.cache/modelscope/hub/datasets/tmp/test.jsonl`，perf 套件的 ShareGPT 数据集放 `~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json`——容器启动时会自动拷入 /tmp（缓存缺失则忽略，回退在线下载）。
 
 **Q: 如何测某个特定 commit？**
@@ -261,7 +259,7 @@ gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前放到节点
 能，但用例跑在容器里，文件必须在容器可见的挂载内。最简单的做法：把用例放到节点的 `~/.cache/` 下（随模型缓存挂载进容器），然后 `file` 配绝对路径，如 `/root/.cache/my_tests/test_foo.py`。其他节点路径（如 `/data/...`）容器内不可见，会报 `No such file or directory`。
 
 **Q: 需要登录的私有镜像？**
-在节点上提前 `docker login`，`prepare.pull_image` 保持 true 即可 pull。
+在节点上提前 `docker login`，`prepare: true` 即可 pull。
 
 **Q: 只想看会执行什么命令？**
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。

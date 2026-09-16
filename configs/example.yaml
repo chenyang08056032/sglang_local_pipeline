@@ -7,10 +7,8 @@ run:
     repo: /root/.cache/sglang           # 节点上的 sglang 源码
     git_remote: https://github.com/sgl-project/sglang.git   # clone 用, 节点需配好网络/代理
     ref: main
-  prepare:                              # 节点自动准备 (执行前每节点一次)
-    pull_image: true                    # 镜像不存在则 docker pull
-    clone_repo: true                    # 仓库不存在则 git clone
-    fetch: true                         # 每次 run 前 git fetch (测最新代码)
+  prepare: true                           # true=联网: 镜像不存在则 pull, 代码 clone/fetch/checkout
+                                          # false=离线: 镜像和代码已手动就位, 不联网不动代码
   docker:
     # 官方: quay.io/ascend/sglang:main-cann9.0.0-a3 (每日构建)
     #       quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16 (稳定版)
