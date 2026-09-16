@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""SSH 远程执行 + 单机用例执行器。
+
+执行链: SSH 到节点 → git checkout → docker run → 容器内跑 run_suite.py / 用例文件 → 拉回日志
+"""
+
+import os
+import subprocess
+import time
+
+_MGMT_DEVICES = ["/dev/davinci_manager", "/dev/hisi_hdc"]
+
+# A3 节点标准挂载 (宿主机:容器), 与运维手册的 docker run 命令保持一致
+_NODE_MOUNTS = [
+    "/usr/local/sbin:/usr/local/sbin",
+    "/usr/local/Ascend/driver:/usr/local/Ascend/driver",
+    "/usr/local/Ascend/firmware:/usr/local/Ascend/firmware",
+    "/etc/ascend_install.info:/etc/ascend_install.info",
+    "/var/queue_schedule:/var/queue_schedule",
+    "$HOME/.cache:/root/.cache",  # 模型缓存复用, 避免每次容器重复下载
+]
+
+
+def ssh_run(node, command, log_path=None, dry_run=False):
+    """SSH 远程执行, 实时回显 + 写日志。"""
+    if dry_run:
+        print(f"[dry-run] {node.user}@{node.host}:{node.port}$ {command}")
+        return 0
+    proc = subprocess.Popen(
+        ["ssh", "-p", str(node.port), f"{node.user}@{node.host}", command],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="ignore", bufsize=1,
+    )
+    log_f = None
+    if log_path:
+        # 先建目录再打开文件 (调用方不保证父目录已存在)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        log_f = open(log_path, "a", encoding="utf-8", errors="ignore")
+    try:
+        for line in proc.stdout:
+            print(line, end="")
+            if log_f:
+                log_f.write(line)
+                log_f.flush()
+    finally:
+        if log_f:
+            log_f.close()
+        proc.wait()
+    return proc.returncode
+
+
+def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
+    """tar 管道拉回远端目录。"""
+    if dry_run:
+        print(f"[dry-run] fetch {node.host}:{remote_dir} -> {local_dir}")
+        return 0
+    os.makedirs(local_dir, exist_ok=True)
+    pull = subprocess.Popen(
+        ["ssh", "-p", str(node.port), f"{node.user}@{node.host}",
+         f"tar czf - -C '{remote_dir}' ."],
+        stdout=subprocess.PIPE,
+    )
+    extract = subprocess.Popen(["tar", "xzf", "-", "-C", local_dir], stdin=pull.stdout)
+    pull.stdout.close()
+    rc = extract.wait()
+    pull.wait()
+    return rc
+
+
+def prepare_node(cfg, node, dry_run=False):
+    """执行前准备一个节点: 镜像就位 + 代码就位 + 切到目标 ref。返回 True=就绪。
+
+    需要节点网络可达 (docker registry / git remote), 代理由节点环境预置。
+    """
+    repo = cfg.run.repo
+    p = cfg.run.prepare
+    lines = ["set -e"]
+    if p.pull_image:
+        lines.append(f"docker image inspect {cfg.run.docker.image} >/dev/null 2>&1 "
+                     f"|| docker pull {cfg.run.docker.image}")
+    if p.clone_repo:
+        remote = cfg.run.git_remote
+        # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
+        lines.append(
+            f"if [ -d {repo}/.git ]; then\n"
+            f"  cd {repo}\n"
+            f"  [ \"$(git remote get-url origin)\" = '{remote}' ] || git remote set-url origin '{remote}'\n"
+            f"  cd - >/dev/null\n"
+            f"else\n"
+            f"  git clone {remote} {repo}\n"
+            f"fi"
+        )
+    if p.fetch:
+        # fetch 只更新 origin/* 指针; checkout 切版本; 分支还需 reset --hard 对齐远端
+        # (否则本地分支停在旧提交, checkout 到的是旧代码)。tag/commit 不 reset。
+        lines.append(f"cd {repo} && git fetch origin --tags --force")
+        lines.append(f"git checkout --force {cfg.run.ref}")
+        lines.append(f"if git show-ref --verify --quiet refs/remotes/origin/{cfg.run.ref}; then "
+                     f"git reset --hard origin/{cfg.run.ref}; fi")
+    else:
+        lines.append(f"cd {repo} && git checkout --force {cfg.run.ref}")
+    rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    return rc == 0
+
+
+def _build_cmd(cfg, suite, node, node_run_dir):
+    """构造节点上执行的完整命令。"""
+    repo = cfg.run.repo
+    d = cfg.run.docker
+
+    # 容器内命令
+    parts = ["set -euo pipefail"]
+    # 覆盖镜像内 ascend 工具 (学 CI nightly 做法)
+    parts.append(
+        f"cp -r {repo}/python/sglang/test/ascend/* "
+        f"$(python3 -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')/test/ascend/"
+    )
+    # 预置 gsm8k / ShareGPT 数据集 (与 CI 一致): /tmp 每次全新挂载, 不预置则会
+    # 重复下载 (gsm8k) 或 perf 套件找不到数据; 缓存缺失时忽略, 走在线下载
+    for f in ("tmp/test.jsonl",
+              "otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"):
+        parts.append(f"cp '/root/.cache/modelscope/hub/datasets/{f}' /tmp/ 2>/dev/null || true")
+    if suite.type == "suite":
+        cmd = (f"cd {repo}/test && python3 -u run_suite.py --hw npu --suite {suite.name} "
+               f"--timeout-per-file {suite.timeout_per_file}"
+               + (" --nightly --continue-on-error" if suite.nightly else ""))
+        log_file = "suite.log"
+    else:  # file
+        cmd = f"cd {repo} && python3 -u {suite.file} -f"
+        log_file = "case.log"
+    parts.append(f"{cmd} 2>&1 | tee /output/{log_file}")
+
+    inner = "\n".join(parts)
+
+    # docker run 参数
+    ids = range(node.npus) if d.devices == "auto" else d.devices
+    device_args = []
+    for i in ids:
+        device_args += ["--device", f"/dev/davinci{i}"]
+    for dev in _MGMT_DEVICES:
+        device_args += ["--device", dev]
+
+    mount_args = [
+        "-v", f"{repo}:{repo}",
+        "-v", f"{node_run_dir}:/output",
+        "-v", f"{node_run_dir}/tmp:/tmp",
+        "-v", f"{node_run_dir}/plog:/root/ascend/log",
+    ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
+
+    env_args = [v for k, val in cfg.run.env.items() for v in ("-e", f"{k}={val}")]
+
+    inner_escaped = inner.replace("'", "'\"'\"'")
+    docker_args = (["docker", "run", "--rm", "--privileged",
+                    "--net", d.net, "--ipc", "host",
+                    "--shm-size", d.shm_size,
+                    "--name", f"sgl-pipeline-{suite.name}"]
+                   + device_args + mount_args + env_args
+                   + [d.image, "bash", "-c", f"'{inner_escaped}'"])
+
+    # 宿主机命令 (镜像/代码/版本由 prepare_node 提前保证)
+    lines = [
+        "set -e",
+        f"mkdir -p {node_run_dir}/tmp {node_run_dir}/plog",
+        # 清理残留同名容器: 上次 timeout 杀掉 docker 客户端后容器不会自停,
+        # 不清理则本次 docker run 因 --name 冲突直接失败
+        f"docker rm -f sgl-pipeline-{suite.name} >/dev/null 2>&1 || true",
+    ]
+    if suite.timeout_minutes:
+        # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
+        lines.append(f"timeout -k 60 {int(suite.timeout_minutes) * 60} " + " ".join(docker_args))
+    else:
+        lines.append(" ".join(docker_args))
+    return "\n".join(lines)
+
+
+def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
+    """执行一个单机用例, 返回结果 dict。"""
+    result = {"name": suite.name, "type": suite.type, "node": node.host,
+              "status": "fail", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+              "duration_sec": 0, "error": None}
+    node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}"
+    local_suite_dir = os.path.join(local_run_dir, suite.name)
+
+    tic = time.perf_counter()
+    try:
+        cmd = _build_cmd(cfg, suite, node, node_run_dir)
+        rc = ssh_run(node, cmd, log_path=os.path.join(local_suite_dir, "suite.log"), dry_run=dry_run)
+        result["status"] = "pass" if rc == 0 else "fail"
+        result["error"] = None if rc == 0 else f"exit code {rc}"
+        if not dry_run:
+            ssh_fetch_dir(node, node_run_dir, local_suite_dir)
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = f"{type(e).__name__}: {e}"
+    result["duration_sec"] = round(time.perf_counter() - tic, 1)
+    return result

@@ -1,0 +1,53 @@
+# sglang 本地流水线配置
+# 用法: python3 src/run.py --config configs/example.yaml
+
+run:
+  workspace: /root/sglang_local_pipeline   # 节点上的工作目录
+  code:
+    repo: /root/.cache/sglang           # 节点上的 sglang 源码
+    git_remote: https://github.com/sgl-project/sglang.git   # clone 用, 节点需配好网络/代理
+    ref: main
+  prepare:                              # 节点自动准备 (执行前每节点一次)
+    pull_image: true                    # 镜像不存在则 docker pull
+    clone_repo: true                    # 仓库不存在则 git clone
+    fetch: true                         # 每次 run 前 git fetch (测最新代码)
+  docker:
+    # 官方: quay.io/ascend/sglang:main-cann9.0.0-a3 (每日构建)
+    #       quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16 (稳定版)
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
+    devices: auto                       # auto=按 npus 映射; 或 [0,1,2,3]
+    net: host
+    shm_size: 16g                       # 固定加 --privileged --ipc=host (A3 标准参数)
+  env:
+    SGLANG_USE_MODELSCOPE: "true"
+    HF_ENDPOINT: https://hf-mirror.com
+    SGLANG_IS_IN_CI: "true"
+    TORCH_EXTENSIONS_DIR: /tmp/torch_extensions   # 与 CI 一致, 编译缓存落在挂载的 /tmp
+    PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+    STREAMS_PER_DEVICE: "32"
+
+nodes:
+  - host: 192.168.10.1            # A3
+    user: root
+    port: 22
+    npus: 16
+  - host: 192.168.10.2            # A5
+    user: root
+    port: 22
+    npus: 8
+
+suites:
+  - name: full-1-npu-a3                 # 复用 CI 套件, 容器内跑 run_suite.py
+    type: suite
+    node: 192.168.10.1
+    nightly: true
+    timeout_per_file: 3600
+
+  - name: qwen3-32b-gsm8k              # 直接跑单个用例文件
+    type: file
+    node: 192.168.10.1
+    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
+    timeout_minutes: 120
+
+output:
+  dir: results                             # 执行机上的结果目录（与节点的 runs/ 分开，避免同机冲突）
