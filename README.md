@@ -1,6 +1,6 @@
 # sglang 本地测试流水线使用指导
 
-在没有 CI / k8s 的物理服务器（NPU 环境）上批量执行 sglang 测试用例的轻量工具。复用 CI 的容器内测试逻辑（`run_suite.py`、ascend 工具覆盖），只自研本地必需的 SSH 编排 + docker run 两个环节。
+在没有 CI / k8s 的物理服务器（NPU 环境）上批量执行 sglang 测试用例的轻量工具。复用 CI 的容器内测试逻辑（`run_suite.py`、ascend 工具覆盖），只自研本地必需的节点编排 + docker run 两个环节。
 
 ## 1. 目录结构
 
@@ -8,7 +8,7 @@
 sglang_local_pipeline/
 ├── src/
 │   ├── run.py          # 入口: 加载配置、节点准备、编排执行、汇总结果
-│   └── pipeline.py     # 核心: SSH 远程执行、节点准备、docker 命令构造、日志拉回
+│   └── pipeline.py     # 核心: 节点执行 (自动检测本地/SSH)、节点准备、docker 命令构造、日志拉回
 ├── configs/
 │   └── example.yaml    # 配置模板
 ├── README.md
@@ -23,18 +23,17 @@ sglang_local_pipeline/
 |---|---|
 | sglang_local_pipeline 代码 | clone 或拷贝本目录 |
 | Python 3 | 加 `pip install pyyaml`（唯一第三方依赖） |
-| ssh 客户端 + tar | Linux 自带 |
-| SSH 免密 | 已配置到所有节点的免密登录（见附录 A） |
-| 网络 | 可达各节点的 22 端口 |
+| ssh 客户端 + tar | 仅远程节点需要（本地节点直接 subprocess 执行，无需 ssh） |
+| 网络 | 远程节点需可达 22 端口 |
 
 执行机**不需要** Docker、NPU 驱动、git、sglang 仓库——这些全部在节点上。
-执行机也可以就是节点本身（如 A3 上直接跑，SSH 回环到自己）。
+执行机也可以就是节点本身（如 A3 上直接跑）：pipeline 自动检测节点 host 是否指向本机，是则直接本地执行（不走 SSH、无需免密配置、无需 sshd），否则走 SSH。
 
 ### 节点（A3 / A5 等目标机器）
 
 | 项目 | 要求 |
 |---|---|
-| SSH 免密 | 执行机可 `ssh root@<host>` 直连 |
+| SSH 免密 | 仅远程节点需要（本地节点=执行机时自动走 subprocess，无需 SSH） |
 | Docker | 已安装并运行 |
 | NPU 驱动 | 存在 `/usr/local/Ascend/driver`、`/usr/local/Ascend/firmware`、`/dev/davinci*`、`/dev/davinci_manager`、`/dev/hisi_hdc`、`/etc/ascend_install.info` |
 | 网络（可选） | 可达 docker registry 和 git remote（用于自动 pull / clone / fetch；离线时可提前手动准备） |

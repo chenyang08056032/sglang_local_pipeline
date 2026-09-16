@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""SSH 远程执行 + 单机用例执行器。
+"""节点执行器 (自动检测本地/远程)。
 
-执行链: SSH 到节点 → git checkout → docker run → 容器内跑 run_suite.py / 用例文件 → 拉回日志
+执行链: (本地直执 或 SSH) → git checkout → docker run → 容器内跑 run_suite.py / 用例文件 → 拉回日志
 """
 
 import os
+import socket
 import subprocess
 import time
 
@@ -21,16 +22,45 @@ _NODE_MOUNTS = [
 ]
 
 
+def _local_ips():
+    """收集本机所有 IP, 用于判断节点是否就是执行机本身。"""
+    ips = {"127.0.0.1", "localhost", "::1"}
+    try:
+        ips.add(socket.gethostbyname(socket.gethostname()))
+    except (socket.gaierror, Exception):
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            ips.add(info[4][0])
+    except (socket.gaierror, Exception):
+        pass
+    return ips
+
+
+def _is_local(node):
+    """节点 host 是否指向本机。"""
+    return node.host in _local_ips()
+
+
 def ssh_run(node, command, log_path=None, dry_run=False):
-    """SSH 远程执行, 实时回显 + 写日志。"""
+    """执行命令: 本机节点直接 subprocess, 远程走 SSH。实时回显 + 写日志。"""
+    local = _is_local(node)
     if dry_run:
-        print(f"[dry-run] {node.user}@{node.host}:{node.port}$ {command}")
+        tag = "local" if local else f"{node.user}@{node.host}:{node.port}"
+        print(f"[dry-run] {tag}$ {command}")
         return 0
-    proc = subprocess.Popen(
-        ["ssh", "-p", str(node.port), f"{node.user}@{node.host}", command],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, errors="ignore", bufsize=1,
-    )
+    if local:
+        proc = subprocess.Popen(
+            command, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="ignore", bufsize=1,
+        )
+    else:
+        proc = subprocess.Popen(
+            ["ssh", "-p", str(node.port), f"{node.user}@{node.host}", command],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="ignore", bufsize=1,
+        )
     log_f = None
     if log_path:
         # 先建目录再打开文件 (调用方不保证父目录已存在)
@@ -50,11 +80,18 @@ def ssh_run(node, command, log_path=None, dry_run=False):
 
 
 def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
-    """tar 管道拉回远端目录。"""
+    """拉回节点产物: 本机直接 cp, 远程走 tar 管道。"""
+    local = _is_local(node)
     if dry_run:
-        print(f"[dry-run] fetch {node.host}:{remote_dir} -> {local_dir}")
+        tag = "local" if local else node.host
+        print(f"[dry-run] fetch {tag}:{remote_dir} -> {local_dir}")
         return 0
     os.makedirs(local_dir, exist_ok=True)
+    if local:
+        return subprocess.run(
+            ["cp", "-r", f"{remote_dir}/.", local_dir],
+            stderr=subprocess.STDOUT,
+        ).returncode
     pull = subprocess.Popen(
         ["ssh", "-p", str(node.port), f"{node.user}@{node.host}",
          f"tar czf - -C '{remote_dir}' ."],
