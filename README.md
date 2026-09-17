@@ -1,6 +1,6 @@
 # sglang 本地测试流水线使用指导
 
-在没有 CI / k8s 的物理服务器（NPU 环境）上批量执行 sglang 测试用例的轻量工具。复用 CI 的容器内测试逻辑（`run_suite.py`、ascend 工具覆盖），只自研本地必需的节点编排 + docker run 两个环节。
+在没有 CI / k8s 的物理服务器（NPU 环境）上批量执行 sglang 测试用例的轻量工具。复用 CI 的 ascend 工具覆盖逻辑，只自研本地必需的节点编排 + docker run 两个环节。
 
 ## 1. 目录结构
 
@@ -43,7 +43,7 @@ sglang_local_pipeline/
 
 ## 3. 配置文件说明
 
-复制 `configs/example.yaml` 修改，各字段如下：
+复制 `configs/example.yaml` 修改。**下列字段均有代码默认值，不写即取默认**：`prepare=false`、`code.ref=main`、`docker.devices=auto`、`docker.net=host`、`docker.shm_size=16g`、`nodes[].user=root`、`nodes[].port=22`、`nodes[].npus=8`、`output.dir=results`。**`run.env` 也有内置默认值**（见下），通常无需在 YAML 里写出，仅当需要覆盖某项时才写 `run.env`。完整字段参考如下：
 
 ```yaml
 run:
@@ -51,15 +51,16 @@ run:
   code:
     repo: /root/.cache/sglang           # 节点上的 sglang 源码路径
     git_remote: https://github.com/sgl-project/sglang.git   # clone 来源
-    ref: main                           # 目标版本: 分支名 / tag / commit SHA
-  prepare: true                         # true=联网: 镜像 pull + 代码 clone/fetch/checkout
+    ref: main                           # 目标版本: 分支名 / tag / commit SHA (默认 main)
+  prepare: true                         # 默认 false (离线); true=联网: 镜像 pull + 代码 clone/fetch/checkout
                                         # false=离线: 镜像/代码已手动就位, 不联网不动代码
   docker:
     image: <镜像地址>                    # 测试容器镜像
-    devices: auto                       # auto=按节点 npus 映射; 或列表 [0,1,2,3]
-    net: host
-    shm_size: 16g                       # 固定附加 --privileged --ipc=host
-  env:                                  # 注入容器的环境变量
+    devices: auto                       # auto=按节点 npus 映射; 或列表 [0,1,2,3] (默认 auto)
+    net: host                           # 默认 host
+    shm_size: 16g                       # 默认 16g; 固定附加 --privileged --ipc=host
+  env:                                  # 注入容器的环境变量; 下列 6 项为内置默认, 通常省略;
+                                        # 仅当需覆盖某项或追加新键时才写 run.env (按 key 合并)
     SGLANG_USE_MODELSCOPE: "true"
     HF_ENDPOINT: https://hf-mirror.com
     SGLANG_IS_IN_CI: "true"
@@ -69,30 +70,22 @@ run:
 
 nodes:                                  # 所有可用节点
   - host: 192.168.10.1                  # A3
-    user: root
-    port: 22
-    npus: 16                            # NPU 卡数，devices=auto 时决定映射 /dev/davinci0..N-1
-  - host: 192.168.10.2                  # A5
-    user: root
-    port: 22
-    npus: 8
+    user: root                          # 默认 root
+    port: 22                            # 默认 22
+    npus: 16                            # NPU 卡数，devices=auto 时决定映射 /dev/davinci0..N-1 (默认 8)
+  - host: 192.168.10.2                  # A5 (user/port/npus 均取默认值时可整段省略, 仅留 host)
 
 suites:                                 # 要执行的用例，串行执行
-  - name: full-1-npu-a3                 # 复用 CI 套件，容器内跑 run_suite.py
-    type: suite
+  - name: qwen3-32b-gsm8k               # 用例名称 (--suite 过滤用)
     node: 192.168.10.1                  # 在哪个节点执行
-    nightly: true                       # 透传 run_suite.py --nightly --continue-on-error
-    timeout_per_file: 3600              # 透传 run_suite.py --timeout-per-file
-
-  - name: qwen3-32b-gsm8k               # 直接跑单个测试文件
-    type: file
-    node: 192.168.10.1
     file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # 相对 repo 的路径；绝对路径须在容器可见的挂载内（repo 或 ~/.cache）
     timeout_minutes: 120                # 整个 docker run 的超时（分钟），可省略
 
 output:
-  dir: results                         # 本地结果目录（执行机上，默认值；勿与节点 workspace 下的 runs/ 同名同址）
+  dir: results                         # 本地结果目录（执行机上，默认 results；勿与节点 workspace 下的 runs/ 同名同址）
 ```
+
+`configs/example.yaml` 本身就是按上述默认值精简后的最小形态，直接参考它即可。
 
 ## 4. 快速开始
 
@@ -139,7 +132,7 @@ python3 src/run.py
     │       --device /dev/davinci0..N-1 + 管理设备
     │       挂载: repo / workspace 输出目录 / driver / 模型缓存(~/.cache)
     │     容器内: 覆盖 ascend 工具 → 预置 gsm8k/ShareGPT 数据集到 /tmp
-    │              → run_suite.py 或单个用例文件
+    │              → 单个用例文件
     │
     └─ [fetch] tar 管道拉回节点上的运行产物到本地结果目录
 ```
@@ -159,13 +152,14 @@ python3 src/run.py
 路径由 `workspace` + `runs` + `run_id` + `用例名` 拼成：
 
 ```
-/root/sglang_local_pipeline/runs/20260916-100000/full-1-npu-a3/
-├── suite.log          # 容器内 tee /output/suite.log 写入
+/root/sglang_local_pipeline/runs/20260916-100000/qwen3-32b-gsm8k/
+├── case.log           # 容器内 tee /output/case.log 写入
 ├── tmp/               # 容器内 /tmp 挂载
 └── plog/              # 容器内 /root/ascend/log 挂载（NPU 底层日志）
 ```
 
-拉回后**不删除**，多次执行会按 run_id 各占一个子目录，累积保留。
+拉回后远程节点的 `runs/` **不删除**，多次执行会按 run_id 各占一个子目录，累积保留；
+本机节点（执行机=节点）在拷贝成功后自动清理 `runs/` 侧副本（见 6.3）。
 
 ### 6.2 执行机上的日志（拉回副本 + 实时回显）
 
@@ -174,25 +168,23 @@ python3 src/run.py
 ```
 /root/sglang_local_pipeline/results/20260916-100000/
 ├── summary.json                       # run.py 写入的汇总
-└── full-1-npu-a3/
-    ├── result.json                    # run.py 写入的单用例结果
-    ├── suite.log                      # ssh_run 实时回显写盘
-    ├── plog/                          # 从节点拉回的 NPU 底层日志
-    └── tmp/                           # 从节点拉回的临时文件
+└── qwen3-32b-gsm8k/
+    ├── case.log                       # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
+    └── plog/                          # 从节点拉回的 NPU 底层日志
 ```
+
+`tmp/`（容器内 /tmp：预置数据集、torch 编译缓存）体积大且排查价值低，**fetch 不回传**。远程节点的 `runs/` 原件始终保留，需要深度排查（如 JIT 编译问题）时可手动重拉。
 
 多个用例时，每个用例各占一个子目录，互不干扰：
 
 ```
 /root/sglang_local_pipeline/results/20260916-100000/
 ├── summary.json
-├── full-1-npu-a3/
-│   ├── result.json
-│   ├── suite.log
+├── qwen3-32b-gsm8k/
+│   ├── case.log
 │   └── plog/
-└── qwen3-32b-gsm8k/
-    ├── result.json
-    ├── suite.log
+└── qwen3-14b-gsm8k/
+    ├── case.log
     └── plog/
 ```
 
@@ -206,22 +198,20 @@ run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_loc
 /root/sglang_local_pipeline/
 ├── runs/                                    ← 节点（容器挂载写入）
 │   └── 20260916-100000/
-│       └── full-1-npu-a3/
-│           ├── suite.log                    ← 容器 tee 写
-│           ├── tmp/                         ← mkdir -p + 挂载
+│       └── qwen3-32b-gsm8k/
+│           ├── case.log                     ← 容器 tee 写
+│           ├── tmp/                          ← mkdir -p + 挂载
 │           └── plog/                        ← mkdir -p + 挂载
 │
 └── results/                                 ← 执行机（run.py + ssh_run + fetch 写入）
     └── 20260916-100000/
         ├── summary.json                     ← run.py 写
-        └── full-1-npu-a3/
-            ├── result.json                  ← run.py 写
-            ├── suite.log                    ← ssh_run 写
-            ├── plog/                        ← fetch 从节点拉回
-            └── tmp/                         ← fetch 从节点拉回
+        └── qwen3-32b-gsm8k/
+            ├── case.log                     ← ssh_run 回显 → fetch 覆盖为容器 tee 版本
+            └── plog/                        ← fetch 从节点拉回（tmp/ 不回传）
 ```
 
-两个目录完全独立，无并发写入同一文件的问题。
+两个目录完全独立，无并发写入同一文件的问题。且本机节点时 fetch 拷贝成功后会**自动删除**节点侧 `runs/{run_id}/{用例名}/`（避免与 `results/` 重复占磁盘），拷贝失败则保留原件；远程节点的 `runs/` 始终保留。
 
 跨节点执行时同理：节点上留在 `runs/`，执行机上落在 `results/`，fetch 把节点 `runs/{id}/{suite}/` 内容拉回到执行机 `results/{id}/{suite}/`。
 

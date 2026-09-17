@@ -4,7 +4,7 @@
 
 用法:
     python3 src/run.py --config configs/example.yaml
-    python3 src/run.py --config configs/example.yaml --suite full-1-npu-a3
+    python3 src/run.py --config configs/example.yaml --suite qwen3-32b-gsm8k
     python3 src/run.py --config configs/example.yaml --dry-run
 """
 
@@ -30,6 +30,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline import execute_suite, prepare_node
 
 
+# A3 NPU 环境的标准环境变量, 注入每个测试容器
+# YAML 的 run.env 可覆盖这些默认值或追加新键 (按 key 合并, 不必全量重写)
+_DEFAULT_ENV = {
+    "SGLANG_USE_MODELSCOPE": "true",
+    "HF_ENDPOINT": "https://hf-mirror.com",
+    "SGLANG_IS_IN_CI": "true",
+    "TORCH_EXTENSIONS_DIR": "/tmp/torch_extensions",  # 与 CI 一致, 编译缓存落在挂载的 /tmp
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "STREAMS_PER_DEVICE": "32",
+}
+
+
 @dataclass
 class NodeConfig:
     host: str
@@ -50,7 +62,7 @@ class DockerConfig:
 class PrepareConfig:
     """节点准备。online=true 需节点可达 registry/git remote;
     false 则完全使用节点现状 (镜像/代码已手动就位, 不联网不动代码)。"""
-    online: bool = True
+    online: bool = False
 
 
 @dataclass
@@ -67,11 +79,8 @@ class RunConfig:
 @dataclass
 class SuiteConfig:
     name: str
-    type: str  # suite | file
     node: str = None
     file: str = None
-    nightly: bool = True
-    timeout_per_file: int = 3600
     timeout_minutes: int = None
 
 
@@ -101,7 +110,7 @@ def load_config(path):
         net=docker_raw.get("net", "host"),
         shm_size=docker_raw.get("shm_size", "16g"),
     )
-    prepare = PrepareConfig(online=run_raw.get("prepare", True))
+    prepare = PrepareConfig(online=run_raw.get("prepare", False))
     git_remote = run_raw.get("code", {}).get("git_remote")
     if prepare.online and not git_remote:
         raise ValueError("联网模式 (prepare: true) 必须配置 run.code.git_remote")
@@ -113,7 +122,8 @@ def load_config(path):
         ref=run_raw.get("code", {}).get("ref", "main"),
         docker=docker,
         prepare=prepare,
-        env={str(k): str(v) for k, v in run_raw.get("env", {}).items()},
+        env={**_DEFAULT_ENV,
+             **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
     )
 
     nodes = [NodeConfig(host=n["host"], user=n.get("user", "root"),
@@ -123,94 +133,126 @@ def load_config(path):
     suites = []
     for s in raw.get("suites", []):
         suites.append(SuiteConfig(
-            name=s["name"], type=s["type"], node=s.get("node"),
-            file=s.get("file"), nightly=s.get("nightly", True),
-            timeout_per_file=s.get("timeout_per_file", 3600),
-            timeout_minutes=s.get("timeout_minutes"),
+            name=s["name"], node=s.get("node"),
+            file=s["file"], timeout_minutes=s.get("timeout_minutes"),
         ))
 
     return PipelineConfig(run=run, nodes=nodes, suites=suites,
                           output_dir=raw.get("output", {}).get("dir", "results"))
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description="sglang 本地测试流水线")
     parser.add_argument("--config", "-c", required=True, help="配置文件 (YAML)")
     parser.add_argument("--suite", action="append", help="只执行指定用例 (可多次传)")
     parser.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    cfg = load_config(args.config)
-    print(f"[配置] {args.config}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
+
+def print_config(cfg, config_path):
+    print(f"[配置] {config_path}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
           f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
           f"repo={cfg.run.repo}")
     print(f"[配置] 镜像: {cfg.run.docker.image}")
 
-    if args.suite:
-        names = set(args.suite)
-        cfg.suites = [s for s in cfg.suites if s.name in names]
-        if not cfg.suites:
-            print(f"[错误] 没有匹配的用例: {', '.join(names)}")
-            return 2
-        print(f"[过滤] --suite 命中 {len(cfg.suites)} 个用例: {', '.join(s.name for s in cfg.suites)}")
 
-    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = os.path.join(cfg.output_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
+def filter_suites(cfg, names):
+    """按 --suite 过滤用例, 返回是否仍有可执行用例。"""
+    if not names:
+        return True
+    selected = set(names)
+    cfg.suites = [s for s in cfg.suites if s.name in selected]
+    if not cfg.suites:
+        print(f"[错误] 没有匹配的用例: {', '.join(selected)}")
+        return False
+    print(f"[过滤] --suite 命中 {len(cfg.suites)} 个用例: "
+          f"{', '.join(s.name for s in cfg.suites)}")
+    return True
 
-    print(f"===== 流水线 run_id={run_id}  用例={len(cfg.suites)} =====")
 
-    # 按节点去重, 逐节点准备 (镜像 pull / 代码 clone / fetch / checkout)
+def prepare_nodes(cfg, dry_run):
+    """按节点去重, 逐节点准备 (镜像 pull / 代码 clone / fetch / checkout)。
+
+    返回 {host: 是否就绪}; 节点未定义时返回 None。
+    """
     prepared = {}
     for host in dict.fromkeys(s.node for s in cfg.suites):
         node = cfg.find_node(host)
         if node is None:
             print(f"[错误] 用例引用的节点未在 nodes 中定义: {host}")
-            return 2
+            return None
         print(f"\n----- [prepare] {host} -----")
-        prepared[host] = prepare_node(cfg, node, args.dry_run)
+        prepared[host] = prepare_node(cfg, node, dry_run)
         if not prepared[host]:
             print(f"[错误] 节点 {host} 准备失败, 其用例将全部记为失败 (status=error)")
+    return prepared
 
+
+def run_suites(cfg, prepared, run_id, run_dir, dry_run):
+    """逐个执行用例, 返回结果列表。"""
     results = []
     for i, suite in enumerate(cfg.suites):
         print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
         if not prepared.get(suite.node):
             print(f"[错误] 节点 {suite.node} 未就绪, {suite.name} 记为 error 不执行")
-            res = {"name": suite.name, "type": suite.type, "node": suite.node,
+            res = {"name": suite.name, "node": suite.node,
                    "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "duration_sec": 0, "error": "节点准备失败, 未执行"}
         else:
             node = cfg.find_node(suite.node)
-            res = execute_suite(cfg, suite, node, run_id, run_dir, args.dry_run)
-        if args.dry_run:
+            res = execute_suite(cfg, suite, node, run_id, run_dir, dry_run)
+        res["file"] = suite.file
+        if dry_run:
             res["status"] = "dryrun"
         results.append(res)
-        # 写单用例结果
-        p = os.path.join(run_dir, suite.name, "result.json")
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(res, f, ensure_ascii=False, indent=2)
-        print(f"[结果] {suite.name}: {res['status']} (详情: {p})")
+        print(f"[结果] {suite.name}: {res['status']}")
+    return results
 
-    # 汇总
+
+def write_summary(results, run_id, run_dir):
+    """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的 case.log)。"""
     passed = [r for r in results if r["status"] == "pass"]
     failed = [r for r in results if r["status"] in ("fail", "error")]
-    skipped = [r for r in results if r["status"] in ("skip", "dryrun")]
-
     summary = {"run_id": run_id, "total": len(results),
-               "passed": len(passed), "failed": len(failed), "skipped": len(skipped),
-               "results": results}
+               "passed": len(passed), "failed": len(failed),
+               "passed_scripts": [r["file"] for r in passed],
+               "failed_scripts": [r["file"] for r in failed]}
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+    return passed, failed
 
+
+def print_summary(results, passed, failed, run_dir):
     print("\n===== 汇总 =====")
     for r in results:
-        icon = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP",
+        icon = {"pass": "PASS", "fail": "FAIL",
                 "error": "ERROR", "dryrun": "DRY-RUN"}.get(r["status"], "?")
-        print(f"  [{icon}] {r['name']}  {r.get('duration_sec', 0)}s")
-    print(f"通过 {len(passed)} / 失败 {len(failed)} / 跳过 {len(skipped)}")
+        print(f"  [{icon}] {r['file']}  {r.get('duration_sec', 0)}s")
+    print(f"共 {len(results)} 条: 通过 {len(passed)} / 失败 {len(failed)}")
     print(f"结果: {os.path.abspath(run_dir)}")
+
+
+def main():
+    args = parse_args()
+
+    cfg = load_config(args.config)
+    print_config(cfg, args.config)
+
+    if not filter_suites(cfg, args.suite):
+        return 2
+
+    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = os.path.join(cfg.output_dir, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"===== 流水线 run_id={run_id}  用例={len(cfg.suites)} =====")
+
+    prepared = prepare_nodes(cfg, args.dry_run)
+    if prepared is None:
+        return 2
+
+    results = run_suites(cfg, prepared, run_id, run_dir, args.dry_run)
+    passed, failed = write_summary(results, run_id, run_dir)
+    print_summary(results, passed, failed, run_dir)
     return 0 if (not failed or args.dry_run) else 1
 
 

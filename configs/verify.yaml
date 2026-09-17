@@ -1,0 +1,80 @@
+run:
+  workspace: /home/c30044170/sglang_pipeline
+  code:
+    repo: /home/c30044170/sglang_pipeline/sglang
+    git_remote: https://github.com/sgl-project/sglang.git
+  docker:
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
+
+nodes:
+  - host: 61.47.19.68
+    npus: 16
+
+suites:
+  - name: test_npu_afm_4_5b
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_afm_4_5b.py
+    timeout_minutes: 120
+  - name: test_npu_gemma_3_4b_it_llm
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_gemma_3_4b_it_llm.py
+    timeout_minutes: 120
+  - name: test_npu_mimo_7b_rl
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_mimo_7b_rl.py
+    timeout_minutes: 120
+  - name: test_npu_phi_4_multimodal_llm
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_phi_4_multimodal_llm.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_0_6b
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_0_6b.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_1_7b_gptq_int8
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_1_7b_gptq_int8.py
+    timeout_minutes: 120
+  - name: test_ascend_trinity_mini
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_ascend_trinity_mini.py
+    timeout_minutes: 120
+  - name: test_npu_ling_lite
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_ling_lite.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_30b
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_30b.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_30b_w4a4
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_30b_w4a4.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_8b_communications_quantization
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_8b_communications_quantization.py
+    timeout_minutes: 120
+  - name: test_npu_qwq_32b_w8a8
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwq_32b_w8a8.py
+    timeout_minutes: 120
+  - name: test_npu_llama4_scount_17b_16e
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_llama4_scount_17b_16e.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_30b_attn_cp
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_30b_attn_cp.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_30b_fuseep
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_30b_fuseep.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_32b
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
+    timeout_minutes: 120
+
+output:
+  dir: /home/c30044170/sglang_pipeline/results
