@@ -50,6 +50,10 @@ class NodeConfig:
     user: str = "root"
     port: int = 22
     npus: int = 8
+    # tp-size 缩放因子: 用例 other_args 中的 --tp-size 会除以该值后启动 server。
+    # 默认 1 = 原样执行 (A3 环境); A5 单机环境配 2 即把 tp-size 自动减半,
+    # 不影响未显式配 --tp-size 的用例 (默认 1, 不除)。
+    tp_divisor: int = 1
 
 
 @dataclass
@@ -129,7 +133,8 @@ def load_config(path):
     )
 
     nodes = [NodeConfig(host=n["host"], user=n.get("user", "root"),
-                        port=n.get("port", 22), npus=n.get("npus", 8))
+                        port=n.get("port", 22), npus=n.get("npus", 8),
+                        tp_divisor=n.get("tp_divisor", 1))
              for n in raw.get("nodes", [])]
 
     suites = []
@@ -195,6 +200,9 @@ def print_config(cfg, config_path):
           f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
           f"repo={cfg.run.repo}")
     print(f"[配置] 镜像: {cfg.run.docker.image}")
+    for n in cfg.nodes:
+        tip = f" (tp_divisor={n.tp_divisor}, 用例 --tp-size 自动除以该值)" if n.tp_divisor > 1 else ""
+        print(f"[配置] 节点 {n.host}: npus={n.npus}{tip}")
 
 
 def filter_suites(cfg, names):

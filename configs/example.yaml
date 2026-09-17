@@ -16,6 +16,9 @@ nodes:
   - host: 192.168.10.1            # A3
     npus: 16
   - host: 192.168.10.2            # A5
+    npus: 8                       # A5 单机环境卡数 (按实际填)
+    tp_divisor: 2                 # A5 单机环境: 用例 other_args 中的 --tp-size 自动除以 2;
+                                  # 未配 --tp-size 的用例默认 1 不除。A3 不配此字段 (=1) 即原样执行。
 
 suites:
   - name: test_npu_qwen3_32b

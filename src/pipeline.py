@@ -23,6 +23,62 @@ _NODE_MOUNTS = [
     "$HOME/.cache:/root/.cache",  # 模型缓存复用, 避免每次容器重复下载
 ]
 
+# 节点 tp_divisor>1 时 (A5 单机环境) 注入容器的 wrapper 脚本:
+#   1) monkey-patch sglang.test.test_utils.popen_launch_server
+#   2) 扫描 other_args 列表中的 --tp-size, 把值除以 SGLANG_PIPELINE_TP_DIVISOR
+#   3) 以 __main__ 方式 exec 用例文件, 让 if __name__ == "__main__": unittest.main() 正常触发
+# 用例 other_args 中未显式配 --tp-size 时不做任何修改 (sglang 默认 tp=1, 与 A3 一致)。
+_PIPELINE_RUNNER_PY = r'''#!/usr/bin/env python3
+# sglang 本地流水线 wrapper: 节点 tp_divisor>1 时, 自动缩放用例 other_args 中的
+# --tp-size (A5 单机环境适配)。tp_divisor<=1 时本 wrapper 不会被使用。
+import os
+import sys
+
+_DIV = int(os.environ.get("SGLANG_PIPELINE_TP_DIVISOR", "1") or "1")
+if _DIV > 1:
+    print(f"[pipeline] tp_divisor={_DIV}, 用例 other_args 中的 --tp-size 将除以 {_DIV}",
+          flush=True)
+
+    import sglang.test.test_utils as _tu
+    _orig_launch = _tu.popen_launch_server
+
+    def _scaled_launch(*args, **kwargs):
+        other_args = kwargs.get("other_args")
+        if other_args:
+            new_args = list(other_args)
+            i = 0
+            while i < len(new_args):
+                if new_args[i] == "--tp-size" and i + 1 < len(new_args):
+                    try:
+                        v = int(new_args[i + 1])
+                        new_v = max(1, v // _DIV)
+                        print(f"[pipeline] --tp-size {v} -> {new_v} (除以 {_DIV})",
+                              flush=True)
+                        new_args[i + 1] = str(new_v)
+                    except (ValueError, TypeError):
+                        pass
+                    i += 2
+                else:
+                    i += 1
+            kwargs["other_args"] = new_args
+        return _orig_launch(*args, **kwargs)
+
+    _tu.popen_launch_server = _scaled_launch
+
+# argv: [runner_path, suite_file, *extra_args_for_unittest]
+if len(sys.argv) < 2:
+    raise SystemExit("wrapper 用法: python3 _pipeline_runner.py <suite_file> [unittest args...]")
+suite_file = sys.argv[1]
+sys.argv = [suite_file] + sys.argv[2:]
+print(f"[pipeline] 执行用例: {suite_file} (argv={sys.argv[1:]})", flush=True)
+
+_g = globals()
+_g["__file__"] = suite_file
+with open(suite_file, "r", encoding="utf-8") as _f:
+    _code = compile(_f.read(), suite_file, "exec")
+exec(_code, _g, _g)
+'''
+
 
 def _local_ips():
     """收集本机所有 IP, 用于判断节点是否就是执行机本身。
@@ -182,6 +238,7 @@ def _build_cmd(cfg, suite, node, node_run_dir):
     """构造节点上执行的完整命令。"""
     repo = cfg.run.repo
     d = cfg.run.docker
+    tp_divisor = getattr(node, "tp_divisor", 1)
 
     # 容器内命令
     parts = ["set -euo pipefail"]
@@ -196,7 +253,14 @@ def _build_cmd(cfg, suite, node, node_run_dir):
     for f in ("tmp/test.jsonl",
               "otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"):
         parts.append(f"cp '/root/.cache/modelscope/hub/datasets/{f}' /tmp/ 2>/dev/null || true")
-    cmd = f"cd {q_repo} && python3 -u {shlex.quote(suite.file)} -f"
+    # tp_divisor>1 (A5 单机环境): 走 wrapper 跑用例, 自动把 other_args 中 --tp-size 除以 tp_divisor;
+    # tp_divisor==1 (A3): 原样直接执行用例文件, 行为不变
+    if tp_divisor > 1:
+        runner = "/output/_pipeline_runner.py"
+        cmd = (f"cd {q_repo} && python3 -u {shlex.quote(runner)} "
+               f"{shlex.quote(suite.file)} -f")
+    else:
+        cmd = f"cd {q_repo} && python3 -u {shlex.quote(suite.file)} -f"
     parts.append(f"{cmd} 2>&1 | tee /output/case.log")
 
     inner = "\n".join(parts)
@@ -217,7 +281,11 @@ def _build_cmd(cfg, suite, node, node_run_dir):
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
 
     # shlex.quote: 值含空格等 shell 特殊字符时自动加引号, 保证 " ".join 后不被拆断
-    env_args = [v for k, val in cfg.run.env.items()
+    # tp_divisor>1 时追加 SGLANG_PIPELINE_TP_DIVISOR, wrapper 据此缩放 --tp-size
+    env = dict(cfg.run.env)
+    if tp_divisor > 1:
+        env["SGLANG_PIPELINE_TP_DIVISOR"] = str(tp_divisor)
+    env_args = [v for k, val in env.items()
                 for v in ("-e", f"{k}={shlex.quote(str(val))}")]
 
     inner_escaped = inner.replace("'", "'\"'\"'")
@@ -232,10 +300,17 @@ def _build_cmd(cfg, suite, node, node_run_dir):
     lines = [
         "set -e",
         f"mkdir -p {shlex.quote(node_run_dir)}/tmp {shlex.quote(node_run_dir)}/plog",
-        # 清理残留同名容器: 上次 timeout 杀掉 docker 客户端后容器不会自停,
-        # 不清理则本次 docker run 因 --name 冲突直接失败
-        f"docker rm -f sgl-pipeline-{suite.name} >/dev/null 2>&1 || true",
     ]
+    if tp_divisor > 1:
+        # 把 wrapper 脚本写到节点 workspace, 容器通过 /output 挂载访问;
+        # 用 <<'PYEOF' 单引号 heredoc 避免变量展开, 内容固定不依赖节点环境
+        runner_path = f"{node_run_dir}/_pipeline_runner.py"
+        lines.append(f"cat > {shlex.quote(runner_path)} <<'SGL_PIPELINE_RUNNER_EOF'\n"
+                     f"{_PIPELINE_RUNNER_PY}\n"
+                     f"SGL_PIPELINE_RUNNER_EOF")
+    # 清理残留同名容器: 上次 timeout 杀掉 docker 客户端后容器不会自停,
+    # 不清理则本次 docker run 因 --name 冲突直接失败
+    lines.append(f"docker rm -f sgl-pipeline-{suite.name} >/dev/null 2>&1 || true")
     if suite.timeout_minutes:
         # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
         lines.append(f"timeout -k 60 {int(suite.timeout_minutes) * 60} " + " ".join(docker_args))

@@ -8,9 +8,21 @@ run:
 
 nodes:
   - host: 61.47.19.68
-    npus: 16
+    npus: 8
+    tp_divisor: 2
 
 suites:
+  - name: test_npu_qwq_32b_w8a8
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwq_32b_w8a8.py
+  - name: test_ascend_trinity_mini
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_ascend_trinity_mini.py
+    timeout_minutes: 120
+  - name: test_npu_qwen3_235b_a22b_w8a8
+    node: 61.47.19.68
+    file: test/registered/npu/llm_models/test_npu_qwen3_235b_a22b_w8a8
+    timeout_minutes: 120
   - name: test_npu_afm_4_5b
     node: 61.47.19.68
     file: test/registered/npu/llm_models/test_npu_afm_4_5b.py

@@ -43,7 +43,7 @@ sglang_local_pipeline/
 
 ## 3. 配置文件说明
 
-复制 `configs/example.yaml` 修改。**下列字段均有代码默认值，不写即取默认**：`prepare=false`、`code.ref=main`、`docker.devices=auto`、`docker.net=host`、`docker.shm_size=16g`、`nodes[].user=root`、`nodes[].port=22`、`nodes[].npus=8`、`output.dir=results`。**`run.env` 也有内置默认值**（见下），通常无需在 YAML 里写出，仅当需要覆盖某项时才写 `run.env`。完整字段参考如下：
+复制 `configs/example.yaml` 修改。**下列字段均有代码默认值，不写即取默认**：`prepare=false`、`code.ref=main`、`docker.devices=auto`、`docker.net=host`、`docker.shm_size=16g`、`nodes[].user=root`、`nodes[].port=22`、`nodes[].npus=8`、`nodes[].tp_divisor=1`、`output.dir=results`。**`run.env` 也有内置默认值**（见下），通常无需在 YAML 里写出，仅当需要覆盖某项时才写 `run.env`。完整字段参考如下：
 
 ```yaml
 run:
@@ -74,6 +74,11 @@ nodes:                                  # 所有可用节点
     port: 22                            # 默认 22
     npus: 16                            # NPU 卡数，devices=auto 时决定映射 /dev/davinci0..N-1 (默认 8)
   - host: 192.168.10.2                  # A5 (user/port/npus 均取默认值时可整段省略, 仅留 host)
+    npus: 8                             # A5 单机环境卡数 (按实际填)
+    tp_divisor: 2                       # A5 单机环境专用: 用例 other_args 中的 --tp-size
+                                        # 启动 server 前自动除以该值 (例: --tp-size 4 -> 2);
+                                        # 未显式配 --tp-size 的用例默认 1 不除, 与 A3 一致。
+                                        # A3 不配此字段 (默认 1) 即原样执行用例, 不做任何缩放。
 
 suites:                                 # 要执行的用例，串行执行
   - name: qwen3-32b-gsm8k               # 用例名称 (--suite 过滤用)
