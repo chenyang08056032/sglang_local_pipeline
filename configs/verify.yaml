@@ -4,7 +4,7 @@ run:
     repo: /home/c30044170/sglang_pipeline/sglang
     git_remote: https://github.com/sgl-project/sglang.git
   docker:
-    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B060
 
 nodes:
   - host: 61.47.19.68
