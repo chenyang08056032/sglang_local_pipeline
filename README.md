@@ -99,6 +99,10 @@ python3 src/run.py --config configs/example.yaml
 # 3. 只执行指定用例（--suite 可传多次）
 python3 src/run.py --config configs/example.yaml --suite full-1-npu-a3
 python3 src/run.py --config configs/example.yaml --suite full-1-npu-a3 --suite qwen3-32b-gsm8k
+
+# 4. 定时执行（等到指定时间再开始，便于夜间无人值守跑用例）
+python3 src/run.py --config configs/example.yaml --at "2026-09-17 18:00:00"
+python3 src/run.py --config configs/example.yaml --at "18:00:00"   # 今天已过则取明天
 ```
 
 ### 命令行参数
@@ -108,6 +112,7 @@ python3 src/run.py --config configs/example.yaml --suite full-1-npu-a3 --suite q
 | `--config` / `-c` | 配置文件路径（必填） |
 | `--suite NAME` | 只执行指定用例，可多次传，按 name 匹配 |
 | `--dry-run` | 只打印命令不执行，用于校验配置和 docker 命令 |
+| `--at TIME` | 定时执行：阻塞到指定时间再开始。支持 `YYYY-MM-DD HH:MM:SS` 或 `HH:MM:SS`（今天已过则取明天）。等待期间每分钟打印剩余秒数 |
 
 ### 退出码
 

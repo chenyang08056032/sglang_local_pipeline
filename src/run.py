@@ -6,6 +6,8 @@
     python3 src/run.py --config configs/example.yaml
     python3 src/run.py --config configs/example.yaml --suite qwen3-32b-gsm8k
     python3 src/run.py --config configs/example.yaml --dry-run
+    python3 src/run.py --config configs/example.yaml --at "2026-09-17 18:00:00"
+    python3 src/run.py --config configs/example.yaml --at "18:00:00"   # 今天已过则取明天
 """
 
 import argparse
@@ -141,11 +143,50 @@ def load_config(path):
                           output_dir=raw.get("output", {}).get("dir", "results"))
 
 
+def parse_at(at_str):
+    """解析 --at 字符串为目标 datetime。
+
+    支持两种格式:
+      - "YYYY-MM-DD HH:MM:SS" (绝对时间)
+      - "HH:MM:SS"            (今天此刻, 已过则取明天)
+    """
+    now = datetime.datetime.now()
+    for fmt, full in (("%Y-%m-%d %H:%M:%S", True), ("%H:%M:%S", False)):
+        try:
+            dt = datetime.datetime.strptime(at_str, fmt)
+            if not full:
+                dt = dt.replace(year=now.year, month=now.month, day=now.day)
+                if dt <= now:
+                    dt += datetime.timedelta(days=1)
+            return dt
+        except ValueError:
+            continue
+    raise ValueError(f"无法解析 --at 时间: {at_str}  (支持 'YYYY-MM-DD HH:MM:SS' 或 'HH:MM:SS')")
+
+
+def wait_until(target_dt):
+    """阻塞至 target_dt, 每分钟打印一次等待状态。"""
+    while True:
+        now = datetime.datetime.now()
+        remaining = (target_dt - now).total_seconds()
+        if remaining <= 0:
+            break
+        ts = now.strftime("%H:%M:%S")
+        print(f"[{ts}][定时] 等待至 {target_dt.strftime('%Y-%m-%d %H:%M:%S')} "
+              f"(剩余 {int(remaining)} 秒)", flush=True)
+        time.sleep(min(remaining, 60))
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}][定时] "
+          f"到达指定时间, 开始执行", flush=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="sglang 本地测试流水线")
     parser.add_argument("--config", "-c", required=True, help="配置文件 (YAML)")
     parser.add_argument("--suite", action="append", help="只执行指定用例 (可多次传)")
     parser.add_argument("--dry-run", action="store_true", help="只打印命令不执行")
+    parser.add_argument("--at", metavar="TIME",
+                        help="定时执行: 指定开始时间, 支持 'YYYY-MM-DD HH:MM:SS' 或 'HH:MM:SS' "
+                             "(今天已过则取明天)")
     return parser.parse_args()
 
 
@@ -234,6 +275,10 @@ def print_summary(results, passed, failed, run_dir):
 
 def main():
     args = parse_args()
+
+    if args.at:
+        target = parse_at(args.at)
+        wait_until(target)
 
     cfg = load_config(args.config)
     print_config(cfg, args.config)
