@@ -22,3 +22,31 @@ suites:
     node: 192.168.10.1
     file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # 相对 repo; 绝对路径须在容器可见挂载内 (repo 或 ~/.cache)
     timeout_minutes: 120                # docker run 超时 (分钟), 可省略
+
+  # 多机 PD 分离用例 (与 node 二选一): prefill/decode 各占一个节点拉起服务,
+  # router 等 PD 就绪后拉起 router 并执行基准测试; 可复用 PD 节点或配独立节点。
+  # 详见 README 第 7 节 (节点间需互通, 且节点需可达执行机 9377 协调端口)。
+  # prefill/decode 支持多节点 (列表), router 只能单个 (sglang 框架限制)。
+  # - name: dsv4-flash-w8a8-1p1d-16p        # 1p1d: prefill/decode 各 1 节点
+  #   roles:
+  #     prefill: 192.168.10.1
+  #     decode: 192.168.10.2
+  #     router: 192.168.10.1
+  #   file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+  #   timeout_minutes: 240              # 角色容器超时 (分钟); prefill/decode 实际再加 2 分钟余量
+  #
+  # - name: dsv4-flash-w8a8-2p2d-16p        # 2p2d: prefill/decode 各 2 节点
+  #   roles:
+  #     prefill: [192.168.10.1, 192.168.10.2]
+  #     decode: [192.168.10.3, 192.168.10.4]
+  #     router: 192.168.10.1
+  #   file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_2p2d_16p.py
+  #   timeout_minutes: 240
+  #
+  # 多机混布 TP 用例 (与 node/roles 三选一): 多节点组成一个 sglang server 实例 (TP 跨节点),
+  # 第一个节点 = master (跑测试), 其余 = worker (只起 server); 无 PD 分离/router 角色。
+  # 详见 README 第 8 节。
+  # - name: glm5_2-16p-gpqa                 # 2 节点混布 TP
+  #   multinode: [192.168.10.1, 192.168.10.2]
+  #   file: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
+  #   timeout_minutes: 240              # 节点容器超时 (分钟); worker 实际再加 2 分钟余量

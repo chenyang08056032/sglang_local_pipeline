@@ -29,7 +29,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import execute_suite, prepare_node
+from pipeline import (_MULTI_ROLES, execute_multinode_suite,
+                      execute_multinode_tp_suite, execute_suite, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -84,6 +85,12 @@ class SuiteConfig:
     node: str = None
     file: str = None
     timeout_minutes: int = None
+    # 多机 (PD 分离) 用例: 角色到节点 host 列表的映射, 与 node/multinode 互斥
+    # prefill/decode 支持多节点 (如 2p2d); router 只能 1 个 (sglang 框架限制)
+    roles: Dict[str, List[str]] = None
+    # 多机 (混布 TP) 用例: 节点 host 列表, 与 node/roles 互斥
+    # 第一个节点 = master (sglang-node-0), 其余 = worker; 无 router 角色
+    multinode: List[str] = None
 
 
 @dataclass
@@ -134,9 +141,51 @@ def load_config(path):
 
     suites = []
     for s in raw.get("suites", []):
+        roles = s.get("roles")
+        multinode = s.get("multinode")
+        # node / roles / multinode 三选一
+        specified = [k for k, v in (("node", s.get("node")),
+                                    ("roles", roles),
+                                    ("multinode", multinode)) if v]
+        if len(specified) > 1:
+            raise ValueError(
+                f"用例 {s['name']}: {'/'.join(specified)} 互斥, 只能配一个")
+        if roles:
+            missing = set(_MULTI_ROLES) - set(roles)
+            if missing:
+                raise ValueError(
+                    f"用例 {s['name']}: roles 缺少角色 {', '.join(sorted(missing))} "
+                    f"(需 {'/'.join(_MULTI_ROLES)})")
+            unknown = set(roles) - set(_MULTI_ROLES)
+            if unknown:
+                raise ValueError(
+                    f"用例 {s['name']}: 未知角色 {', '.join(sorted(unknown))} "
+                    f"(仅支持 {'/'.join(_MULTI_ROLES)})")
+            # router 只能单个节点 (sglang 框架: 多个 router pod 会各自起 router 进程,
+            # 造成端口冲突和路由混乱); prefill/decode 归一化为列表以统一处理
+            norm = {}
+            for r in _MULTI_ROLES:
+                val = roles[r]
+                if isinstance(val, str):
+                    val = [val]
+                elif not isinstance(val, list):
+                    raise ValueError(
+                        f"用例 {s['name']}: roles.{r} 须为字符串或列表, 实际 {type(val).__name__}")
+                if r == "router" and len(val) > 1:
+                    raise ValueError(
+                        f"用例 {s['name']}: router 角色只支持单个节点, "
+                        f"实际配了 {len(val)} 个")
+                norm[r] = val
+            roles = norm
+        if multinode:
+            if not isinstance(multinode, list) or len(multinode) < 2:
+                raise ValueError(
+                    f"用例 {s['name']}: multinode 须为 ≥2 个节点的列表"
+                    f" (单节点请用 node)")
         suites.append(SuiteConfig(
-            name=s["name"], node=s.get("node"),
-            file=s["file"], timeout_minutes=s.get("timeout_minutes"),
+            name=s["name"], node=s.get("node"), file=s["file"],
+            timeout_minutes=s.get("timeout_minutes"),
+            roles=roles, multinode=multinode,
         ))
 
     return PipelineConfig(run=run, nodes=nodes, suites=suites,
@@ -211,13 +260,22 @@ def filter_suites(cfg, names):
     return True
 
 
+def _suite_hosts(suite):
+    """用例涉及的所有节点 host (单机=1 个; 多机 PD=各角色节点; 多机 TP=所有节点)。"""
+    if suite.roles:
+        return [h for hosts in suite.roles.values() for h in hosts]
+    if suite.multinode:
+        return list(suite.multinode)
+    return [suite.node]
+
+
 def prepare_nodes(cfg, dry_run):
     """按节点去重, 逐节点准备 (镜像 pull / 代码 clone / fetch / checkout)。
 
     返回 {host: 是否就绪}; 节点未定义时返回 None。
     """
     prepared = {}
-    for host in dict.fromkeys(s.node for s in cfg.suites):
+    for host in dict.fromkeys(h for s in cfg.suites for h in _suite_hosts(s)):
         node = cfg.find_node(host)
         if node is None:
             print(f"[错误] 用例引用的节点未在 nodes 中定义: {host}")
@@ -234,11 +292,17 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
     results = []
     for i, suite in enumerate(cfg.suites):
         print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
-        if not prepared.get(suite.node):
-            print(f"[错误] 节点 {suite.node} 未就绪, {suite.name} 记为 error 不执行")
-            res = {"name": suite.name, "node": suite.node,
+        hosts = _suite_hosts(suite)
+        if not all(prepared.get(h) for h in hosts):
+            missing = [h for h in hosts if not prepared.get(h)]
+            print(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
+            res = {"name": suite.name, "node": ",".join(hosts),
                    "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "duration_sec": 0, "error": "节点准备失败, 未执行"}
+        elif suite.roles:
+            res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
+        elif suite.multinode:
+            res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir, dry_run)
         else:
             node = cfg.find_node(suite.node)
             res = execute_suite(cfg, suite, node, run_id, run_dir, dry_run)
