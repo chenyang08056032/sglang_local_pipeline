@@ -29,7 +29,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import execute_suite, prepare_node
+from pipeline import (_ARCH_NPUS, _MULTI_ROLES, execute_multinode_suite,
+                      execute_multinode_tp_suite, execute_suite, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -47,15 +48,17 @@ _DEFAULT_ENV = {
 @dataclass
 class NodeConfig:
     host: str
+    # 节点架构 (a3/a5), 必填: 决定挂卡数量 (a3=16, a5=8, 见 pipeline._ARCH_NPUS);
+    # a5: 该节点上的单机用例 --tp-size 自动减半
+    arch: str
     user: str = "root"
     port: int = 22
-    npus: int = 8
 
 
 @dataclass
 class DockerConfig:
     image: str
-    devices: Union[str, List[int]] = "auto"  # "auto"=按节点 npus 生成 davinci0..N-1
+    devices: Union[str, List[int]] = "auto"  # "auto"=按节点 arch 推导卡数生成 davinci0..N-1
     net: str = "host"
     shm_size: str = "16g"
 
@@ -70,12 +73,16 @@ class PrepareConfig:
 @dataclass
 class RunConfig:
     workspace: str
-    repo: str
     git_remote: str = None
     ref: str = "main"
     docker: DockerConfig = None
     prepare: PrepareConfig = None
     env: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def repo(self):
+        """节点上的 sglang 源码路径, 固定放在 workspace 下。"""
+        return f"{self.workspace}/sglang"
 
 
 @dataclass
@@ -84,6 +91,12 @@ class SuiteConfig:
     node: str = None
     file: str = None
     timeout_minutes: int = None
+    # 多机 (PD 分离) 用例: 角色到节点 host 列表的映射, 与 node/multinode 互斥
+    # prefill/decode 支持多节点 (如 2p2d); router 只能 1 个 (sglang 框架限制)
+    roles: Dict[str, List[str]] = None
+    # 多机 (混布 TP) 用例: 节点 host 列表, 与 node/roles 互斥
+    # 第一个节点 = master (sglang-node-0), 其余 = worker; 无 router 角色
+    multinode: List[str] = None
 
 
 @dataclass
@@ -91,7 +104,11 @@ class PipelineConfig:
     run: RunConfig
     nodes: List[NodeConfig]
     suites: List[SuiteConfig]
-    output_dir: str = "results"
+
+    @property
+    def output_dir(self):
+        """执行机上的结果目录, 固定 {workspace}/results (与节点 runs/ 平级, 同机不冲突)。"""
+        return f"{self.run.workspace}/results"
 
     def find_node(self, host):
         for n in self.nodes:
@@ -113,34 +130,84 @@ def load_config(path):
         shm_size=docker_raw.get("shm_size", "16g"),
     )
     prepare = PrepareConfig(online=run_raw.get("prepare", False))
-    git_remote = run_raw.get("code", {}).get("git_remote")
+    code_raw = run_raw.get("code", {})
+    git_remote = code_raw.get("git_remote")
     if prepare.online and not git_remote:
         raise ValueError("联网模式 (prepare: true) 必须配置 run.code.git_remote")
 
+    workspace = run_raw["workspace"]
     run = RunConfig(
-        workspace=run_raw["workspace"],
-        repo=run_raw["code"]["repo"],
+        workspace=workspace,
         git_remote=git_remote,
-        ref=run_raw.get("code", {}).get("ref", "main"),
+        ref=code_raw.get("ref", "main"),
         docker=docker,
         prepare=prepare,
         env={**_DEFAULT_ENV,
              **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
     )
 
-    nodes = [NodeConfig(host=n["host"], user=n.get("user", "root"),
-                        port=n.get("port", 22), npus=n.get("npus", 8))
-             for n in raw.get("nodes", [])]
+    nodes = []
+    for n in raw.get("nodes", []):
+        # arch 必填且须为已知架构 (挂卡数量与 A5 适配都依赖它, 拼错直接报错)
+        arch = str(n.get("arch") or "").lower()
+        if arch not in _ARCH_NPUS:
+            raise ValueError(
+                f"节点 {n['host']}: arch 必填且须为 {'/'.join(_ARCH_NPUS)} 之一 "
+                f"(a3=16 卡, a5=8 卡), 实际 {n.get('arch')!r}")
+        nodes.append(NodeConfig(host=n["host"], arch=arch,
+                                user=n.get("user", "root"),
+                                port=n.get("port", 22)))
 
     suites = []
     for s in raw.get("suites", []):
+        roles = s.get("roles")
+        multinode = s.get("multinode")
+        # node / roles / multinode 三选一
+        specified = [k for k, v in (("node", s.get("node")),
+                                    ("roles", roles),
+                                    ("multinode", multinode)) if v]
+        if len(specified) > 1:
+            raise ValueError(
+                f"用例 {s['name']}: {'/'.join(specified)} 互斥, 只能配一个")
+        if roles:
+            missing = set(_MULTI_ROLES) - set(roles)
+            if missing:
+                raise ValueError(
+                    f"用例 {s['name']}: roles 缺少角色 {', '.join(sorted(missing))} "
+                    f"(需 {'/'.join(_MULTI_ROLES)})")
+            unknown = set(roles) - set(_MULTI_ROLES)
+            if unknown:
+                raise ValueError(
+                    f"用例 {s['name']}: 未知角色 {', '.join(sorted(unknown))} "
+                    f"(仅支持 {'/'.join(_MULTI_ROLES)})")
+            # router 只能单个节点 (sglang 框架: 多个 router pod 会各自起 router 进程,
+            # 造成端口冲突和路由混乱); prefill/decode 归一化为列表以统一处理
+            norm = {}
+            for r in _MULTI_ROLES:
+                val = roles[r]
+                if isinstance(val, str):
+                    val = [val]
+                elif not isinstance(val, list):
+                    raise ValueError(
+                        f"用例 {s['name']}: roles.{r} 须为字符串或列表, 实际 {type(val).__name__}")
+                if r == "router" and len(val) > 1:
+                    raise ValueError(
+                        f"用例 {s['name']}: router 角色只支持单个节点, "
+                        f"实际配了 {len(val)} 个")
+                norm[r] = val
+            roles = norm
+        if multinode:
+            if not isinstance(multinode, list) or len(multinode) < 2:
+                raise ValueError(
+                    f"用例 {s['name']}: multinode 须为 ≥2 个节点的列表"
+                    f" (单节点请用 node)")
         suites.append(SuiteConfig(
-            name=s["name"], node=s.get("node"),
-            file=s["file"], timeout_minutes=s.get("timeout_minutes"),
+            name=s["name"], node=s.get("node"), file=s["file"],
+            timeout_minutes=s.get("timeout_minutes"),
+            roles=roles, multinode=multinode,
         ))
 
-    return PipelineConfig(run=run, nodes=nodes, suites=suites,
-                          output_dir=raw.get("output", {}).get("dir", "results"))
+    return PipelineConfig(run=run, nodes=nodes, suites=suites)
 
 
 def parse_at(at_str):
@@ -211,13 +278,22 @@ def filter_suites(cfg, names):
     return True
 
 
+def _suite_hosts(suite):
+    """用例涉及的所有节点 host (单机=1 个; 多机 PD=各角色节点; 多机 TP=所有节点)。"""
+    if suite.roles:
+        return [h for hosts in suite.roles.values() for h in hosts]
+    if suite.multinode:
+        return list(suite.multinode)
+    return [suite.node]
+
+
 def prepare_nodes(cfg, dry_run):
     """按节点去重, 逐节点准备 (镜像 pull / 代码 clone / fetch / checkout)。
 
     返回 {host: 是否就绪}; 节点未定义时返回 None。
     """
     prepared = {}
-    for host in dict.fromkeys(s.node for s in cfg.suites):
+    for host in dict.fromkeys(h for s in cfg.suites for h in _suite_hosts(s)):
         node = cfg.find_node(host)
         if node is None:
             print(f"[错误] 用例引用的节点未在 nodes 中定义: {host}")
@@ -234,11 +310,17 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
     results = []
     for i, suite in enumerate(cfg.suites):
         print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
-        if not prepared.get(suite.node):
-            print(f"[错误] 节点 {suite.node} 未就绪, {suite.name} 记为 error 不执行")
-            res = {"name": suite.name, "node": suite.node,
+        hosts = _suite_hosts(suite)
+        if not all(prepared.get(h) for h in hosts):
+            missing = [h for h in hosts if not prepared.get(h)]
+            print(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
+            res = {"name": suite.name, "node": ",".join(hosts),
                    "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "duration_sec": 0, "error": "节点准备失败, 未执行"}
+        elif suite.roles:
+            res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
+        elif suite.multinode:
+            res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir, dry_run)
         else:
             node = cfg.find_node(suite.node)
             res = execute_suite(cfg, suite, node, run_id, run_dir, dry_run)
@@ -280,7 +362,11 @@ def main():
         target = parse_at(args.at)
         wait_until(target)
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except (ValueError, KeyError, yaml.YAMLError, OSError) as e:
+        print(f"[错误] 配置文件无效: {e}")
+        return 2
     print_config(cfg, args.config)
 
     if not filter_suites(cfg, args.suite):
