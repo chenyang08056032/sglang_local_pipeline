@@ -105,6 +105,15 @@ python3 src/run.py --config configs/example.yaml --at "2026-09-17 18:00:00"
 python3 src/run.py --config configs/example.yaml --at "18:00:00"   # 今天已过则取明天
 ```
 
+`--at` 按**执行机本地时间**计算（不是节点时间）。执行机与节点跨时区时尤其要注意。
+
+查执行机当前时间：
+
+```bash
+date +"%Y-%m-%d %H:%M:%S"   # 输出形如 2026-09-17 18:00:00
+date +"%H:%M:%S"            # 输出形如 18:00:00
+```
+
 ### 命令行参数
 
 | 参数 | 说明 |
