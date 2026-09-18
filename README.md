@@ -57,6 +57,7 @@ sglang_local_pipeline/
 | `run.docker.devices` | `auto` | 否 | `auto`=按节点 arch 推导卡数映射 `/dev/davinci0..N-1`（a3=16、a5=8）+ 管理设备；或显式列表如 `[0,1,2,3]`，以列表为准 |
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
 | `run.docker.shm_size` | `16g` | 否 | 容器共享内存大小；固定附加 `--privileged --ipc=host` |
+| `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"` |
 | `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 
 ### 3.2 nodes 段
@@ -201,6 +202,7 @@ python3 src/run.py
     │     单机用例: docker run --rm --privileged --ipc=host
     │       --device /dev/davinci0..N-1 + 管理设备
     │       挂载: repo / workspace 输出目录 / driver / 模型缓存(~/.cache)
+    │              + run.docker.extra_mounts (用户自定义, 可选)
     │     容器内: 覆盖 ascend 工具 → 预置 gsm8k/ShareGPT 数据集到 /tmp
     │              → 单个用例文件 (A5 节点经 /output/run_case.py 包装启动,
     │                 --tp-size 自动减半)
@@ -236,10 +238,10 @@ python3 src/run.py
 
 ### 6.2 执行机上的日志（拉回副本 + 实时回显）
 
-路径由 `{workspace}/results` + `run_id` + `用例名` 拼成（不受执行目录影响），与节点的 `runs/` 分开：
+路径由 `{workspace}/results` + `run_id` + `用例名` 拼成（不受执行目录影响），与节点的 `runs/` 分开。`run_id` 格式为 `{yaml_stem}-{timestamp}`（如 `example-20260916-100000`），目录名同时体现来源 yaml 与执行时间：
 
 ```
-/root/sglang_local_pipeline/results/20260916-100000/
+/root/sglang_local_pipeline/results/example-20260916-100000/
 ├── summary.json                       # run.py 写入的汇总
 └── qwen3-32b-gsm8k/
     ├── case.log                       # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
@@ -251,7 +253,7 @@ python3 src/run.py
 多个用例时，每个用例各占一个子目录，互不干扰：
 
 ```
-/root/sglang_local_pipeline/results/20260916-100000/
+/root/sglang_local_pipeline/results/example-20260916-100000/
 ├── summary.json
 ├── qwen3-32b-gsm8k/
 │   ├── case.log
@@ -261,7 +263,7 @@ python3 src/run.py
     └── plog/
 ```
 
-run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_local_pipeline/results/20260916-100000`
+run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_local_pipeline/results/example-20260916-100000`
 
 ### 6.3 执行机 = 节点时的路径关系
 
@@ -270,14 +272,14 @@ run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_loc
 ```
 /root/sglang_local_pipeline/
 ├── runs/                                    ← 节点（容器挂载写入）
-│   └── 20260916-100000/
+│   └── example-20260916-100000/
 │       └── qwen3-32b-gsm8k/
 │           ├── case.log                     ← 容器 tee 写
 │           ├── tmp/                          ← mkdir -p + 挂载
 │           └── plog/                        ← mkdir -p + 挂载
 │
 └── results/                                 ← 执行机（run.py + ssh_run + fetch 写入）
-    └── 20260916-100000/
+    └── example-20260916-100000/
         ├── summary.json                     ← run.py 写
         └── qwen3-32b-gsm8k/
             ├── case.log                     ← ssh_run 回显 → fetch 覆盖为容器 tee 版本

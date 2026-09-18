@@ -160,8 +160,16 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
 
 
 def _log(msg):
-    """带时间戳的流水线日志。"""
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    """带时间戳的流水线日志; 时间戳插在首个 [tag] 之后, 保持 tag 在视觉左侧。"""
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    # 消息都以 [tag] 开头 (如 [ssh], [execute], [decode-0] [ssh]);
+    # 把时间戳插到第一个 ] 之后, 不带 tag 的消息前补 [time]
+    idx = msg.find(']')
+    if idx > 0:
+        out = f"{msg[:idx+1]} [{ts}]{msg[idx+1:]}"
+    else:
+        out = f"[{ts}] {msg}"
+    print(out, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +192,10 @@ _COORD_DEFAULT_PORT = 9377
 _ACTIVE_TEST_CLASS_KEY = "active-test-class"
 # 结束信号哨兵值: 与任何测试类名都不同, PD 节点看到后正常退出
 _RELEASE_VALUE = "__pipeline_released__"
+# 结束信号写入后给 PD/worker 节点的 grace period (轮询周期 ~30s);
+# 超时仍未退出的 (如 router 卡在 wait_for_all_ports_ready 不查 ConfigMap)
+# 主动 docker rm -f 杀掉, 等价 CI 外层 runner 检测 pod 非 Running 后删 job
+_GRACE_PERIOD_KILL_SEC = 60
 # 多机用例的角色 (每个角色对应一个节点配置)
 _MULTI_ROLES = ("prefill", "decode", "router")
 
@@ -372,6 +384,25 @@ def _reclaim_coord_port():
             pass
     time.sleep(1)
     return not _port_occupants(_COORD_DEFAULT_PORT)
+
+
+def _kill_container(node, container_name):
+    """强制删除节点上的容器 (任一节点退出后, 清理残留的未退出容器)。
+
+    本机直接执行, 远程走 SSH; 不回显输出 (快速清理, 日志由调用方打印)。
+    """
+    cmd = f"docker rm -f {container_name} >/dev/null 2>&1 || true"
+    if _is_local(node):
+        subprocess.Popen(cmd, shell=True,
+                         stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL).wait()
+    else:
+        subprocess.Popen(
+            ["ssh", "-o", "BatchMode=yes",
+             "-o", "StrictHostKeyChecking=accept-new",
+             "-p", str(node.port), f"{node.user}@{node.host}", cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).wait()
 
 
 class _CoordHandler(BaseHTTPRequestHandler):
@@ -611,11 +642,18 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         "-v", shlex.quote(f"{node_run_dir}/tmp:/tmp"),
         "-v", shlex.quote(f"{node_run_dir}/plog:/root/ascend/log"),
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
+    # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;
+    # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro")
+    if d.extra_mounts:
+        mount_args += [x for m in d.extra_mounts for x in ("-v", shlex.quote(m))]
 
     # shlex.quote: 值含空格等 shell 特殊字符时自动加引号, 保证 " ".join 后不被拆断
     envs = dict(cfg.run.env)
     if extra_env:
         envs.update(extra_env)
+    # 容器默认 UTC, 流水线日志用本机时区 (Asia/Shanghai); 统一为 +8 避免同一
+    # 输出里两个时区造成误判 (如 prefill/decode 跨节点时序分析)
+    envs.setdefault("TZ", "Asia/Shanghai")
     # 内网直连: 节点 /root/.docker/config.json 的 proxies 配置会向容器注入
     # http_proxy, requests/urllib 访问内网地址 (协调服务 / server 健康检查)
     # 经代理会超时; 对所有节点 + 协调地址设置 no_proxy, 外网下载仍走代理。
@@ -834,16 +872,45 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         threads = {k: threading.Thread(target=_run_unit,
                                       args=(r, i, n, k), daemon=True)
                    for (r, i, n), k in zip(units, keys)}
-        for t in threads.values():
-            t.start()
-        # 监控: router 结束 (正常路径) 或任一 PD 提前退出 (崩溃) → 广播结束信号
+        # 先启 router, 等它向 ConfigMap 写入 active-test-class 后再启 PD;
+        # 保证 PD 的首次 ConfigMap 查询能看到该 key (对齐 CI 的时序):
+        # CI 的 router pod 不挂 NPU, 框架比 PD 快很多必先写; 本地 router 也挂
+        # 满 NPU, 启动竞争无偏向, 需显式控制顺序。router 崩溃未写入时超时兜底
+        if not dry_run:
+            threads[router_key].start()
+            _log(f"[execute] {suite.name} 先启动 router, 等待写入 active-test-class ...")
+            router_seq_tic = time.perf_counter()
+            while True:
+                if _ACTIVE_TEST_CLASS_KEY in coord.get_data():
+                    _log(f"[execute] {suite.name} active-test-class 已写入, 启动 PD 节点")
+                    break
+                if not threads[router_key].is_alive():
+                    _log(f"[execute] {suite.name} router 提前退出 (未写入 active-test-class), "
+                         "直接启动 PD 节点")
+                    break
+                if time.perf_counter() - router_seq_tic > 120:
+                    _log(f"[execute] {suite.name} 等待 active-test-class 超时 (120s), "
+                         "直接启动 PD 节点")
+                    break
+                time.sleep(2)
+            for k in pd_keys:
+                threads[k].start()
+        else:
+            for t in threads.values():
+                t.start()
+        # 监控: router 结束 (正常路径) 或任一 PD 提前退出 (崩溃) → 广播结束信号;
+        # 信号写入后给 PD 节点 _GRACE_PERIOD_KILL_SEC 收到信号退出, 超时仍未退出的
+        # (如 router 卡在 wait_for_all_ports_ready 不查 ConfigMap) 主动 docker rm -f
         released = False
+        released_at = None
+        killed = False
         while any(t.is_alive() for t in threads.values()):
             if (not released and not dry_run
                     and (not threads[router_key].is_alive()
                          or any(not threads[k].is_alive() for k in pd_keys))):
                 coord.patch_data({_ACTIVE_TEST_CLASS_KEY: _RELEASE_VALUE})
                 released = True
+                released_at = time.perf_counter()
                 # 区分释放原因便于排查: router 退出 (正常/异常) vs PD 提前退出 (崩溃)
                 # 注意: router 异常退出时 PD 可能仍在服务, 此信号会让 PD 提前退出,
                 # 测试结果应以 router 的 case.log 为准
@@ -851,6 +918,17 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                          else "PD 节点提前退出")
                 _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
                      "等待 prefill/decode 节点退出")
+            # grace period 超时后, 仍有容器未退出 → 强杀 (等价 CI 外层 runner
+            # 检测 pod 非 Running 后删 job; 常见于 PD 崩溃后 router 卡在端口等待)
+            if (released and not killed and not dry_run
+                    and time.perf_counter() - released_at > _GRACE_PERIOD_KILL_SEC):
+                for (r, i, n), k in zip(units, keys):
+                    if threads[k].is_alive():
+                        container = f"sgl-pipeline-{suite.name}-{k}"
+                        _log(f"[execute] {suite.name}/{k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
+                             f"未退出, 强制删除容器 {container}")
+                        _kill_container(n, container)
+                killed = True
             time.sleep(5)
         for t in threads.values():
             t.join()
@@ -993,14 +1071,19 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                    for (i, n), k in zip(units, keys)}
         for t in threads.values():
             t.start()
-        # 监控: master 结束 (正常路径) 或任一 worker 提前退出 (崩溃) → 广播结束信号
+        # 监控: master 结束 (正常路径) 或任一 worker 提前退出 (崩溃) → 广播结束信号;
+        # 信号写入后给 worker 节点 _GRACE_PERIOD_KILL_SEC 收到信号退出, 超时仍未退出的
+        # 主动 docker rm -f (等价 CI 外层 runner 检测 pod 非 Running 后删 job)
         released = False
+        released_at = None
+        killed = False
         while any(t.is_alive() for t in threads.values()):
             if (not released and not dry_run
                     and (not threads[master_key].is_alive()
                          or any(not threads[k].is_alive() for k in worker_keys))):
                 coord.patch_data({_ACTIVE_TEST_CLASS_KEY: _RELEASE_VALUE})
                 released = True
+                released_at = time.perf_counter()
                 # 区分释放原因便于排查: master 退出 (正常/异常) vs worker 提前退出 (崩溃)
                 # 注意: master 异常退出时 worker 可能仍在服务, 此信号会让 worker 提前退出,
                 # 测试结果应以 master 的 case.log 为准
@@ -1008,6 +1091,16 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                          else "worker 节点提前退出")
                 _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
                      "等待 worker 节点退出")
+            # grace period 超时后, 仍有容器未退出 → 强杀
+            if (released and not killed and not dry_run
+                    and time.perf_counter() - released_at > _GRACE_PERIOD_KILL_SEC):
+                for (i, n), k in zip(units, keys):
+                    if threads[k].is_alive():
+                        container = f"sgl-pipeline-{suite.name}-{k}"
+                        _log(f"[execute] {suite.name}/{k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
+                             f"未退出, 强制删除容器 {container}")
+                        _kill_container(n, container)
+                killed = True
             time.sleep(5)
         for t in threads.values():
             t.join()

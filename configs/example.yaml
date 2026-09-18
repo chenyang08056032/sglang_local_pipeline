@@ -8,6 +8,9 @@ run:
                    # false=离线: 镜像/代码已手动就位, 不联网不动代码
   docker:
     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
+    # extra_mounts:                          # 额外 docker -v 挂载 (追加到 driver/缓存等默认挂载之后), 默认无
+    #   - "/data/models:/models"             # 普通挂载
+    #   - "/etc/myconf:/etc/myconf:ro"       # 只读挂载
 
 nodes:
   - host: 192.168.10.1   # A3, 16 卡

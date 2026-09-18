@@ -14,6 +14,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -29,7 +30,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import (_ARCH_NPUS, _MULTI_ROLES, execute_multinode_suite,
+from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, execute_multinode_suite,
                       execute_multinode_tp_suite, execute_suite, prepare_node)
 
 
@@ -61,6 +62,8 @@ class DockerConfig:
     devices: Union[str, List[int]] = "auto"  # "auto"=按节点 arch 推导卡数生成 davinci0..N-1
     net: str = "host"
     shm_size: str = "16g"
+    # 额外挂载 (追加到默认 _NODE_MOUNTS 之后), 格式同 docker -v: "host:container[:ro]"
+    extra_mounts: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -128,6 +131,7 @@ def load_config(path):
         devices=docker_raw.get("devices", "auto"),
         net=docker_raw.get("net", "host"),
         shm_size=docker_raw.get("shm_size", "16g"),
+        extra_mounts=list(docker_raw.get("extra_mounts") or []),
     )
     prepare = PrepareConfig(online=run_raw.get("prepare", False))
     code_raw = run_raw.get("code", {})
@@ -248,12 +252,10 @@ def wait_until(target_dt):
         remaining = (target_dt - now).total_seconds()
         if remaining <= 0:
             break
-        ts = now.strftime("%H:%M:%S")
-        print(f"[{ts}][定时] 等待至 {target_dt.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"(剩余 {int(remaining)} 秒)", flush=True)
+        _log(f"[定时] 等待至 {target_dt.strftime('%Y-%m-%d %H:%M:%S')} "
+             f"(剩余 {int(remaining)} 秒)")
         time.sleep(min(remaining, 60))
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}][定时] "
-          f"到达指定时间, 开始执行", flush=True)
+    _log(f"[定时] 到达指定时间, 开始执行")
 
 
 def parse_args():
@@ -268,10 +270,10 @@ def parse_args():
 
 
 def print_config(cfg, config_path):
-    print(f"[配置] {config_path}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
-          f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
-          f"repo={cfg.run.repo}")
-    print(f"[配置] 镜像: {cfg.run.docker.image}")
+    _log(f"[配置] {config_path}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
+        f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
+        f"repo={cfg.run.repo}")
+    _log(f"[配置] 镜像: {cfg.run.docker.image}")
 
 
 def filter_suites(cfg, names):
@@ -281,10 +283,10 @@ def filter_suites(cfg, names):
     selected = set(names)
     cfg.suites = [s for s in cfg.suites if s.name in selected]
     if not cfg.suites:
-        print(f"[错误] 没有匹配的用例: {', '.join(selected)}")
+        _log(f"[错误] 没有匹配的用例: {', '.join(selected)}")
         return False
-    print(f"[过滤] --suite 命中 {len(cfg.suites)} 个用例: "
-          f"{', '.join(s.name for s in cfg.suites)}")
+    _log(f"[过滤] --suite 命中 {len(cfg.suites)} 个用例: "
+         f"{', '.join(s.name for s in cfg.suites)}")
     return True
 
 
@@ -306,12 +308,12 @@ def prepare_nodes(cfg, dry_run):
     for host in dict.fromkeys(h for s in cfg.suites for h in _suite_hosts(s)):
         node = cfg.find_node(host)
         if node is None:
-            print(f"[错误] 用例引用的节点未在 nodes 中定义: {host}")
+            _log(f"[错误] 用例引用的节点未在 nodes 中定义: {host}")
             return None
         print(f"\n----- [prepare] {host} -----")
         prepared[host] = prepare_node(cfg, node, dry_run)
         if not prepared[host]:
-            print(f"[错误] 节点 {host} 准备失败, 其用例将全部记为失败 (status=error)")
+            _log(f"[错误] 节点 {host} 准备失败, 其用例将全部记为失败 (status=error)")
     return prepared
 
 
@@ -323,7 +325,7 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
         hosts = _suite_hosts(suite)
         if not all(prepared.get(h) for h in hosts):
             missing = [h for h in hosts if not prepared.get(h)]
-            print(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
+            _log(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
             res = {"name": suite.name, "node": ",".join(hosts),
                    "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                    "duration_sec": 0, "error": "节点准备失败, 未执行"}
@@ -338,7 +340,7 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
         if dry_run:
             res["status"] = "dryrun"
         results.append(res)
-        print(f"[结果] {suite.name}: {res['status']}")
+        _log(f"[结果] {suite.name}: {res['status']}")
     return results
 
 
@@ -375,14 +377,16 @@ def main():
     try:
         cfg = load_config(args.config)
     except (ValueError, KeyError, yaml.YAMLError, OSError) as e:
-        print(f"[错误] 配置文件无效: {e}")
+        _log(f"[错误] 配置文件无效: {e}")
         return 2
     print_config(cfg, args.config)
 
     if not filter_suites(cfg, args.suite):
         return 2
 
-    run_id = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # run_id = {yaml_stem}-{timestamp}: 文件名表职责 (summary.json), 目录名表来源 (哪个 yaml + 什么时间)
+    yaml_stem = re.sub(r"\.(ya?ml)$", "", os.path.basename(args.config), flags=re.I)
+    run_id = f"{yaml_stem}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     run_dir = os.path.join(cfg.output_dir, run_id)
     os.makedirs(run_dir, exist_ok=True)
     print(f"===== 流水线 run_id={run_id}  用例={len(cfg.suites)} =====")
