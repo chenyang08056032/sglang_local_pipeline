@@ -6,13 +6,16 @@
 
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 # 各架构的标准卡数 (挂卡数量的唯一事实来源, run.py 的配置校验也依赖它)
 _ARCH_NPUS = {"a3": 16, "a5": 8}
@@ -67,10 +70,11 @@ def _is_local(node):
     return node.host in _local_ips()
 
 
-def ssh_run(node, command, log_path=None, dry_run=False, prefix=None):
+def ssh_run(node, command, log_path=None, dry_run=False, prefix=None, quiet=False):
     """执行命令: 本机节点直接 subprocess, 远程走 SSH。实时回显 + 写日志。
 
     prefix: 多角色并发执行时给控制台每行加前缀 (如 "[prefill] "); 日志文件始终是原始输出。
+    quiet: 不回显控制台, 只写日志文件 (多机用例的 PD/worker 角色, 控制台只留测试角色)。
     开始/结束打印 [ssh] 连接诊断 (执行方式/目标节点/rc/耗时), 便于排查多机连接问题。
     """
     local = _is_local(node)
@@ -107,7 +111,8 @@ def ssh_run(node, command, log_path=None, dry_run=False, prefix=None):
         log_f = open(log_path, "a", encoding="utf-8", errors="ignore")
     try:
         for line in proc.stdout:
-            print(f"{prefix}{line}", end="") if prefix else print(line, end="")
+            if not quiet:
+                print(f"{prefix}{line}", end="") if prefix else print(line, end="")
             if log_f:
                 log_f.write(line)
                 log_f.flush()
@@ -197,6 +202,11 @@ _COORD_URL = os.environ.get("SGLANG_COORD_URL", "").rstrip("/")
 
 if _COORD_URL and "kubernetes" not in sys.modules:
 
+    # 协调服务在内网执行机上, 请求必须直连: 容器若预置了 http_proxy,
+    # urllib 默认经代理访问内网地址会超时; 空 ProxyHandler 强制绕过代理
+    # (不影响用例自身走代理下载模型等需求)
+    _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     class _ApiException(Exception):
         def __init__(self, status=0, reason=""):
             super().__init__(f"({status}) Reason: {reason}")
@@ -211,7 +221,7 @@ if _COORD_URL and "kubernetes" not in sys.modules:
 
     class _CoreV1Api:
         def read_namespaced_config_map(self, name, namespace):
-            with urllib.request.urlopen(_COORD_URL + "/configmap", timeout=15) as r:
+            with _OPENER.open(_COORD_URL + "/configmap", timeout=15) as r:
                 return _ConfigMap(json.loads(r.read().decode())["data"])
 
         def patch_namespaced_config_map(self, name, namespace, body):
@@ -221,7 +231,7 @@ if _COORD_URL and "kubernetes" not in sys.modules:
                 headers={"Content-Type": "application/json"},
                 method="PATCH",
             )
-            with urllib.request.urlopen(req, timeout=15):
+            with _OPENER.open(req, timeout=15):
                 pass
             return _ConfigMap()
 
@@ -307,6 +317,63 @@ runpy.run_path(_file, run_name="__main__")
 '''
 
 
+def _port_occupants(port):
+    """占用指定监听端口的进程列表 [(pid, name, cmdline)]; 无法解析时返回 []。"""
+    try:
+        r = subprocess.run(["ss", "-tlnpH", f"sport = :{port}"],
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+    occupants = []
+    for line in r.stdout.splitlines():
+        m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', line)
+        if not m:
+            continue
+        pid = int(m.group(2))
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = " ".join(
+                    f.read().decode(errors="ignore").split("\0")).strip()
+        except OSError:
+            cmdline = m.group(1)
+        occupants.append((pid, m.group(1), cmdline))
+    return occupants
+
+
+def _reclaim_coord_port():
+    """释放被残留流水线进程占用的协调端口, 供新一轮多机用例使用。
+
+    只清理 cmdline 含 run.py 的进程 (上一轮未退干净的流水线); 被无关进程
+    误占时不动它, 返回 False 由调用方报错。返回 True 表示端口已可用。
+    """
+    # 防御性排除自身 pid, 避免极端情况下误杀当前进程
+    occupants = [o for o in _port_occupants(_COORD_DEFAULT_PORT)
+                 if o[0] != os.getpid()]
+    stale = [o for o in occupants if "run.py" in o[2]]
+    if not stale:
+        # 无可清理对象: 要么已空闲 (对端恰好退出), 要么被无关进程占用
+        return not occupants
+    for pid, _, cmdline in stale:
+        _log(f"[coord] 清理占用 {_COORD_DEFAULT_PORT} 的残留流水线进程: "
+             f"pid={pid} ({cmdline})")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(20):  # 最多等 10s 让 SIGTERM 生效
+        if not _port_occupants(_COORD_DEFAULT_PORT):
+            return True
+        time.sleep(0.5)
+    for pid, _, _ in stale:
+        _log(f"[coord] SIGTERM 未退出, 强杀 pid={pid}")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(1)
+    return not _port_occupants(_COORD_DEFAULT_PORT)
+
+
 class _CoordHandler(BaseHTTPRequestHandler):
     """协调服务的 HTTP 接口: GET/PATCH /configmap (与 K8s patch 语义一致, 按 key 合并)。"""
 
@@ -352,13 +419,26 @@ class CoordService:
         self._httpd = None
 
     def start(self):
+        # 环境契约: 节点侧只放行 9377 (见配置头部前置说明), 不回退随机端口
+        # (远程节点会静默连不上)。端口被占时先自动清理残留的流水线进程,
+        # 清不掉 (被无关进程占用) 才报错
         try:
             self._httpd = ThreadingHTTPServer(
                 ("0.0.0.0", _COORD_DEFAULT_PORT), _CoordHandler)
         except OSError:
-            self._httpd = ThreadingHTTPServer(("0.0.0.0", 0), _CoordHandler)
-            print(f"[警告] 端口 {_COORD_DEFAULT_PORT} 被占用, "
-                  f"协调服务改用随机端口 {self.port}")
+            if not _reclaim_coord_port():
+                leftovers = _port_occupants(_COORD_DEFAULT_PORT)
+                detail = "; ".join(f"pid={p} ({c})" for p, _, c in leftovers)
+                kills = "; ".join(f"kill -9 {p}" for p, _, _ in leftovers)
+                raise RuntimeError(
+                    f"协调端口 {_COORD_DEFAULT_PORT} 被 {detail or '未知进程'} 占用, "
+                    f"且无法自动清理, 手动处理: {kills or 'ss -tlnp 检查后处理'}, "
+                    f"完成后重跑")
+            try:
+                self._httpd = ThreadingHTTPServer(
+                    ("0.0.0.0", _COORD_DEFAULT_PORT), _CoordHandler)
+            except OSError as e:
+                raise RuntimeError(f"清理残留进程后仍无法绑定协调端口: {e}")
         self._httpd.coord = self
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
@@ -536,6 +616,16 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     envs = dict(cfg.run.env)
     if extra_env:
         envs.update(extra_env)
+    # 内网直连: 节点 /root/.docker/config.json 的 proxies 配置会向容器注入
+    # http_proxy, requests/urllib 访问内网地址 (协调服务 / server 健康检查)
+    # 经代理会超时; 对所有节点 + 协调地址设置 no_proxy, 外网下载仍走代理。
+    # 显式 -e 优先于 docker config 注入, 不被节点侧配置覆盖
+    no_proxy = {n.host for n in cfg.nodes} | {"localhost", "127.0.0.1", "::1"}
+    if str(envs.get("SGLANG_COORD_URL", "")).startswith("http"):
+        no_proxy.add(urlparse(envs["SGLANG_COORD_URL"]).hostname)
+    combined = ",".join(sorted(no_proxy))
+    for k in ("no_proxy", "NO_PROXY"):
+        envs[k] = f"{envs[k]},{combined}" if envs.get(k) else combined
     env_args = [v for k, val in envs.items()
                 for v in ("-e", f"{k}={shlex.quote(str(val))}")]
 
@@ -730,8 +820,11 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)
                 log_path = os.path.join(local_run_dir, suite.name, key, "case.log")
+                # PD 角色日志量大且与 router 交错, 只写文件不回显 (对齐 CI 各 pod
+                # 日志隔离的观感, 控制台只看 router 的测试输出)
                 rc[key] = ssh_run(node, cmd, log_path=log_path,
-                                 dry_run=dry_run, prefix=f"[{key}] ")
+                                  dry_run=dry_run, prefix=f"[{key}] ",
+                                  quiet=(role != "router"))
             except Exception as e:
                 rc[key] = -1
                 errs[key] = f"{type(e).__name__}: {e}"
@@ -769,7 +862,9 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
             elif rc.get(key) == 0:
                 _log(f"[execute] {suite.name}/{key} 正常结束 (rc=0, 耗时 {dur}s)")
             else:
-                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s)")
+                # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
+                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
+                     f"日志: {os.path.join(local_run_dir, suite.name, key, 'case.log')}")
 
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
@@ -883,8 +978,10 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)
                 log_path = os.path.join(local_run_dir, suite.name, key, "case.log")
+                # worker 角色只写文件不回显, 控制台只保留 master 的测试输出
                 rc[key] = ssh_run(node, cmd, log_path=log_path,
-                                 dry_run=dry_run, prefix=f"[{key}] ")
+                                  dry_run=dry_run, prefix=f"[{key}] ",
+                                  quiet=(key != master_key))
             except Exception as e:
                 rc[key] = -1
                 errs[key] = f"{type(e).__name__}: {e}"
@@ -922,7 +1019,9 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             elif rc.get(key) == 0:
                 _log(f"[execute] {suite.name}/{key} 正常结束 (rc=0, 耗时 {dur}s)")
             else:
-                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s)")
+                # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
+                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
+                     f"日志: {os.path.join(local_run_dir, suite.name, key, 'case.log')}")
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
         failed = {k: (errs.get(k)

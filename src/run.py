@@ -169,6 +169,16 @@ def load_config(path):
         if len(specified) > 1:
             raise ValueError(
                 f"用例 {s['name']}: {'/'.join(specified)} 互斥, 只能配一个")
+        node = s.get("node")
+        if not specified:
+            # 三者均未配: 恰好只定义 1 个节点时默认该节点 (单机配置可省略 node);
+            # 多节点时无法推断, 显式报错
+            if len(nodes) != 1:
+                raise ValueError(
+                    f"用例 {s['name']}: 须配 node/roles/multinode 之一 "
+                    f"(仅当 nodes 恰好定义 1 个节点时 node 才可省略, "
+                    f"当前定义了 {len(nodes)} 个)")
+            node = nodes[0].host
         if roles:
             missing = set(_MULTI_ROLES) - set(roles)
             if missing:
@@ -202,7 +212,7 @@ def load_config(path):
                     f"用例 {s['name']}: multinode 须为 ≥2 个节点的列表"
                     f" (单节点请用 node)")
         suites.append(SuiteConfig(
-            name=s["name"], node=s.get("node"), file=s["file"],
+            name=s["name"], node=node, file=s["file"],
             timeout_minutes=s.get("timeout_minutes"),
             roles=roles, multinode=multinode,
         ))

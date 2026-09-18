@@ -43,54 +43,106 @@ sglang_local_pipeline/
 
 ## 3. 配置文件说明
 
-复制 `configs/example.yaml` 修改。**下列字段均有代码默认值，不写即取默认**：`prepare=false`、`code.ref=main`、`docker.devices=auto`、`docker.net=host`、`docker.shm_size=16g`、`nodes[].user=root`、`nodes[].port=22`。**`nodes[].arch` 为必填**（`a3`=16 卡、`a5`=8 卡，缺失或拼错启动时报错），节点挂卡数量在 `docker.devices` 取默认 `auto` 时由 arch 决定（显式配 devices 列表时以列表为准）。sglang 源码**固定放在 `{workspace}/sglang`**（联网模式 clone 到这里，离线模式需手动就位）；执行机结果目录**固定为 `{workspace}/results`**（与节点 `runs/` 平级，同机不冲突）。**`run.env` 也有内置默认值**（见下），通常无需在 YAML 里写出，仅当需要覆盖某项时才写 `run.env`。完整字段参考如下：
+复制 `configs/example.yaml` 修改。各参数的默认值、是否必填按段落列表如下，YAML 里不写即取默认值。
+
+### 3.1 run 段
+
+| 参数 | 默认值 | 必填 | 说明 |
+|---|---|---|---|
+| `run.workspace` | 无 | 是 | 节点上的工作目录。sglang 仓固定在 `{workspace}/sglang`，执行机结果目录固定在 `{workspace}/results`（与节点 `runs/` 平级，同机不冲突），均不可另配 |
+| `run.prepare` | `false` | 否 | `true`=联网：镜像 pull + 代码 clone/fetch/checkout；`false`=离线：镜像/代码需提前手动就位，流水线不联网、不动代码 |
+| `run.code.git_remote` | 无 | `prepare: true` 时必填 | clone/fetch 来源。**仅联网模式读取**；离线模式不生效，配置里可整段省略 |
+| `run.code.ref` | `main` | 否 | 目标版本：分支名 / tag / commit SHA。仅联网模式 checkout |
+| `run.docker.image` | 无 | 是 | 测试容器镜像 |
+| `run.docker.devices` | `auto` | 否 | `auto`=按节点 arch 推导卡数映射 `/dev/davinci0..N-1`（a3=16、a5=8）+ 管理设备；或显式列表如 `[0,1,2,3]`，以列表为准 |
+| `run.docker.net` | `host` | 否 | 容器网络模式 |
+| `run.docker.shm_size` | `16g` | 否 | 容器共享内存大小；固定附加 `--privileged --ipc=host` |
+| `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
+
+### 3.2 nodes 段
+
+| 参数 | 默认值 | 必填 | 说明 |
+|---|---|---|---|
+| `nodes[].host` | 无 | 是 | 节点 IP。指向执行机本身时自动本地执行（不走 SSH、无需免密） |
+| `nodes[].arch` | 无 | 是 | 节点架构：`a3`=16 卡、`a5`=8 卡。决定挂卡数量（devices=auto 时）及 A5 单机用例 `--tp-size` 减半适配；缺失或拼错启动时报错 |
+| `nodes[].user` | `root` | 否 | SSH 用户名 |
+| `nodes[].port` | `22` | 否 | SSH 端口 |
+
+### 3.3 suites 段
+
+| 参数 | 默认值 | 必填 | 说明 |
+|---|---|---|---|
+| `suites[].name` | 无 | 是 | 用例名称（`--suite` 过滤用） |
+| `suites[].node` | 无 | 三选一 | 单机用例：执行的节点 host。**nodes 仅定义 1 个节点时可省略**，默认用该节点；多节点时必须显式指定 |
+| `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 7 节）：prefill/decode/router → 节点 |
+| `suites[].multinode` | 无 | 三选一 | 多机混布 TP 用例（第 8 节）：节点列表，第一个 = master |
+| `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo 或 `~/.cache`） |
+| `suites[].timeout_minutes` | 无（不限时） | 否 | docker run 超时（分钟）。多机用例为每角色容器超时，prefill/decode/worker 实际再加 2 分钟余量 |
+
+`node` / `roles` / `multinode` 三者互斥，只能配一个。
+
+### 3.4 run.env 内置默认值
+
+不写 `run.env` 时容器自动注入以下 6 项（与 CI 一致）；需覆盖某项或追加新键时才写：
+
+| 环境变量 | 默认值 |
+|---|---|
+| `SGLANG_USE_MODELSCOPE` | `true` |
+| `HF_ENDPOINT` | `https://hf-mirror.com` |
+| `SGLANG_IS_IN_CI` | `true` |
+| `TORCH_EXTENSIONS_DIR` | `/tmp/torch_extensions` |
+| `PYTORCH_NPU_ALLOC_CONF` | `expandable_segments:True` |
+| `STREAMS_PER_DEVICE` | `32` |
+
+此外流水线会自动为所有容器注入 `no_proxy`/`NO_PROXY`（含全部节点 IP + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
+
+### 3.5 配置示例（联网模式）
 
 ```yaml
 run:
-  workspace: /root/sglang_local_pipeline   # 节点上的工作目录（运行产物 + sglang 仓都在这里）
+  workspace: /root/sglang_local_pipeline
+  prepare: true                                # 离线改 false, 且 code: 段可整段删除
   code:
-    git_remote: https://github.com/sgl-project/sglang.git   # clone 来源
-    ref: main                           # 目标版本: 分支名 / tag / commit SHA (默认 main)
-  prepare: true                         # 默认 false (离线); true=联网: 镜像 pull + 代码 clone/fetch/checkout
-                                        # false=离线: 镜像/代码已手动就位, 不联网不动代码
+    git_remote: https://github.com/sgl-project/sglang.git
+    ref: main
   docker:
-    image: <镜像地址>                    # 测试容器镜像
-    devices: auto                       # auto=按节点 arch 推导卡数映射; 或列表 [0,1,2,3] (默认 auto)
-    net: host                           # 默认 host
-    shm_size: 16g                       # 默认 16g; 固定附加 --privileged --ipc=host
-  env:                                  # 注入容器的环境变量; 下列 6 项为内置默认, 通常省略;
-                                        # 仅当需覆盖某项或追加新键时才写 run.env (按 key 合并)
-    SGLANG_USE_MODELSCOPE: "true"
-    HF_ENDPOINT: https://hf-mirror.com
-    SGLANG_IS_IN_CI: "true"
-    TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
-    PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
-    STREAMS_PER_DEVICE: "32"
+    image: <镜像地址>
 
-nodes:                                  # 所有可用节点
-  - host: 192.168.10.1                  # A3
-    user: root                          # 默认 root
-    port: 22                            # 默认 22
-    arch: a3                            # 节点架构, 必填; 决定挂卡数量 (a3=16, a5=8)
-  - host: 192.168.10.2                  # A5 (user/port 均取默认值时可整段省略, 仅留 host)
-    arch: a5                            # 标记 A5 节点: 卡数为 8; 其上执行的单机用例
-                                        # --tp-size 自动减半 (见第 9 节 FAQ)
+nodes:
+  - host: 192.168.10.1                  # A3; user/port 取默认时可只写 host + arch
+    arch: a3
+  - host: 192.168.10.2                  # A5 (8 卡, 单机用例 --tp-size 自动减半)
+    arch: a5
 
-suites:                                 # 要执行的用例，串行执行
-  - name: qwen3-32b-gsm8k               # 用例名称 (--suite 过滤用)
-    node: 192.168.10.1                  # 在哪个节点执行 (单机用例)
-    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # 相对 repo 的路径；绝对路径须在容器可见的挂载内（repo 或 ~/.cache）
-    timeout_minutes: 120                # 整个 docker run 的超时（分钟），可省略
-  # - name: dsv4-flash-w8a8-1p1d-16p    # 多机 PD 分离用例 (与 node 互斥), 详见第 7 节
-  #   roles:                            # prefill/decode/router 三个角色各配一个节点
-  #     prefill: 192.168.10.1
-  #     decode: 192.168.10.2
-  #     router: 192.168.10.1
-  #   file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
-  #   timeout_minutes: 240              # 每个角色容器的超时（分钟）
+suites:
+  - name: qwen3-32b-gsm8k
+    node: 192.168.10.1
+    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
+    timeout_minutes: 120
+  # 多机用例用 roles / multinode 代替 node, 见第 7/8 节
 ```
 
-`configs/example.yaml` 本身就是按上述默认值精简后的最小形态，直接参考它即可。
+### 3.6 最小配置（单节点离线）
+
+`nodes` 仅定义 1 个节点时，用例的 `node` 可省略（默认用该节点），单机快速验证的配置精简到：
+
+```yaml
+run:
+  workspace: /root/sglang_local_pipeline
+  docker:
+    image: <镜像地址>
+
+nodes:
+  - host: 192.168.10.1
+    arch: a3
+
+suites:
+  - name: qwen3-32b-gsm8k
+    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
+    timeout_minutes: 120
+```
+
+注意：该默认仅在**恰好 1 个节点**时生效。多节点配置下用例漏配 `node`/`roles`/`multinode` 会在启动时直接报错（不会静默选择某个节点）。
 
 ## 4. 快速开始
 
@@ -295,7 +347,7 @@ suites:
 
 这类用例（`TestNpuPerfMultiNodePdSepTestCaseBase`）原本跑在 K8s 上：用 `HOSTNAME` 区分角色、`POD_IP` 标识地址、ConfigMap 做节点发现与结束通知。本地无 K8s，流水线做了等价替代，**不修改 sglang 代码**：
 
-1. 执行机起一个轻量 HTTP 协调服务（默认端口 9377，被占用自动换随机端口），模拟 ConfigMap 的读/写；
+1. 执行机起一个轻量 HTTP 协调服务（固定端口 9377，模拟 ConfigMap 的读/写。端口被残留的流水线进程占用时自动清理后重试；被无关进程占用或清理失败则启动报错，报错信息附带手动 kill 命令。**不会回退随机端口**——环境只放行 9377，换端口会导致远程节点静默连不上）；
 2. 每个角色容器启动前注入 `sitecustomize.py`（落在挂载的 /output，经 `PYTHONPATH` 生效），把用例用到的 kubernetes 客户端接口重定向到协调服务；
 3. 流水线预置所有 pod 的注册信息 `sglang-prefill-0`/`sglang-prefill-1`/`sglang-decode-0`/... → 节点 IP（K8s 里由各 pod 自注册），PD 节点据此确定 master 地址和 `ASCEND_MF_STORE_URL`，router 据此收集 PD 地址列表；
 4. 所有节点**并发** `docker run` 同一用例文件，以环境变量区分角色和序号：
@@ -310,9 +362,11 @@ suites:
 | 项目 | 要求 |
 |---|---|
 | 节点间网络互通 | router 需访问 prefill/decode 的 8000 端口；PD 分离还用到 8995（bootstrap）、24666（MF store）等端口，节点间防火墙需放行 |
-| 节点可达执行机 | 各节点容器需访问执行机的协调服务端口（默认 9377）。执行机在 NAT 后、节点无法回访时不支持 |
+| 节点可达执行机 | 各节点容器需访问执行机的协调服务端口（固定 9377）。执行机在 NAT 后、节点无法回访时不支持 |
 | 模型缓存 | prefill/decode 节点均需预置模型缓存（`~/.cache`，与单机用例一致） |
 | 镜像 | router 所在节点镜像需含 `sglang_router`（与 CI 一致的镜像已含；缺失时 router 日志会报 ModuleNotFoundError） |
+
+节点 `/root/.docker/config.json` 配了代理也不影响：流水线给所有容器注入 `no_proxy`（含全部节点 IP），协调服务与节点互访直连（见 3.4）。
 
 ### 7.4 产物
 
@@ -339,7 +393,7 @@ results/{run_id}/
         └── plog/
 ```
 
-执行过程中控制台并发回显所有节点的输出，每行带 `[prefill-0] ` / `[prefill-1] ` / `[decode-0] ` / `[router-0] ` 前缀；各节点的 case.log 保持原始输出。
+执行过程中控制台**只回显 router 的输出**（每行带 `[router-0] ` 前缀），对齐 CI 各 pod 日志隔离的观感；prefill/decode 日志量大且与 router 交错，仅实时写入各自子目录的 case.log 不回显（PD 角色异常结束时，控制台的状态行会指明其 case.log 路径）。基准结果与断言看 `router-0/case.log`，PD 服务问题看对应角色目录。混布 TP 用例（第 8 节）同理：只回显 master（node-0），worker 仅写文件。
 
 ## 8. 多机（混布 TP）用例
 

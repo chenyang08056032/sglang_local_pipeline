@@ -1,58 +1,56 @@
-# sglang 本地流水线配置
+# sglang 本地流水线配置模板 (多节点示例, 实际使用时按环境裁剪)
 # 用法: python3 src/run.py --config configs/example.yaml
 # 字段默认值见 README 第 3 节; env 默认注入见 run.py 的 _DEFAULT_ENV
 
 run:
   workspace: /root/sglang_local_pipeline   # sglang 仓固定在 {workspace}/sglang
-  code:
-    git_remote: https://github.com/sgl-project/sglang.git   # prepare=true 时用于 clone/fetch
-  prepare: false                          # true=联网: 镜像 pull + 代码 clone/fetch/checkout
-                                          # false=离线: 镜像/代码已手动就位, 不联网不动代码
+  prepare: false   # true=联网: 镜像 pull + 代码 clone/fetch/checkout (需配 run.code.git_remote)
+                   # false=离线: 镜像/代码已手动就位, 不联网不动代码
   docker:
     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3
 
 nodes:
-  - host: 192.168.10.1            # A3 (arch=a3, 16 卡)
+  - host: 192.168.10.1   # A3, 16 卡
     arch: a3
-  - host: 192.168.10.2            # A3 (16 卡; 下方多机示例: 1p1d decode / 2p2d 第二个 prefill)
+  - host: 192.168.10.2   # A3, 16 卡; 下方多机示例的 1p1d decode / 2p2d 第二个 prefill
     arch: a3
-  - host: 192.168.10.3            # A3 (16 卡; 2p2d 示例的 decode)
+  - host: 192.168.10.3   # A3, 16 卡; 2p2d 示例的 decode
     arch: a3
-  - host: 192.168.10.4            # A3 (16 卡; 2p2d 示例的 decode)
+  - host: 192.168.10.4   # A3, 16 卡; 2p2d 示例的 decode
     arch: a3
-  - host: 192.168.10.5            # A5 (arch=a5, 8 卡); 多机示例均按 16 卡配 a3, 此节点未被引用
-    arch: a5                      # A5 节点: 其上的单机用例 --tp-size 自动减半 (脚本按 A3 卡数配置)
+  - host: 192.168.10.5   # A5, 8 卡; 其上的单机用例 --tp-size 自动减半 (脚本按 A3 卡数配置)
+    arch: a5
 
 suites:
+  # ---- 单机用例: node 指定执行节点 ----
   - name: test_npu_qwen3_32b
     node: 192.168.10.1
     file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # 相对 repo; 绝对路径须在容器可见挂载内 (repo 或 ~/.cache)
-    timeout_minutes: 120                # docker run 超时 (分钟), 可省略
+    timeout_minutes: 60   # docker run 超时 (分钟), 含模型下载/加载余量, 缓存全热可再压
 
-  # 多机 PD 分离用例 (与 node 二选一): prefill/decode 各占一个节点拉起服务,
-  # router 等 PD 就绪后拉起 router 并执行基准测试; 可复用 PD 节点或配独立节点。
-  # 详见 README 第 7 节 (节点间需互通, 且节点需可达执行机 9377 协调端口)。
-  # prefill/decode 支持多节点 (列表), router 只能单个 (sglang 框架限制)。
-  - name: dsv4-flash-w8a8-1p1d-16p        # 1p1d: prefill/decode 各 1 节点
+  # ---- 多机 PD 分离用例: roles 配角色节点 (与 node 互斥) ----
+  # prefill/decode 拉起服务, router 等 PD 就绪后执行基准测试; prefill/decode 支持
+  # 多节点 (列表), router 只能单个 (sglang 框架限制)。详见 README 第 7 节。
+  - name: dsv4-flash-w8a8-1p1d-16p
     roles:
       prefill: 192.168.10.1
       decode: 192.168.10.2
-      router: 192.168.10.1
+      router: 192.168.10.1   # router 不占 NPU, 复用 prefill 节点
     file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
-    timeout_minutes: 240              # 角色容器超时 (分钟); prefill/decode 实际再加 2 分钟余量
+    timeout_minutes: 120   # 角色容器超时 (分钟); prefill/decode 实际再加 2 分钟余量
 
-  - name: dsv4-flash-w8a8-2p2d-16p        # 2p2d: prefill/decode 各 2 节点
+  - name: dsv4-flash-w8a8-2p2d-16p
     roles:
       prefill: [192.168.10.1, 192.168.10.2]
       decode: [192.168.10.3, 192.168.10.4]
       router: 192.168.10.1
     file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_2p2d_16p.py
-    timeout_minutes: 240
+    timeout_minutes: 120
 
-  # 多机混布 TP 用例 (与 node/roles 三选一): 多节点组成一个 sglang server 实例 (TP 跨节点),
-  # 第一个节点 = master (跑测试), 其余 = worker (只起 server); 无 PD 分离/router 角色。
-  # 详见 README 第 8 节。
-  - name: glm5_2-16p-gpqa                 # 2 节点混布 TP
+  # ---- 多机混布 TP 用例: multinode 配节点列表 (与 node/roles 互斥) ----
+  # 多节点组成一个 sglang server 实例 (TP 跨节点), 第一个节点 = master (跑测试),
+  # 其余 = worker (只起 server)。详见 README 第 8 节。
+  - name: glm5_2-16p-gpqa
     multinode: [192.168.10.1, 192.168.10.2]
     file: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-    timeout_minutes: 240              # 节点容器超时 (分钟); worker 实际再加 2 分钟余量
+    timeout_minutes: 120   # 节点容器超时 (分钟); worker 实际再加 2 分钟余量
