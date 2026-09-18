@@ -37,6 +37,13 @@ _NODE_MOUNTS = [
 _LOCAL_IPS_CACHE = None
 
 
+def _log_filename(suite):
+    """用例脚本名去 .py 加 .log, 作为容器内 tee 和本地 log_path 的统一文件名。
+    比固定的 'case.log' 更直观: 文件名即用例名, 一眼可知是哪个用例的日志。
+    """
+    return os.path.splitext(os.path.basename(suite.file))[0] + ".log"
+
+
 def _local_ips():
     """收集本机所有 IP, 用于判断节点是否就是执行机本身。
 
@@ -70,11 +77,17 @@ def _is_local(node):
     return node.host in _local_ips()
 
 
-def ssh_run(node, command, log_path=None, dry_run=False, prefix=None, quiet=False):
+def ssh_run(node, command, log_path=None, diag_path=None,
+            dry_run=False, prefix=None, quiet=False):
     """执行命令: 本机节点直接 subprocess, 远程走 SSH。实时回显 + 写日志。
 
     prefix: 多角色并发执行时给控制台每行加前缀 (如 "[prefill] "); 日志文件始终是原始输出。
-    quiet: 不回显控制台, 只写日志文件 (多机用例的 PD/worker 角色, 控制台只留测试角色)。
+    quiet: 不回显控制台, 只写日志文件 (多机用例的 PD/worker 角色, 控制台只留测试角色);
+        [ssh] 连接诊断同样只落日志, 失败 (rc!=0) 时强制上控制台, 不静默失败。
+    log_path: 容器实时输出 (stdout 流) 写入此文件; fetch 阶段会被容器内 tee 版本覆盖
+        (tee 版本更完整: 不受 SSH 断开/timeout 截断影响)。
+    diag_path: [ssh] 连接诊断 (开始/结束/rc/耗时) 写入此独立文件; fetch 不覆盖,
+        保证用例日志被覆盖后仍可查连接记录。无 diag_path 时回退写 log_path。
     开始/结束打印 [ssh] 连接诊断 (执行方式/目标节点/rc/耗时), 便于排查多机连接问题。
     """
     local = _is_local(node)
@@ -88,7 +101,29 @@ def ssh_run(node, command, log_path=None, dry_run=False, prefix=None, quiet=Fals
     target = "本机" if local else f"ssh {node.user}@{node.host}:{node.port}"
     preview = " ".join(command.split())[:120]
     tic = time.perf_counter()
-    _log(f"{prefix or ''}[ssh] 开始 {target}: {preview}")
+    # 实时流文件 (用例名.log): fetch 阶段会被容器 tee 版本覆盖
+    # 诊断文件 (ssh.log): 独立保留, fetch 不覆盖, 保证连接记录可查
+    log_f = None
+    diag_f = None
+    for p in (log_path, diag_path):
+        if p:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+    if log_path:
+        log_f = open(log_path, "a", encoding="utf-8", errors="ignore")
+    if diag_path:
+        diag_f = open(diag_path, "a", encoding="utf-8", errors="ignore")
+
+    def _diag(msg, force=False):
+        # 诊断优先落 diag_f (独立文件, fetch 不覆盖);
+        # 无 diag_f 时回退落 log_f (会被 fetch 覆盖, 但好过完全不记录)
+        for f in (diag_f, log_f):
+            if f:
+                f.write(msg + "\n")
+                f.flush()
+        if not quiet or force:  # quiet 角色失败时 (force) 仍上控制台, 不静默失败
+            _log(msg)
+
+    _diag(f"{prefix or ''}[ssh] 开始 {target}: {preview}")
     if local:
         proc = subprocess.Popen(
             command, shell=True,
@@ -97,18 +132,15 @@ def ssh_run(node, command, log_path=None, dry_run=False, prefix=None, quiet=Fals
         )
     else:
         # BatchMode=yes: 禁止交互式提示 (host key 未知/需 passphrase 时直接失败而非挂死);
-        # StrictHostKeyChecking=accept-new: 首次连接自动接受 host key, 避免提示
+        # StrictHostKeyChecking=accept-new: 首次连接自动接受 host key, 避免提示;
+        # LogLevel=ERROR: 抑制登录 banner ("Authorized users only..."), 纯噪音
         proc = subprocess.Popen(
             ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "LogLevel=ERROR",
              "-p", str(node.port), f"{node.user}@{node.host}", command],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="ignore", bufsize=1,
         )
-    log_f = None
-    if log_path:
-        # 先建目录再打开文件 (调用方不保证父目录已存在)
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        log_f = open(log_path, "a", encoding="utf-8", errors="ignore")
     try:
         for line in proc.stdout:
             if not quiet:
@@ -119,10 +151,13 @@ def ssh_run(node, command, log_path=None, dry_run=False, prefix=None, quiet=Fals
     finally:
         if log_f:
             log_f.close()
+        if diag_f:
+            diag_f.close()
         proc.wait()
     # [连接诊断] rc + 耗时: SSH 失败 (rc=255)、BatchMode 拒绝、命令超时等在此一目了然
     dur = round(time.perf_counter() - tic, 1)
-    _log(f"{prefix or ''}[ssh] 结束 {target} rc={proc.returncode} 耗时 {dur}s")
+    _diag(f"{prefix or ''}[ssh] 结束 {target} rc={proc.returncode} 耗时 {dur}s",
+          force=(proc.returncode != 0))
     return proc.returncode
 
 
@@ -147,14 +182,28 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
         return rc
     pull = subprocess.Popen(
         ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+         "-o", "LogLevel=ERROR",
          "-p", str(node.port), f"{node.user}@{node.host}",
          f"tar czf - -C '{remote_dir}' --exclude=./tmp ."],
         stdout=subprocess.PIPE,
     )
-    extract = subprocess.Popen(["tar", "xzf", "-", "-C", local_dir], stdin=pull.stdout)
+    # tar 的 "time stamp in the future" 告警是节点时钟偏差的免费探测器: 逐条刷屏
+    # 但完全丢弃会丢失该信号, 故压成一行汇总; 其余 tar 错误原样透出
+    extract = subprocess.Popen(
+        ["tar", "xzf", "-", "-C", local_dir],
+        stdin=pull.stdout, stderr=subprocess.PIPE, text=True, errors="ignore")
     pull.stdout.close()
-    rc = extract.wait()
+    _, tar_err = extract.communicate()
+    rc = extract.returncode
     pull_rc = pull.wait()
+    if tar_err:
+        future = [l for l in tar_err.splitlines() if "in the future" in l]
+        for l in tar_err.splitlines():
+            if "in the future" not in l:
+                _log(f"[fetch] tar: {l}")
+        if future:
+            _log(f"[fetch] 警告: {node.host} 时钟快于本机 "
+                 f"(检出 {len(future)} 个未来时间戳, 明细略), 建议校时")
     # 任一端失败都算拉回失败 (ssh 断开 / 远程 tar 出错 / 本地 tar 解压出错)
     return rc if rc != 0 else pull_rc
 
@@ -506,8 +555,14 @@ def _local_ip_towards(host):
         return None
 
 
-def _stage_sitecustomize(node, run_dir, dry_run=False):
-    """把 fake kubernetes 桥接写到节点 run 目录 (容器内 /output, 经 PYTHONPATH 生效)。"""
+def _stage_sitecustomize(node, run_dir, dry_run=False, prefix=None, quiet=False,
+                         diag_path=None):
+    """把 fake kubernetes 桥接写到节点 run 目录 (容器内 /output, 经 PYTHONPATH 生效)。
+
+    prefix/quiet/diag_path 透传 ssh_run: 与主命令同规则, quiet 角色的 [ssh] 诊断
+    只落 ssh.log 不刷控制台 (失败时仍上控制台), 保证连接记录完整。
+    staging 只记诊断不记实时流 (一条 cat 命令, 无容器 stdout)。
+    """
     path = f"{run_dir}/sitecustomize.py"
     if dry_run:
         print(f"[dry-run] 写入 {path}: fake kubernetes 协调桥接 "
@@ -517,7 +572,7 @@ def _stage_sitecustomize(node, run_dir, dry_run=False):
            f"cat > {shlex.quote(path)} <<'SGL_PIPELINE_EOF'\n"
            f"{_SITECUSTOMIZE}"
            f"SGL_PIPELINE_EOF\n")
-    return ssh_run(node, cmd)
+    return ssh_run(node, cmd, prefix=prefix, quiet=quiet, diag_path=diag_path)
 
 
 def _stage_run_wrapper(node, run_dir, dry_run=False):
@@ -622,7 +677,7 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
                f"{shlex.quote(suite.file)} -f")
     else:
         cmd = f"cd {q_repo} && python3 -u {shlex.quote(suite.file)} -f"
-    parts.append(f"{cmd} 2>&1 | tee /output/case.log")
+    parts.append(f"{cmd} 2>&1 | tee /output/{_log_filename(suite)}")
 
     inner = "\n".join(parts)
 
@@ -696,17 +751,18 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     return "\n".join(lines)
 
 
-def _fetch_artifacts(node, node_run_dir, local_dir, label):
-    """拉回一个执行单元的产物 (case.log + plog/, 不含 tmp/)。
+def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
+    """拉回一个执行单元的产物 (用例名.log + ssh.log + plog/, 不含 tmp/)。
 
-    本机节点: 拷贝成功后清理 runs/ 侧副本省磁盘 (results/ 已有一份);
+    本机节点: 拷贝成功后清理 runs/ 侧副本省磁盘 (results/ 已有一份), 并逐级
+    清掉因此变空的上层目录直到 runs/ 根 (含; 之上的 workspace 不动);
     远程节点: runs/ 是节点侧唯一原始数据, 始终保留。
     """
     frc = ssh_fetch_dir(node, node_run_dir, local_dir)
     if frc != 0:
         _log(f"[fetch] {label} 拉回失败 (rc={frc}), 保留节点侧原件: {node_run_dir}")
         return
-    _log(f"[fetch] {label} 拉回完成 (case.log + plog/, 未回传 tmp/)")
+    _log(f"[fetch] {label} 拉回完成 (用例日志 + plog/, 未回传 tmp/)")
     if not _is_local(node):
         return
     try:
@@ -714,13 +770,18 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label):
         _log(f"[fetch] {label} 已清理本机节点侧目录: {node_run_dir}")
     except OSError as e:
         _log(f"[fetch] {label} 清理失败 ({e}), 保留: {node_run_dir}")
-    # 上层目录空了则顺手清掉 (其他用例/角色还在用时 rmdir 自然失败)
-    for d in (os.path.dirname(node_run_dir),
-              os.path.dirname(os.path.dirname(node_run_dir))):
+    # 逐级向上清掉变空的目录直到 runs/ 根 (含); rmdir 只删空目录, 其他用例/
+    # 角色还在用时自然失败即止 (下级非空时上级必非空, 无需再往上试)
+    root = runs_root.rstrip("/")
+    d = os.path.dirname(node_run_dir)
+    while d == root or d.startswith(root + "/"):
         try:
             os.rmdir(d)
         except OSError:
-            pass
+            break
+        if d == root:
+            break
+        d = os.path.dirname(d)
 
 
 def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
@@ -744,7 +805,10 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
         cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving)
         _log(f"[execute] {suite.name} @ {where} 启动容器 "
              f"(超时={suite.timeout_minutes or '无'}分钟, 节点输出目录={node_run_dir})")
-        rc = ssh_run(node, cmd, log_path=os.path.join(local_suite_dir, "case.log"), dry_run=dry_run)
+        rc = ssh_run(node, cmd,
+                     log_path=os.path.join(local_suite_dir, _log_filename(suite)),
+                     diag_path=os.path.join(local_suite_dir, "ssh.log"),
+                     dry_run=dry_run)
         result["status"] = "pass" if rc == 0 else "fail"
         result["error"] = None if rc == 0 else f"exit code {rc}"
         dur = round(time.perf_counter() - tic, 1)
@@ -754,10 +818,11 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
             _log(f"[execute] {suite.name} dry-run 完成命令打印")
         else:
             _log(f"[execute] {suite.name} 容器异常结束 (rc={rc}, 耗时 {dur}s), "
-                 f"日志: {local_suite_dir}/case.log")
+                 f"日志: {os.path.join(local_suite_dir, _log_filename(suite))}")
         if not dry_run:
             _log(f"[fetch] {suite.name} 拉回节点产物: {node_run_dir} -> {local_suite_dir}")
-            _fetch_artifacts(node, node_run_dir, local_suite_dir, suite.name)
+            _fetch_artifacts(node, node_run_dir, local_suite_dir, suite.name,
+                             f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -843,8 +908,13 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 "PYTHONPATH": "/output",
             }
             unit_tic = time.perf_counter()
+            log_path = os.path.join(local_run_dir, suite.name, key, _log_filename(suite))
+            diag_path = os.path.join(local_run_dir, suite.name, key, "ssh.log")
             try:
-                if _stage_sitecustomize(node, node_run_dir, dry_run) != 0:
+                if _stage_sitecustomize(node, node_run_dir, dry_run,
+                                        prefix=f"[{key}] ",
+                                        quiet=(role != "router"),
+                                        diag_path=diag_path) != 0:
                     rc[key] = -1
                     errs[key] = "写入 sitecustomize.py 失败"
                     return
@@ -857,10 +927,9 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 cmd = _build_cmd(cfg, suite, node, node_run_dir,
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)
-                log_path = os.path.join(local_run_dir, suite.name, key, "case.log")
                 # PD 角色日志量大且与 router 交错, 只写文件不回显 (对齐 CI 各 pod
                 # 日志隔离的观感, 控制台只看 router 的测试输出)
-                rc[key] = ssh_run(node, cmd, log_path=log_path,
+                rc[key] = ssh_run(node, cmd, log_path=log_path, diag_path=diag_path,
                                   dry_run=dry_run, prefix=f"[{key}] ",
                                   quiet=(role != "router"))
             except Exception as e:
@@ -913,7 +982,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 released_at = time.perf_counter()
                 # 区分释放原因便于排查: router 退出 (正常/异常) vs PD 提前退出 (崩溃)
                 # 注意: router 异常退出时 PD 可能仍在服务, 此信号会让 PD 提前退出,
-                # 测试结果应以 router 的 case.log 为准
+                # 测试结果应以 router 的用例日志为准
                 cause = ("router 退出" if not threads[router_key].is_alive()
                          else "PD 节点提前退出")
                 _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
@@ -942,7 +1011,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
             else:
                 # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
                 _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
-                     f"日志: {os.path.join(local_run_dir, suite.name, key, 'case.log')}")
+                     f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
 
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
@@ -963,7 +1032,8 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
                 _log(f"[fetch] {suite.name}/{key} 拉回节点产物: "
                      f"{node_run_dir} -> {local_unit_dir}")
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}")
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}",
+                                 f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -1041,8 +1111,13 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 "PYTHONPATH": "/output",
             }
             unit_tic = time.perf_counter()
+            log_path = os.path.join(local_run_dir, suite.name, key, _log_filename(suite))
+            diag_path = os.path.join(local_run_dir, suite.name, key, "ssh.log")
             try:
-                if _stage_sitecustomize(node, node_run_dir, dry_run) != 0:
+                if _stage_sitecustomize(node, node_run_dir, dry_run,
+                                        prefix=f"[{key}] ",
+                                        quiet=(key != master_key),
+                                        diag_path=diag_path) != 0:
                     rc[key] = -1
                     errs[key] = "写入 sitecustomize.py 失败"
                     return
@@ -1055,9 +1130,8 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 cmd = _build_cmd(cfg, suite, node, node_run_dir,
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)
-                log_path = os.path.join(local_run_dir, suite.name, key, "case.log")
                 # worker 角色只写文件不回显, 控制台只保留 master 的测试输出
-                rc[key] = ssh_run(node, cmd, log_path=log_path,
+                rc[key] = ssh_run(node, cmd, log_path=log_path, diag_path=diag_path,
                                   dry_run=dry_run, prefix=f"[{key}] ",
                                   quiet=(key != master_key))
             except Exception as e:
@@ -1086,7 +1160,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 released_at = time.perf_counter()
                 # 区分释放原因便于排查: master 退出 (正常/异常) vs worker 提前退出 (崩溃)
                 # 注意: master 异常退出时 worker 可能仍在服务, 此信号会让 worker 提前退出,
-                # 测试结果应以 master 的 case.log 为准
+                # 测试结果应以 master 的用例日志为准
                 cause = ("master 退出" if not threads[master_key].is_alive()
                          else "worker 节点提前退出")
                 _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
@@ -1114,7 +1188,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             else:
                 # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
                 _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
-                     f"日志: {os.path.join(local_run_dir, suite.name, key, 'case.log')}")
+                     f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
         failed = {k: (errs.get(k)
@@ -1134,7 +1208,8 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
                 _log(f"[fetch] {suite.name}/{key} 拉回节点产物: "
                      f"{node_run_dir} -> {local_unit_dir}")
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}")
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}",
+                                 f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"

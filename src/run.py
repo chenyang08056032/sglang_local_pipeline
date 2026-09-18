@@ -345,7 +345,7 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
 
 
 def write_summary(results, run_id, run_dir):
-    """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的 case.log)。"""
+    """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的日志)。"""
     passed = [r for r in results if r["status"] == "pass"]
     failed = [r for r in results if r["status"] in ("fail", "error")]
     summary = {"run_id": run_id, "total": len(results),
