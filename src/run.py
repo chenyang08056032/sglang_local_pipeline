@@ -126,12 +126,19 @@ def load_config(path):
 
     run_raw = raw.get("run", {})
     docker_raw = run_raw.get("docker", {})
+    # list(字符串) 会逐字符拆分, 单条挂载误写成字符串时报清晰错误而非 -v 单字符灾难
+    extra_mounts = docker_raw.get("extra_mounts") or []
+    if not isinstance(extra_mounts, list):
+        raise ValueError(
+            f"run.docker.extra_mounts 须为列表 (格式同 docker -v), 如:\n"
+            f"  extra_mounts:\n    - \"/data/models:/models\"\n"
+            f"实际: {extra_mounts!r}")
     docker = DockerConfig(
         image=docker_raw["image"],
         devices=docker_raw.get("devices", "auto"),
         net=docker_raw.get("net", "host"),
         shm_size=docker_raw.get("shm_size", "16g"),
-        extra_mounts=list(docker_raw.get("extra_mounts") or []),
+        extra_mounts=list(extra_mounts),
     )
     prepare = PrepareConfig(online=run_raw.get("prepare", False))
     code_raw = run_raw.get("code", {})

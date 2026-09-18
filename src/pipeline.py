@@ -149,15 +149,19 @@ def ssh_run(node, command, log_path=None, diag_path=None,
                 log_f.write(line)
                 log_f.flush()
     finally:
-        if log_f:
-            log_f.close()
-        if diag_f:
-            diag_f.close()
         proc.wait()
-    # [连接诊断] rc + 耗时: SSH 失败 (rc=255)、BatchMode 拒绝、命令超时等在此一目了然
-    dur = round(time.perf_counter() - tic, 1)
-    _diag(f"{prefix or ''}[ssh] 结束 {target} rc={proc.returncode} 耗时 {dur}s",
-          force=(proc.returncode != 0))
+        # [连接诊断] rc + 耗时: SSH 失败 (rc=255)、BatchMode 拒绝、命令超时等在此一目了然;
+        # 必须在关闭文件之前写入: 对已关闭的文件 write 会抛
+        # "ValueError: I/O operation on closed file" (角色线程直接崩溃, 容器不会启动)
+        dur = round(time.perf_counter() - tic, 1)
+        try:
+            _diag(f"{prefix or ''}[ssh] 结束 {target} rc={proc.returncode} 耗时 {dur}s",
+                  force=(proc.returncode != 0))
+        finally:
+            if log_f:
+                log_f.close()
+            if diag_f:
+                diag_f.close()
     return proc.returncode
 
 
