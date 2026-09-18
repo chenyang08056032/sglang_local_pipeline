@@ -165,15 +165,33 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     return proc.returncode
 
 
+# 不回传的产物: tmp/ (数据集+torch 编译缓存) 体积大且排查价值低;
+# run_case.py / sitecustomize.py 是流水线注入的固定脚本 (内容为
+# _RUN_CASE_WRAPPER / _SITECUSTOMIZE 常量), 连同其编译缓存 __pycache__/
+# 均无回传价值, 均不进 results (节点 runs/ 原件保留, 需要时可手动重拉)
+_FETCH_EXCLUDES = ("tmp", "__pycache__", "run_case.py", "sitecustomize.py")
+
+
+def _rm_fetch_excluded(local_dir):
+    """删除不回传产物 (本机 cp 无法排除, 拷完再删)。"""
+    for name in _FETCH_EXCLUDES:
+        p = os.path.join(local_dir, name)
+        if os.path.isdir(p):
+            shutil.rmtree(p, ignore_errors=True)
+        elif os.path.exists(p):
+            os.remove(p)
+
+
 def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
     """拉回节点产物: 本机直接 cp, 远程走 tar 管道。
-    tmp/ (数据集+torch 编译缓存) 体积大且排查价值低, 不回传:
-    远程节点的 runs/ 原件始终保留, 需要深度排查时可手动重拉。
+    _FETCH_EXCLUDES 中的内容不回传; 远程节点的 runs/ 原件始终保留,
+    需要深度排查时可手动重拉。
     """
     local = _is_local(node)
     if dry_run:
         tag = "local" if local else node.host
-        print(f"[dry-run] fetch {tag}:{remote_dir} -> {local_dir} (不含 tmp/)")
+        print(f"[dry-run] fetch {tag}:{remote_dir} -> {local_dir} "
+              f"(不含 {'/'.join(_FETCH_EXCLUDES)})")
         return 0
     os.makedirs(local_dir, exist_ok=True)
     if local:
@@ -182,13 +200,14 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
             stderr=subprocess.STDOUT,
         ).returncode
         if rc == 0:
-            shutil.rmtree(os.path.join(local_dir, "tmp"), ignore_errors=True)
+            _rm_fetch_excluded(local_dir)
         return rc
+    excludes = "".join(f" --exclude=./{n}" for n in _FETCH_EXCLUDES)
     pull = subprocess.Popen(
         ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
          "-o", "LogLevel=ERROR",
          "-p", str(node.port), f"{node.user}@{node.host}",
-         f"tar czf - -C '{remote_dir}' --exclude=./tmp ."],
+         f"tar czf - -C '{remote_dir}'{excludes} ."],
         stdout=subprocess.PIPE,
     )
     # tar 的 "time stamp in the future" 告警是节点时钟偏差的免费探测器: 逐条刷屏
@@ -756,7 +775,8 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
 
 
 def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
-    """拉回一个执行单元的产物 (用例名.log + ssh.log + plog/, 不含 tmp/)。
+    """拉回一个执行单元的产物 (用例名.log + ssh.log + plog/, 排除项见
+    _FETCH_EXCLUDES)。
 
     本机节点: 拷贝成功后清理 runs/ 侧副本省磁盘 (results/ 已有一份), 并逐级
     清掉因此变空的上层目录直到 runs/ 根 (含; 之上的 workspace 不动);
@@ -766,7 +786,8 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
     if frc != 0:
         _log(f"[fetch] {label} 拉回失败 (rc={frc}), 保留节点侧原件: {node_run_dir}")
         return
-    _log(f"[fetch] {label} 拉回完成 (用例日志 + plog/, 未回传 tmp/)")
+    _log(f"[fetch] {label} 拉回完成 (用例日志 + plog/, 未回传 "
+         f"{'/'.join(_FETCH_EXCLUDES)})")
     if not _is_local(node):
         return
     try:

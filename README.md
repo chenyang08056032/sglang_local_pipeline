@@ -209,7 +209,8 @@ python3 src/run.py
     │     多机用例 (roles): 各角色节点并发 docker run 同一用例文件,
     │       以 HOSTNAME/POD_IP 环境变量区分角色 (见第 7 节)
     │
-    └─ [fetch] tar 管道拉回节点上的运行产物到本地结果目录
+    └─ [fetch] 拉回节点上的运行产物到本地结果目录
+         (tmp/ 及注入的固定脚本不回传, 见 6.2)
 ```
 
 ## 6. 结果产物与日志路径
@@ -224,14 +225,17 @@ python3 src/run.py
 
 ### 6.1 节点上的日志（原始产物）
 
-路径由 `workspace` + `runs` + `run_id` + `用例名` 拼成：
+路径由 `workspace` + `runs` + `run_id` + `用例名` 拼成。日志文件名 = 用例脚本名去 `.py` 加 `.log`（如 `test_npu_qwen3_32b.py` → `test_npu_qwen3_32b.log`）：
 
 ```
-/root/sglang_local_pipeline/runs/20260916-100000/qwen3-32b-gsm8k/
-├── case.log           # 容器内 tee /output/case.log 写入
-├── tmp/               # 容器内 /tmp 挂载
-└── plog/              # 容器内 /root/ascend/log 挂载（NPU 底层日志）
+/root/sglang_local_pipeline/runs/example-20260916-100000/qwen3-32b-gsm8k/
+├── test_npu_qwen3_32b.log   # 容器内 tee /output/ 写入
+├── tmp/                     # 容器内 /tmp 挂载（数据集、torch 编译缓存）
+├── plog/                    # 容器内 /root/ascend/log 挂载（NPU 底层日志）
+└── run_case.py              # 仅 A5 节点：--tp-size 减半包装器（流水线注入）
 ```
+
+多机用例在 `用例名` 下再按角色/节点序号分一层子目录（`prefill-0/`、`decode-0/`、`router-0/` 或 `node-0/`、`node-1/`），每个子目录内另有注入的协调桥接 `sitecustomize.py` 及其编译缓存 `__pycache__/`（见第 7/8 节）。
 
 拉回后远程节点的 `runs/` **不删除**，多次执行会按 run_id 各占一个子目录，累积保留；
 本机节点（执行机=节点）在拷贝成功后自动清理 `runs/` 侧副本（见 6.3）。
@@ -244,11 +248,15 @@ python3 src/run.py
 /root/sglang_local_pipeline/results/example-20260916-100000/
 ├── summary.json                       # run.py 写入的汇总
 └── qwen3-32b-gsm8k/
-    ├── case.log                       # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
+    ├── test_npu_qwen3_32b.log         # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
+    ├── ssh.log                        # SSH 连接诊断（本地直写，fetch 不覆盖）
     └── plog/                          # 从节点拉回的 NPU 底层日志
 ```
 
-`tmp/`（容器内 /tmp：预置数据集、torch 编译缓存）体积大且排查价值低，**fetch 不回传**。远程节点的 `runs/` 原件始终保留，需要深度排查（如 JIT 编译问题）时可手动重拉。
+以下内容 **fetch 不回传**（远程节点的 `runs/` 原件始终保留，需要深度排查时可手动重拉）：
+
+- `tmp/`（容器内 /tmp：预置数据集、torch 编译缓存）——体积大且排查价值低；
+- `run_case.py`、`sitecustomize.py`（流水线注入的固定脚本，内容为内置常量，各角色完全相同）及其编译缓存 `__pycache__/`——无回传价值。
 
 多个用例时，每个用例各占一个子目录，互不干扰：
 
@@ -256,10 +264,12 @@ python3 src/run.py
 /root/sglang_local_pipeline/results/example-20260916-100000/
 ├── summary.json
 ├── qwen3-32b-gsm8k/
-│   ├── case.log
+│   ├── test_npu_qwen3_32b.log
+│   ├── ssh.log
 │   └── plog/
 └── qwen3-14b-gsm8k/
-    ├── case.log
+    ├── test_npu_qwen3_14b.log
+    ├── ssh.log
     └── plog/
 ```
 
@@ -274,16 +284,18 @@ run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_loc
 ├── runs/                                    ← 节点（容器挂载写入）
 │   └── example-20260916-100000/
 │       └── qwen3-32b-gsm8k/
-│           ├── case.log                     ← 容器 tee 写
-│           ├── tmp/                          ← mkdir -p + 挂载
-│           └── plog/                        ← mkdir -p + 挂载
+│           ├── test_npu_qwen3_32b.log       ← 容器 tee 写
+│           ├── tmp/                         ← mkdir -p + 挂载（fetch 不回传）
+│           ├── plog/                        ← mkdir -p + 挂载
+│           └── run_case.py                  ← 仅 A5：注入的包装器（fetch 不回传）
 │
 └── results/                                 ← 执行机（run.py + ssh_run + fetch 写入）
     └── example-20260916-100000/
         ├── summary.json                     ← run.py 写
         └── qwen3-32b-gsm8k/
-            ├── case.log                     ← ssh_run 回显 → fetch 覆盖为容器 tee 版本
-            └── plog/                        ← fetch 从节点拉回（tmp/ 不回传）
+            ├── test_npu_qwen3_32b.log       ← ssh_run 回显 → fetch 覆盖为容器 tee 版本
+            ├── ssh.log                      ← ssh_run 诊断直写
+            └── plog/                        ← fetch 从节点拉回
 ```
 
 两个目录完全独立，无并发写入同一文件的问题。且本机节点时 fetch 拷贝成功后会**自动删除**节点侧 `runs/{run_id}/{用例名}/`（避免与 `results/` 重复占磁盘），拷贝失败则保留原件；远程节点的 `runs/` 始终保留。
@@ -299,7 +311,7 @@ cd /home
 python3 /root/sglang_local_pipeline/src/run.py --config /root/sglang_local_pipeline/configs/example.yaml
 ```
 
-结果目录固定为 `{workspace}/results`（如上例为 `/root/sglang_local_pipeline/results/20260916-100000/`），不随 cwd 变化，无需配置。
+结果目录固定为 `{workspace}/results`（如上例为 `/root/sglang_local_pipeline/results/example-20260916-100000/`），不随 cwd 变化，无需配置。
 
 ## 7. 多机（PD 分离）用例
 
@@ -350,7 +362,7 @@ suites:
 这类用例（`TestNpuPerfMultiNodePdSepTestCaseBase`）原本跑在 K8s 上：用 `HOSTNAME` 区分角色、`POD_IP` 标识地址、ConfigMap 做节点发现与结束通知。本地无 K8s，流水线做了等价替代，**不修改 sglang 代码**：
 
 1. 执行机起一个轻量 HTTP 协调服务（固定端口 9377，模拟 ConfigMap 的读/写。端口被残留的流水线进程占用时自动清理后重试；被无关进程占用或清理失败则启动报错，报错信息附带手动 kill 命令。**不会回退随机端口**——环境只放行 9377，换端口会导致远程节点静默连不上）；
-2. 每个角色容器启动前注入 `sitecustomize.py`（落在挂载的 /output，经 `PYTHONPATH` 生效），把用例用到的 kubernetes 客户端接口重定向到协调服务；
+2. 每个角色容器启动前注入 `sitecustomize.py`（落在挂载的 /output，经 `PYTHONPATH` 生效），把用例用到的 kubernetes 客户端接口重定向到协调服务。各角色注入的内容完全相同（角色差异全在环境变量），该文件及编译缓存仅留在节点 `runs/` 侧，fetch 不回传（见 6.2）；
 3. 流水线预置所有 pod 的注册信息 `sglang-prefill-0`/`sglang-prefill-1`/`sglang-decode-0`/... → 节点 IP（K8s 里由各 pod 自注册），PD 节点据此确定 master 地址和 `ASCEND_MF_STORE_URL`，router 据此收集 PD 地址列表；
 4. 所有节点**并发** `docker run` 同一用例文件，以环境变量区分角色和序号：
    - `HOSTNAME=sglang-{role}-{idx}`：用例框架据此识别角色（含 role 名）和序号（末尾数字）；
@@ -372,30 +384,37 @@ suites:
 
 ### 7.4 产物
 
-多机用例在每个节点的子目录下各有一份产物（基准测试结果看 `router-0/case.log`）。以 2p2d 为例：
+多机用例每个角色在 results 下各占一个子目录，结构同 6.2（`{用例名}.log` + `ssh.log` + `plog/`；基准测试结果看 `router-0/{用例名}.log`）。以 2p2d 为例：
 
 ```
 results/{run_id}/
 ├── summary.json
 └── dsv4-flash-w8a8-2p2d-16p/
     ├── prefill-0/
-    │   ├── case.log
+    │   ├── {用例名}.log
+    │   ├── ssh.log
     │   └── plog/
     ├── prefill-1/
-    │   ├── case.log
+    │   ├── {用例名}.log
+    │   ├── ssh.log
     │   └── plog/
     ├── decode-0/
-    │   ├── case.log
+    │   ├── {用例名}.log
+    │   ├── ssh.log
     │   └── plog/
     ├── decode-1/
-    │   ├── case.log
+    │   ├── {用例名}.log
+    │   ├── ssh.log
     │   └── plog/
     └── router-0/
-        ├── case.log
+        ├── {用例名}.log
+        ├── ssh.log
         └── plog/
 ```
 
-执行过程中控制台**只回显 router 的输出**（每行带 `[router-0] ` 前缀），对齐 CI 各 pod 日志隔离的观感；prefill/decode 日志量大且与 router 交错，仅实时写入各自子目录的 case.log 不回显（PD 角色异常结束时，控制台的状态行会指明其 case.log 路径）。基准结果与断言看 `router-0/case.log`，PD 服务问题看对应角色目录。混布 TP 用例（第 8 节）同理：只回显 master（node-0），worker 仅写文件。
+节点 `runs/` 侧同构，但多出 `tmp/`、`sitecustomize.py`、`__pycache__/`（fetch 不回传，见 6.2）。
+
+执行过程中控制台**只回显 router 的输出**（每行带 `[router-0] ` 前缀），对齐 CI 各 pod 日志隔离的观感；prefill/decode 日志量大且与 router 交错，仅实时写入各自子目录的 `{用例名}.log` 不回显（PD 角色异常结束时，控制台的状态行会指明其日志路径）。基准结果与断言看 `router-0/{用例名}.log`，PD 服务问题看对应角色目录。混布 TP 用例（第 8 节）同理：只回显 master（node-0），worker 仅写文件。
 
 ## 8. 多机（混布 TP）用例
 
@@ -433,17 +452,19 @@ suites:
 
 ### 8.4 产物
 
-与 PD 分离结构类似，按节点序号分子目录（基准测试结果看 `node-0/case.log`）：
+与 PD 分离结构类似，按节点序号分子目录，每个子目录同 6.2 结构（基准测试结果看 `node-0/{用例名}.log`）：
 
 ```
 results/{run_id}/
 ├── summary.json
 └── glm5_2-16p-gpqa/
     ├── node-0/                # master (跑测试)
-    │   ├── case.log
+    │   ├── {用例名}.log
+    │   ├── ssh.log
     │   └── plog/
     └── node-1/                # worker (只起 server)
-        ├── case.log
+        ├── {用例名}.log
+        ├── ssh.log
         └── plog/
 ```
 
@@ -469,7 +490,7 @@ gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前放到节点
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。
 
 **Q: A5 节点上跑单机用例，脚本里的 `--tp-size` 是按 A3 卡数配置的，怎么办？**
-该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（case.log 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
+该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（`{用例名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
 
 ## 附录 A: 配置 SSH 免密
 
