@@ -395,11 +395,14 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
             res["status"] = "dryrun"
         results.append(res)
         _log(f"[结果] {suite.name}: {res['status']}")
+        # 每跑完一条即写 summary.json, 中途被杀也能看到已完成用例的结果
+        write_summary(results, run_id, run_dir)
     return results
 
 
 def write_summary(results, run_id, run_dir):
-    """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的日志)。"""
+    """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的日志)。
+    每条用例完成即全量重写一次 (内容始终为当前已完成用例的汇总)。"""
     passed = [r for r in results if r["status"] == "pass"]
     failed = [r for r in results if r["status"] in ("fail", "error")]
     summary = {"run_id": run_id, "total": len(results),

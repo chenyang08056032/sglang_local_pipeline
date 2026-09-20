@@ -229,6 +229,8 @@ python3 src/run.py
     │       再启动 PD 容器; 各节点 docker run 同一用例文件, 以
     │       HOSTNAME/POD_IP 环境变量区分角色 (见第 7 节; 混布 TP
     │       multinode 全节点并发启动, 见第 8 节)
+    │     每条用例完成即重写 summary.json
+    │       (run.py 中途被杀也能看到已完成用例的结果)
     │
     └─ [fetch] 拉回节点上的运行产物到本地结果目录
          (tmp/ 及注入的固定脚本不回传, 见 6.2)
@@ -267,7 +269,7 @@ python3 src/run.py
 
 ```
 /root/sglang_local_pipeline/results/example-20260916-100000/
-├── summary.json                       # run.py 写入的汇总
+├── summary.json                       # run.py 写入的汇总 (每跑完一条用例即更新)
 └── qwen3-32b-gsm8k/
     ├── test_npu_qwen3_32b.log         # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
     ├── ssh.log                        # SSH 连接诊断（本地直写，fetch 不覆盖）
@@ -295,6 +297,8 @@ python3 src/run.py
 ```
 
 run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_local_pipeline/results/example-20260916-100000`
+
+summary.json **每跑完一条用例即全量重写一次**（非结束时统一写）：run.py 中途被杀（Ctrl+C、终端断开、执行机重启等）时，已完成用例的汇总与日志均已落盘可查；被中断时正在执行的用例不计入 summary，但其过程日志仍实时写在用例子目录的 `{脚本名}.log` 里。
 
 ### 6.3 执行机 = 节点时的路径关系
 
