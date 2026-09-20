@@ -827,6 +827,16 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
 
     # 容器内命令
     parts = ["set -euo pipefail"]
+    # 自定义算子包环境 (DeepSeek-V4-Flash 等用例需要; 镜像未装时忽略, 与 CI 一致)。
+    # vendor 脚本可能引用未定义变量 (如 ZSH_VERSION), source 前临时关 -u
+    parts += [
+        "set +u",
+        "source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/"
+        "customize/bin/set_env.bash || true",
+        "source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/"
+        "custom_transformer/bin/set_env.bash || true",
+        "set -u",
+    ]
     q_repo = shlex.quote(repo)
     # 覆盖镜像内 ascend 工具 (学 CI nightly 做法)
     # 注意: 对完整路径做 shlex.quote, 不能只引用前缀 (否则 /python/... 落在引号外,
