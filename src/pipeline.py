@@ -77,6 +77,13 @@ def _is_local(node):
     return node.host in _local_ips()
 
 
+# 容器内 Python logging 行 (asctime,mmm - LEVEL - msg): 控制台改写为与 _log
+# 一致的 [ts] LEVEL - msg, 两种来源的日志格式统一; 日志文件始终保留原始行
+_PY_LOG_LINE = re.compile(
+    r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d{3} - ([A-Z]+) - (.*)'
+)
+
+
 def ssh_run(node, command, log_path=None, diag_path=None,
             dry_run=False, prefix=None, quiet=False):
     """执行命令: 本机节点直接 subprocess, 远程走 SSH。实时回显 + 写日志。
@@ -144,7 +151,11 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     try:
         for line in proc.stdout:
             if not quiet:
-                print(f"{prefix}{line}", end="") if prefix else print(line, end="")
+                # 容器 logging 行改写为与 _log 一致的 [ts] LEVEL - msg (仅控制台)
+                m = _PY_LOG_LINE.match(line)
+                shown = (f"[{m.group(1)}] {m.group(2)} - {m.group(3)}\n"
+                         if m else line)
+                print(f"{prefix}{shown}", end="") if prefix else print(shown, end="")
             if log_f:
                 log_f.write(line)
                 log_f.flush()
@@ -622,11 +633,10 @@ def prepare_node(cfg, node, dry_run=False):
     where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
     lines = ["set -e"]
     if not cfg.run.prepare.online:
-        # 离线: 不 pull / 不 clone / 不 fetch / 不 checkout
-        _log(f"[prepare] {where} 离线模式: 跳过镜像/代码准备, 直接使用节点现状")
-        _log(f"[prepare] repo={repo} (请自行确认代码已就位)")
-        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
-        _log(f"[prepare] {where} 就绪 (rc={rc})")
+        # 离线: 不 pull / 不 clone / 不 fetch / 不 checkout;
+        # ssh 诊断 quiet (连通性空命令无信息量), 失败时 rc!=0 仍会强制上控制台
+        _log(f"[prepare] {where} 离线就绪 (跳过镜像/代码准备, repo={repo} 自行确认)")
+        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run, quiet=True)
         return rc == 0
     remote = cfg.run.git_remote
     # 镜像不存在才 pull
@@ -664,6 +674,43 @@ def prepare_node(cfg, node, dry_run=False):
     return rc == 0
 
 
+def cleanup_node_sglang(cfg, node, dry_run=False):
+    """清理节点上的 sglang 残留 (宿主机进程 + 容器), 释放 NPU 卡。
+
+    prepare 阶段对每个就绪节点执行一次 (紧跟 prepare_node), 覆盖三类残留:
+      - 宿主机 sglang 进程 (python -m sglang.* / sglang_router, 手动调试残留)
+      - 本流水线容器 (name=sgl-pipeline-*): 上轮 timeout 只杀掉节点上的
+        docker 客户端, 容器不会自停, 不清理则占卡 / --name 冲突
+      - 同镜像的其他容器 (CI / 手动 docker run 残留)
+
+    模式中的 [.] / [_-] 防止 pgrep/pkill 匹配到清理命令自身 (其 cmdline
+    含模式原文), 也不会误杀 run.py (路径是 sglang_local_pipeline, 不匹配)。
+    """
+    image = shlex.quote(cfg.run.docker.image)
+    pattern = "'sglang[.]|sglang[_-]router'"
+    lines = [
+        # 先列后杀, 输出确认清掉了什么; pgrep 无匹配 (rc=1) 时打印 (无)
+        "echo '[cleanup] 宿主机 sglang 进程:'",
+        f"pgrep -af {pattern} || echo '  (无)'",
+        f"pkill -9 -f {pattern} 2>/dev/null || true",
+        "echo '[cleanup] 残留容器 (sgl-pipeline-* / 同镜像):'",
+        "docker ps -a --filter name=sgl-pipeline- --format '  {.Names} ({.Status})'",
+        f"docker ps -a --filter ancestor={image} --format '  {{.Names}} ({{.Status}})'",
+        # xargs -r: 无输入时不执行 (避免空参数报错); rm 失败 stderr 可见, 不阻断
+        "docker ps -aq --filter name=sgl-pipeline- "
+        "| xargs -r docker rm -f >/dev/null || true",
+        f"docker ps -aq --filter ancestor={image} "
+        f"| xargs -r docker rm -f >/dev/null || true",
+    ]
+    where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
+    _log(f"[cleanup] {where} 清理 sglang 残留 (宿主机进程 + 容器)")
+    rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    if not dry_run and rc != 0:
+        _log(f"[cleanup] {where} 清理失败 (rc={rc}), 不阻断执行; "
+             f"如用例报 NPU 卡被占用, 手动检查: pgrep -af sglang; docker ps")
+    return rc
+
+
 def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
                timeout_minutes=None, tp_halving=False):
     """构造节点上执行的完整命令。
@@ -689,11 +736,12 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         f"cp -r {ascend_src}/* "
         f"$(python3 -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')/test/ascend/"
     )
-    # 预置 gsm8k / ShareGPT 数据集 (与 CI 一致): /tmp 每次全新挂载, 不预置则会
-    # 重复下载 (gsm8k) 或 perf 套件找不到数据; 缓存缺失时忽略, 走在线下载
-    for f in ("tmp/test.jsonl",
-              "otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"):
-        parts.append(f"cp '/root/.cache/modelscope/hub/datasets/{f}' /tmp/ 2>/dev/null || true")
+    # 预置数据集到 /tmp (与 CI 一致): /tmp 每次全新挂载, 不预置则会重复下载
+    # (gsm8k) 或 perf 套件找不到数据; datasets 为节点本地绝对路径, 所在目录
+    # 已自动挂载进容器 (见下方 mount_args); 未配置时跳过, 由用例在线下载或
+    # 自行读取; cp -r 兼容文件/目录, 缓存缺失时忽略, 回退在线下载
+    for f in cfg.run.datasets:
+        parts.append(f"cp -r {shlex.quote(f)} /tmp/ 2>/dev/null || true")
     if tp_halving:
         # A5 适配: 经包装器启动, 自动把 other_args 里的 --tp-size 减半
         cmd = (f"cd {q_repo} && python3 -u /output/run_case.py "
@@ -720,6 +768,11 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         "-v", shlex.quote(f"{node_run_dir}/tmp:/tmp"),
         "-v", shlex.quote(f"{node_run_dir}/plog:/root/ascend/log"),
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
+    # datasets 所在目录自动挂载 (同路径映射, 去重), 容器内路径与配置一致,
+    # cp 命令直接使用原路径; 与默认挂载重叠时 (如 ~/.cache 下) docker 后挂载
+    # 遮蔽前者, 同一宿主机目录内容一致, 无害
+    for m in dict.fromkeys(f.rsplit("/", 1)[0] for f in cfg.run.datasets):
+        mount_args += ["-v", shlex.quote(f"{m}:{m}")]
     # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;
     # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro")
     if d.extra_mounts:
@@ -767,10 +820,9 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         lines.append(f"timeout -k 60 {int(tmo) * 60} " + " ".join(docker_args))
     else:
         lines.append(" ".join(docker_args))
-    # [路径诊断] 打印构造出的容器关键路径, 便于排查多机部署时的挂载/路径问题
-    # (多机并发时各线程同时构造命令, 带节点 host 才能区分是哪个节点的容器)
-    _log(f"[cmd] 容器={container} 节点={node.host} repo={repo} "
-         f"输出目录={node_run_dir} 超时={tmo or '无'}分钟")
+    # [cmd] 每容器一行: 角色@节点+超时 (容器名/输出目录按固定规则可推导,
+    # 完整命令看 dry-run 或各角色 ssh.log; 多机并发时靠 host 区分归属)
+    _log(f"[cmd] {role or '单机用例'} @{node.host} 超时={tmo or '无'}分钟")
     return "\n".join(lines)
 
 
@@ -783,30 +835,34 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
     远程节点: runs/ 是节点侧唯一原始数据, 始终保留。
     """
     frc = ssh_fetch_dir(node, node_run_dir, local_dir)
+    # label 为空时 (单机用例, 段落上下文已明确) 不占位
+    who = f"{label} " if label else ""
     if frc != 0:
-        _log(f"[fetch] {label} 拉回失败 (rc={frc}), 保留节点侧原件: {node_run_dir}")
+        # 失败保留完整路径便于手动重拉
+        _log(f"[fetch] {who}拉回失败 (rc={frc}), 保留节点侧原件: {node_run_dir}")
         return
-    _log(f"[fetch] {label} 拉回完成 (用例日志 + plog/, 未回传 "
-         f"{'/'.join(_FETCH_EXCLUDES)})")
-    if not _is_local(node):
-        return
-    try:
-        shutil.rmtree(node_run_dir)
-        _log(f"[fetch] {label} 已清理本机节点侧目录: {node_run_dir}")
-    except OSError as e:
-        _log(f"[fetch] {label} 清理失败 ({e}), 保留: {node_run_dir}")
-    # 逐级向上清掉变空的目录直到 runs/ 根 (含); rmdir 只删空目录, 其他用例/
-    # 角色还在用时自然失败即止 (下级非空时上级必非空, 无需再往上试)
-    root = runs_root.rstrip("/")
-    d = os.path.dirname(node_run_dir)
-    while d == root or d.startswith(root + "/"):
+    note = "日志 + plog"
+    if _is_local(node):
         try:
-            os.rmdir(d)
-        except OSError:
-            break
-        if d == root:
-            break
-        d = os.path.dirname(d)
+            shutil.rmtree(node_run_dir)
+        except OSError as e:
+            _log(f"[fetch] {who}拉回完成 ({note}); 清理本机 runs/ 副本失败 "
+                 f"({e}), 保留: {node_run_dir}")
+            return
+        note += ", 本机 runs/ 副本已清理"
+        # 逐级向上清掉变空的目录直到 runs/ 根 (含); rmdir 只删空目录, 其他用例/
+        # 角色还在用时自然失败即止 (下级非空时上级必非空, 无需再往上试)
+        root = runs_root.rstrip("/")
+        d = os.path.dirname(node_run_dir)
+        while d == root or d.startswith(root + "/"):
+            try:
+                os.rmdir(d)
+            except OSError:
+                break
+            if d == root:
+                break
+            d = os.path.dirname(d)
+    _log(f"[fetch] {who}拉回完成 ({note})")
 
 
 def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
@@ -823,13 +879,16 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
         # A5 节点: 脚本 --tp-size 按 A3 卡数配置, 注入包装器减半 (仅单机用例)
         tp_halving = node.arch == "a5"
         if tp_halving:
-            _log(f"[execute] {suite.name} A5 适配: 注入 --tp-size 减半包装器 "
+            _log(f"[execute] A5 适配: 注入 --tp-size 减半包装器 "
                  f"({node_run_dir}/run_case.py)")
             if _stage_run_wrapper(node, node_run_dir, dry_run) != 0:
                 raise RuntimeError("写入 run_case.py 失败")
-        cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving)
-        _log(f"[execute] {suite.name} @ {where} 启动容器 "
-             f"(超时={suite.timeout_minutes or '无'}分钟, 节点输出目录={node_run_dir})")
+        # A5 单机用例专属环境变量 (run.a5_env, 如灵衢 FIA 互联 ASCEND_USE_FIA);
+        # 未配置时为空, 不注入; 多机用例不注入
+        extra_env = dict(cfg.run.a5_env) if node.arch == "a5" else None
+        cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving,
+                         extra_env=extra_env)
+        _log(f"[execute] @ {where} 启动容器 (超时={suite.timeout_minutes or '无'}分钟)")
         rc = ssh_run(node, cmd,
                      log_path=os.path.join(local_suite_dir, _log_filename(suite)),
                      diag_path=os.path.join(local_suite_dir, "ssh.log"),
@@ -838,20 +897,20 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
         result["error"] = None if rc == 0 else f"exit code {rc}"
         dur = round(time.perf_counter() - tic, 1)
         if rc == 0:
-            _log(f"[execute] {suite.name} 容器正常结束 (rc=0, 耗时 {dur}s)")
+            _log(f"[execute] 容器正常结束 (rc=0, 耗时 {dur}s)")
         elif dry_run:
-            _log(f"[execute] {suite.name} dry-run 完成命令打印")
+            _log(f"[execute] dry-run 完成命令打印")
         else:
-            _log(f"[execute] {suite.name} 容器异常结束 (rc={rc}, 耗时 {dur}s), "
+            # 失败保留完整日志路径便于排查
+            _log(f"[execute] 容器异常结束 (rc={rc}, 耗时 {dur}s), "
                  f"日志: {os.path.join(local_suite_dir, _log_filename(suite))}")
         if not dry_run:
-            _log(f"[fetch] {suite.name} 拉回节点产物: {node_run_dir} -> {local_suite_dir}")
-            _fetch_artifacts(node, node_run_dir, local_suite_dir, suite.name,
+            _fetch_artifacts(node, node_run_dir, local_suite_dir, "",
                              f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
-        _log(f"[execute] {suite.name} 流水线异常: {type(e).__name__}: {e}")
+        _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
     return result
 
@@ -912,10 +971,9 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                     "多机用例的协调服务将不可达")
             coord_url = f"http://{coord_host}:{coord.port}"
             coord.patch_data(coord_data)
-        _log(f"[execute] {suite.name} 多机用例 @ {where_desc} "
+        _log(f"[execute] 多机用例 @ {where_desc} "
              f"(超时={suite.timeout_minutes or '无'}分钟/每节点)")
-        _log(f"[execute] {suite.name} 协调服务: {coord_url} "
-             f"(已预置 {len(coord_data)} 个 pod 注册: {', '.join(coord_data.keys())})")
+        _log(f"[execute] 协调服务: {coord_url} (已预置 {len(coord_data)} 个 pod 注册)")
 
         rc, errs, durs = {}, {}, {}
 
@@ -972,18 +1030,18 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         # 满 NPU, 启动竞争无偏向, 需显式控制顺序。router 崩溃未写入时超时兜底
         if not dry_run:
             threads[router_key].start()
-            _log(f"[execute] {suite.name} 先启动 router, 等待写入 active-test-class ...")
+            _log(f"[execute] 先启动 router, 等待写入 active-test-class ...")
             router_seq_tic = time.perf_counter()
             while True:
                 if _ACTIVE_TEST_CLASS_KEY in coord.get_data():
-                    _log(f"[execute] {suite.name} active-test-class 已写入, 启动 PD 节点")
+                    _log(f"[execute] active-test-class 已写入, 启动 PD 节点")
                     break
                 if not threads[router_key].is_alive():
-                    _log(f"[execute] {suite.name} router 提前退出 (未写入 active-test-class), "
+                    _log(f"[execute] router 提前退出 (未写入 active-test-class), "
                          "直接启动 PD 节点")
                     break
                 if time.perf_counter() - router_seq_tic > 120:
-                    _log(f"[execute] {suite.name} 等待 active-test-class 超时 (120s), "
+                    _log(f"[execute] 等待 active-test-class 超时 (120s), "
                          "直接启动 PD 节点")
                     break
                 time.sleep(2)
@@ -1010,7 +1068,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 # 测试结果应以 router 的用例日志为准
                 cause = ("router 退出" if not threads[router_key].is_alive()
                          else "PD 节点提前退出")
-                _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
+                _log(f"[execute] 结束信号已写入协调服务 ({cause}), "
                      "等待 prefill/decode 节点退出")
             # grace period 超时后, 仍有容器未退出 → 强杀 (等价 CI 外层 runner
             # 检测 pod 非 Running 后删 job; 常见于 PD 崩溃后 router 卡在端口等待)
@@ -1019,7 +1077,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 for (r, i, n), k in zip(units, keys):
                     if threads[k].is_alive():
                         container = f"sgl-pipeline-{suite.name}-{k}"
-                        _log(f"[execute] {suite.name}/{k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
+                        _log(f"[execute] {k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
                              f"未退出, 强制删除容器 {container}")
                         _kill_container(n, container)
                 killed = True
@@ -1030,12 +1088,12 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         for key in keys:
             dur = durs.get(key, "?")
             if errs.get(key):
-                _log(f"[execute] {suite.name}/{key} 异常 (耗时 {dur}s): {errs[key]}")
+                _log(f"[execute] {key} 异常 (耗时 {dur}s): {errs[key]}")
             elif rc.get(key) == 0:
-                _log(f"[execute] {suite.name}/{key} 正常结束 (rc=0, 耗时 {dur}s)")
+                _log(f"[execute] {key} 正常结束 (rc=0, 耗时 {dur}s)")
             else:
                 # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
-                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
+                _log(f"[execute] {key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
                      f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
 
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
@@ -1055,14 +1113,12 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
             for (role, idx, node), key in zip(units, keys):
                 node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}/{key}"
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
-                _log(f"[fetch] {suite.name}/{key} 拉回节点产物: "
-                     f"{node_run_dir} -> {local_unit_dir}")
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}",
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, key,
                                  f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
-        _log(f"[execute] {suite.name} 流水线异常: {type(e).__name__}: {e}")
+        _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
     finally:
         coord.stop()
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
@@ -1117,10 +1173,9 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                     "多机用例的协调服务将不可达")
             coord_url = f"http://{coord_host}:{coord.port}"
             coord.patch_data(coord_data)
-        _log(f"[execute] {suite.name} 多机混布 @ {where_desc} "
+        _log(f"[execute] 多机混布 @ {where_desc} "
              f"(超时={suite.timeout_minutes or '无'}分钟/每节点)")
-        _log(f"[execute] {suite.name} 协调服务: {coord_url} "
-             f"(已预置 {len(coord_data)} 个 pod 注册: {', '.join(coord_data.keys())})")
+        _log(f"[execute] 协调服务: {coord_url} (已预置 {len(coord_data)} 个 pod 注册)")
 
         rc, errs, durs = {}, {}, {}
 
@@ -1188,7 +1243,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 # 测试结果应以 master 的用例日志为准
                 cause = ("master 退出" if not threads[master_key].is_alive()
                          else "worker 节点提前退出")
-                _log(f"[execute] {suite.name} 结束信号已写入协调服务 ({cause}), "
+                _log(f"[execute] 结束信号已写入协调服务 ({cause}), "
                      "等待 worker 节点退出")
             # grace period 超时后, 仍有容器未退出 → 强杀
             if (released and not killed and not dry_run
@@ -1196,7 +1251,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 for (i, n), k in zip(units, keys):
                     if threads[k].is_alive():
                         container = f"sgl-pipeline-{suite.name}-{k}"
-                        _log(f"[execute] {suite.name}/{k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
+                        _log(f"[execute] {k} 超过 {_GRACE_PERIOD_KILL_SEC}s "
                              f"未退出, 强制删除容器 {container}")
                         _kill_container(n, container)
                 killed = True
@@ -1207,12 +1262,12 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
         for key in keys:
             dur = durs.get(key, "?")
             if errs.get(key):
-                _log(f"[execute] {suite.name}/{key} 异常 (耗时 {dur}s): {errs[key]}")
+                _log(f"[execute] {key} 异常 (耗时 {dur}s): {errs[key]}")
             elif rc.get(key) == 0:
-                _log(f"[execute] {suite.name}/{key} 正常结束 (rc=0, 耗时 {dur}s)")
+                _log(f"[execute] {key} 正常结束 (rc=0, 耗时 {dur}s)")
             else:
                 # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
-                _log(f"[execute] {suite.name}/{key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
+                _log(f"[execute] {key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
                      f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
@@ -1231,14 +1286,12 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             for (idx, node), key in zip(units, keys):
                 node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}/{key}"
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
-                _log(f"[fetch] {suite.name}/{key} 拉回节点产物: "
-                     f"{node_run_dir} -> {local_unit_dir}")
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, f"{suite.name}/{key}",
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, key,
                                  f"{cfg.run.workspace}/runs")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
-        _log(f"[execute] {suite.name} 流水线异常: {type(e).__name__}: {e}")
+        _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
     finally:
         coord.stop()
     result["duration_sec"] = round(time.perf_counter() - tic, 1)

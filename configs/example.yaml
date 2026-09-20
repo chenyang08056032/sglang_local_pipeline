@@ -12,6 +12,13 @@ run:
     #   - "/data/models:/models"             # 普通挂载
     #   - "/etc/myconf:/etc/myconf:ro"       # 只读挂载
 
+  # a5_env:                                  # 仅 a5 节点单机用例容器注入 (多机用例及其他节点不注入), 默认无
+  #   ASCEND_USE_FIA: "1"                    # A5 灵衢互联 (FIA) 开启
+
+  # datasets:                                # 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载进容器)
+  #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # gsm8k
+  #   - /data/datasets/sharegpt.jsonl         # 任意本地路径; 多节点用例须各节点均存在
+
 nodes:
   - host: 192.168.10.1   # A3, 16 卡
     arch: a3

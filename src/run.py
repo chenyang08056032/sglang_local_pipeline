@@ -30,8 +30,9 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, execute_multinode_suite,
-                      execute_multinode_tp_suite, execute_suite, prepare_node)
+from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, cleanup_node_sglang,
+                      execute_multinode_suite, execute_multinode_tp_suite,
+                      execute_suite, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -81,6 +82,13 @@ class RunConfig:
     docker: DockerConfig = None
     prepare: PrepareConfig = None
     env: Dict[str, str] = field(default_factory=dict)
+    # 仅注入 a5 节点单机用例容器的环境变量 (如 ASCEND_USE_FIA);
+    # 多机用例及其他 arch 节点不注入, 覆盖 env 同名键
+    a5_env: Dict[str, str] = field(default_factory=dict)
+    # 预置到容器 /tmp/ 的数据集路径列表 (节点本地绝对路径, 以 / 开头);
+    # 所在目录自动挂载进容器 (同路径映射)。未配置时不预置任何数据集,
+    # 由用例在线下载或自行读取
+    datasets: List[str] = field(default_factory=list)
 
     @property
     def repo(self):
@@ -141,6 +149,31 @@ def load_config(path):
         extra_mounts=list(extra_mounts),
     )
     prepare = PrepareConfig(online=run_raw.get("prepare", False))
+    # a5_env 须为键值映射 (键值自动转字符串, YAML 写 1 即 "1");
+    # 误写成列表/标量时报清晰错误
+    a5_env_raw = run_raw.get("a5_env") or {}
+    if not isinstance(a5_env_raw, dict):
+        raise ValueError(
+            f"run.a5_env 须为键值映射, 如:\n"
+            f"  a5_env:\n    ASCEND_USE_FIA: \"1\"\n"
+            f"实际: {a5_env_raw!r}")
+    # datasets 须为绝对路径字符串列表 (节点本地路径, 所在目录自动挂载进容器);
+    # 误写成标量/字典/相对路径时报清晰错误
+    datasets_raw = run_raw.get("datasets") or []
+    if not isinstance(datasets_raw, list):
+        raise ValueError(
+            f"run.datasets 须为字符串列表, 如:\n"
+            f"  datasets:\n    - /data/datasets/test.jsonl\n"
+            f"实际: {datasets_raw!r}")
+    for x in datasets_raw:
+        if not isinstance(x, str) or not x.startswith("/"):
+            raise ValueError(
+                f"run.datasets 须为节点本地绝对路径 (以 / 开头), 实际: {x!r}")
+        # 根目录直属文件: 所在目录为 /, 整盘挂载危险且无意义
+        if x.rsplit("/", 1)[0] == "":
+            raise ValueError(
+                f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
+                f"请移入子目录: {x!r}")
     code_raw = run_raw.get("code", {})
     git_remote = code_raw.get("git_remote")
     if prepare.online and not git_remote:
@@ -155,6 +188,8 @@ def load_config(path):
         prepare=prepare,
         env={**_DEFAULT_ENV,
              **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
+        a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
+        datasets=list(datasets_raw),
     )
 
     nodes = []
@@ -321,6 +356,10 @@ def prepare_nodes(cfg, dry_run):
         prepared[host] = prepare_node(cfg, node, dry_run)
         if not prepared[host]:
             _log(f"[错误] 节点 {host} 准备失败, 其用例将全部记为失败 (status=error)")
+        else:
+            # 就绪后清理 sglang 残留 (宿主机进程 + 容器), 确保 NPU 卡无占用;
+            # 失败不阻断 (用例报卡占用时按 [cleanup] 提示手动检查)
+            cleanup_node_sglang(cfg, node, dry_run)
     return prepared
 
 

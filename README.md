@@ -59,6 +59,8 @@ sglang_local_pipeline/
 | `run.docker.shm_size` | `16g` | 否 | 容器共享内存大小；固定附加 `--privileged --ipc=host` |
 | `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"` |
 | `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
+| `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
+| `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；多节点用例须各节点均存在 |
 
 ### 3.2 nodes 段
 
@@ -95,7 +97,10 @@ sglang_local_pipeline/
 | `PYTORCH_NPU_ALLOC_CONF` | `expandable_segments:True` |
 | `STREAMS_PER_DEVICE` | `32` |
 
-此外流水线会自动为所有容器注入 `no_proxy`/`NO_PROXY`（含全部节点 IP + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
+此外流水线会自动为所有容器注入：
+
+- `TZ=Asia/Shanghai`：容器默认 UTC，与流水线日志时区混排会造成时序误判，统一对齐（需其他时区在 `run.env` 覆盖 `TZ`）；
+- `no_proxy`/`NO_PROXY`（含全部节点 IP + 协调服务地址 + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
 
 ### 3.5 配置示例（联网模式）
 
@@ -197,17 +202,24 @@ python3 src/run.py
     │     git fetch origin --tags --force
     │     git checkout --force {ref}
     │     分支则 git reset --hard origin/{ref}   # 保证与远端严格一致
+    │     就绪后清理 sglang 残留（联网/离线均执行）:
+    │       杀宿主机 sglang / sglang_router 进程（pkill -f）
+    │       删 sgl-pipeline-* 及同镜像残留容器（docker rm -f）
+    │       → 确保没有进程占用 NPU 卡
     │
     ├─ [execute] 逐用例串行执行（SSH 到节点）:
     │     单机用例: docker run --rm --privileged --ipc=host
     │       --device /dev/davinci0..N-1 + 管理设备
     │       挂载: repo / workspace 输出目录 / driver / 模型缓存(~/.cache)
+    │              + run.datasets 所在目录 (自动, 可选)
     │              + run.docker.extra_mounts (用户自定义, 可选)
-    │     容器内: 覆盖 ascend 工具 → 预置 gsm8k/ShareGPT 数据集到 /tmp
+    │     容器内: 覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
     │              → 单个用例文件 (A5 节点经 /output/run_case.py 包装启动,
     │                 --tp-size 自动减半)
-    │     多机用例 (roles): 各角色节点并发 docker run 同一用例文件,
-    │       以 HOSTNAME/POD_IP 环境变量区分角色 (见第 7 节)
+    │     多机用例 (roles): router 容器先启动 (等其写入 active-test-class),
+    │       再启动 PD 容器; 各节点 docker run 同一用例文件, 以
+    │       HOSTNAME/POD_IP 环境变量区分角色 (见第 7 节; 混布 TP
+    │       multinode 全节点并发启动, 见第 8 节)
     │
     └─ [fetch] 拉回节点上的运行产物到本地结果目录
          (tmp/ 及注入的固定脚本不回传, 见 6.2)
@@ -364,11 +376,11 @@ suites:
 1. 执行机起一个轻量 HTTP 协调服务（固定端口 9377，模拟 ConfigMap 的读/写。端口被残留的流水线进程占用时自动清理后重试；被无关进程占用或清理失败则启动报错，报错信息附带手动 kill 命令。**不会回退随机端口**——环境只放行 9377，换端口会导致远程节点静默连不上）；
 2. 每个角色容器启动前注入 `sitecustomize.py`（落在挂载的 /output，经 `PYTHONPATH` 生效），把用例用到的 kubernetes 客户端接口重定向到协调服务。各角色注入的内容完全相同（角色差异全在环境变量），该文件及编译缓存仅留在节点 `runs/` 侧，fetch 不回传（见 6.2）；
 3. 流水线预置所有 pod 的注册信息 `sglang-prefill-0`/`sglang-prefill-1`/`sglang-decode-0`/... → 节点 IP（K8s 里由各 pod 自注册），PD 节点据此确定 master 地址和 `ASCEND_MF_STORE_URL`，router 据此收集 PD 地址列表；
-4. 所有节点**并发** `docker run` 同一用例文件，以环境变量区分角色和序号：
+4. **router 容器先启动**，等它向协调服务写入 `active-test-class` 后再启动 prefill/decode 容器——保证 PD 首次查询 ConfigMap 即能看到该 key（对齐 CI 时序：CI 的 router pod 不挂 NPU、必然先写好；本地 router 同样挂满 NPU，启动竞争无偏向，需显式控制顺序。router 提前退出或等待超 120s 时兜底直接启动 PD）。各节点 `docker run` 同一用例文件，以环境变量区分角色和序号：
    - `HOSTNAME=sglang-{role}-{idx}`：用例框架据此识别角色（含 role 名）和序号（末尾数字）；
    - `POD_IP=节点 IP`：服务绑定与互访地址（容器 host 网络）；
-   - prefill/decode 拉起 PD 服务后轮询等待结束信号；router 等 PD 端口（8000）全部就绪后拉起 router，`/health` 就绪后执行基准测试；
-5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时；
+   - prefill/decode 拉起 PD 服务后轮询等待结束信号；router 等 PD 端口（8000）全部就绪后拉起 router 进程，`/health` 就绪后执行基准测试；
+5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时。结束信号写入 60s 后仍未退出的容器（如卡在端口等待不查 ConfigMap）会被强制 `docker rm -f`（等价 CI 外层 runner 删 job，避免拖到容器超时）；
 6. 用例判定 = 全部节点退出码为 0（正常结束时 PD 角色不跑测试，收到结束信号后以 0 退出，基准结果与断言都在 router 的日志里）。
 
 ### 7.3 前置条件（多机用例额外要求）
@@ -380,7 +392,7 @@ suites:
 | 模型缓存 | prefill/decode 节点均需预置模型缓存（`~/.cache`，与单机用例一致） |
 | 镜像 | router 所在节点镜像需含 `sglang_router`（与 CI 一致的镜像已含；缺失时 router 日志会报 ModuleNotFoundError） |
 
-节点 `/root/.docker/config.json` 配了代理也不影响：流水线给所有容器注入 `no_proxy`（含全部节点 IP），协调服务与节点互访直连（见 3.4）。
+节点 `/root/.docker/config.json` 配了代理也不影响：流水线给所有容器注入 `no_proxy`（含全部节点 IP + 协调服务地址），协调服务与节点互访直连（见 3.4）。
 
 ### 7.4 产物
 
@@ -475,7 +487,16 @@ results/{run_id}/
 
 **Q: 节点无法访问 GitHub / 镜像仓库怎么办？**
 节点预配代理；或用离线模式：提前手动 `git clone` + `docker pull`，配置里 `prepare: false`——pipeline 不联网、不动代码，完全使用节点现状。
-gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前放到节点 `~/.cache/modelscope/hub/datasets/tmp/test.jsonl`，perf 套件的 ShareGPT 数据集放 `~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json`——容器启动时会自动拷入 /tmp（缓存缺失则忽略，回退在线下载）。
+gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前下载后放到任意本地目录（如 `/data/datasets/`），再配置 `run.datasets` 指向**绝对路径**——pipeline 自动把所在目录挂载进容器（同路径映射），容器启动时 cp 到 `/tmp/`（文件缺失则忽略，回退在线下载）：
+
+```yaml
+run:
+  datasets:
+    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
+    - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+```
+
+未配置 `run.datasets` 时不会预置任何数据集，由用例在线下载或自行读取。多节点用例要求各节点均存在该路径。
 
 **Q: 如何测某个特定 commit？**
 `run.code.ref` 改为 commit SHA 即可，checkout 逻辑对分支/tag/SHA 通用。
@@ -491,6 +512,15 @@ gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前放到节点
 
 **Q: A5 节点上跑单机用例，脚本里的 `--tp-size` 是按 A3 卡数配置的，怎么办？**
 该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（`{用例名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
+
+**Q: A5 单机用例需要开灵衢互联（FIA）怎么办？**
+配置 `run.a5_env`（仅对 a5 节点单机用例容器生效，其他容器不受影响）：
+
+```yaml
+run:
+  a5_env:
+    ASCEND_USE_FIA: "1"
+```
 
 ## 附录 A: 配置 SSH 免密
 
