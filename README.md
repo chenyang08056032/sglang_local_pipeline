@@ -60,7 +60,7 @@ sglang_local_pipeline/
 | `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"` |
 | `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
-| `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；多节点用例须各节点均存在 |
+| `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；单机用例需该 `node` 节点存在，多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，缺失不影响（路径不存在时 cp 静默忽略） |
 
 ### 3.2 nodes 段
 
@@ -364,7 +364,7 @@ suites:
 ```
 
 - `prefill`/`decode` 的值可以是字符串（单节点）或列表（多节点），两种写法等价。
-- `router` 的值只能是字符串（单节点），配列表会报错。
+- `router` 的值只能对应单个节点（字符串或单元素列表均可，等价），配多个节点会报错。
 - 节点卡数在 `docker.devices: auto`（默认）时由 `arch` 决定（`a3`→16 卡、`a5`→8 卡），未知/缺失 arch 启动时报错；显式配 devices 列表时以列表为准。
 - router 不占 NPU（仅转发与压测），通常复用 P/D 节点（host 网络下端口不冲突：PD 服务 8000、router 6677），也可配独立节点。
 - 各角色的启动参数、环境变量、断言阈值完全由用例文件自身定义（与 CI 一致），流水线只负责编排。
@@ -396,37 +396,37 @@ suites:
 
 ### 7.4 产物
 
-多机用例每个角色在 results 下各占一个子目录，结构同 6.2（`{用例名}.log` + `ssh.log` + `plog/`；基准测试结果看 `router-0/{用例名}.log`）。以 2p2d 为例：
+多机用例每个角色在 results 下各占一个子目录，结构同 6.2（`{脚本名}.log` + `ssh.log` + `plog/`；基准测试结果看 `router-0/{脚本名}.log`）。以 2p2d 为例：
 
 ```
 results/{run_id}/
 ├── summary.json
 └── dsv4-flash-w8a8-2p2d-16p/
     ├── prefill-0/
-    │   ├── {用例名}.log
+    │   ├── {脚本名}.log
     │   ├── ssh.log
     │   └── plog/
     ├── prefill-1/
-    │   ├── {用例名}.log
+    │   ├── {脚本名}.log
     │   ├── ssh.log
     │   └── plog/
     ├── decode-0/
-    │   ├── {用例名}.log
+    │   ├── {脚本名}.log
     │   ├── ssh.log
     │   └── plog/
     ├── decode-1/
-    │   ├── {用例名}.log
+    │   ├── {脚本名}.log
     │   ├── ssh.log
     │   └── plog/
     └── router-0/
-        ├── {用例名}.log
+        ├── {脚本名}.log
         ├── ssh.log
         └── plog/
 ```
 
 节点 `runs/` 侧同构，但多出 `tmp/`、`sitecustomize.py`、`__pycache__/`（fetch 不回传，见 6.2）。
 
-执行过程中控制台**只回显 router 的输出**（每行带 `[router-0] ` 前缀），对齐 CI 各 pod 日志隔离的观感；prefill/decode 日志量大且与 router 交错，仅实时写入各自子目录的 `{用例名}.log` 不回显（PD 角色异常结束时，控制台的状态行会指明其日志路径）。基准结果与断言看 `router-0/{用例名}.log`，PD 服务问题看对应角色目录。混布 TP 用例（第 8 节）同理：只回显 master（node-0），worker 仅写文件。
+执行过程中控制台**只回显 router 的输出**（每行带 `[router-0] ` 前缀），对齐 CI 各 pod 日志隔离的观感；prefill/decode 日志量大且与 router 交错，仅实时写入各自子目录的 `{脚本名}.log` 不回显（PD 角色异常结束时，控制台的状态行会指明其日志路径）。基准结果与断言看 `router-0/{脚本名}.log`，PD 服务问题看对应角色目录。混布 TP 用例（第 8 节）同理：只回显 master（node-0），worker 仅写文件。
 
 ## 8. 多机（混布 TP）用例
 
@@ -464,18 +464,18 @@ suites:
 
 ### 8.4 产物
 
-与 PD 分离结构类似，按节点序号分子目录，每个子目录同 6.2 结构（基准测试结果看 `node-0/{用例名}.log`）：
+与 PD 分离结构类似，按节点序号分子目录，每个子目录同 6.2 结构（基准测试结果看 `node-0/{脚本名}.log`）：
 
 ```
 results/{run_id}/
 ├── summary.json
 └── glm5_2-16p-gpqa/
     ├── node-0/                # master (跑测试)
-    │   ├── {用例名}.log
+    │   ├── {脚本名}.log
     │   ├── ssh.log
     │   └── plog/
     └── node-1/                # worker (只起 server)
-        ├── {用例名}.log
+        ├── {脚本名}.log
         ├── ssh.log
         └── plog/
 ```
@@ -496,7 +496,7 @@ run:
     - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
 ```
 
-未配置 `run.datasets` 时不会预置任何数据集，由用例在线下载或自行读取。多节点用例要求各节点均存在该路径。
+未配置 `run.datasets` 时不会预置任何数据集，由用例在线下载或自行读取。单机用例需该 `node` 节点存在该路径；多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，路径不存在时 cp 静默忽略不影响启动。
 
 **Q: 如何测某个特定 commit？**
 `run.code.ref` 改为 commit SHA 即可，checkout 逻辑对分支/tag/SHA 通用。
@@ -511,7 +511,7 @@ run:
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。
 
 **Q: A5 节点上跑单机用例，脚本里的 `--tp-size` 是按 A3 卡数配置的，怎么办？**
-该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（`{用例名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
+该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（`{脚本名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
 
 **Q: A5 单机用例需要开灵衢互联（FIA）怎么办？**
 配置 `run.a5_env`（仅对 a5 节点单机用例容器生效，其他容器不受影响）：

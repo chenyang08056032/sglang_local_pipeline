@@ -269,7 +269,8 @@ def _log(msg):
 #   - sitecustomize.py 把用例用到的 kubernetes 接口重定向到协调服务
 # ---------------------------------------------------------------------------
 
-# 协调服务默认端口 (被占用则自动换随机端口); 节点容器需可达执行机的该端口
+# 协调服务固定端口 (不回退随机端口: 环境只放行 9377, 换端口远程节点会静默
+# 连不上; 被占时先清理残留流水线进程, 清不掉才报错, 见 CoordService.start)
 _COORD_DEFAULT_PORT = 9377
 # 与 sglang 侧 test_npu_multi_node_utils.ACTIVE_TEST_CLASS 保持一致
 _ACTIVE_TEST_CLASS_KEY = "active-test-class"

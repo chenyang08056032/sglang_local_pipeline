@@ -25,9 +25,12 @@ run:
     STREAMS_PER_DEVICE: "32"                # 每卡 stream 数
   a5_env:                                   # 仅 a5 节点单机用例容器注入 (多机用例及其他 arch 节点不注入), 覆盖 env 同名键, 默认无
     ASCEND_USE_FIA: "1"                     # A5 灵衢互联 (FIA) 开启
-  datasets:                                 # 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载进容器); 默认不预置; 多节点用例须各节点均存在
-    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # gsm8k
-    - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.jsonl         # 任意本地路径
+  # 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载进容器); 默认不预置
+  # 单机用例: 该 node 节点需存在; 多机用例: 仅 router (PD 分离) / master (混布 TP) 节点需存在
+  # PD/worker 节点缺失不影响 (它们只起 server 不读数据集); 路径不存在时 cp 静默忽略, 回退在线下载
+  datasets:
+    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl  # gsm8k
+    - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.jsonl  # 任意本地路径
 
 nodes:
   - host: 192.168.10.1   # A3, 16 卡
