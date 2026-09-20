@@ -32,7 +32,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, cleanup_node_sglang,
                       execute_multinode_suite, execute_multinode_tp_suite,
-                      execute_suite, prepare_node)
+                      execute_suite, prepare_local_repo, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -69,8 +69,9 @@ class DockerConfig:
 
 @dataclass
 class PrepareConfig:
-    """节点准备。online=true 需节点可达 registry/git remote;
-    false 则完全使用节点现状 (镜像/代码已手动就位, 不联网不动代码)。"""
+    """节点准备。online=true 需执行机可达 registry/git remote (节点侧
+    只拉镜像); false 则离线: 节点镜像手动就位, 执行机代码仓手动准备,
+    两种模式均会把执行机代码仓清理后复制到各远程节点。"""
     online: bool = False
 
 
@@ -92,7 +93,7 @@ class RunConfig:
 
     @property
     def repo(self):
-        """节点上的 sglang 源码路径, 固定放在 workspace 下。"""
+        """sglang 源码路径, 固定放在 workspace 下 (执行机准备, 各节点同路径复制)。"""
         return f"{self.workspace}/sglang"
 
 
@@ -342,10 +343,17 @@ def _suite_hosts(suite):
 
 
 def prepare_nodes(cfg, dry_run):
-    """按节点去重, 逐节点准备 (镜像 pull / 代码 clone / fetch / checkout)。
+    """先在执行机准备代码仓 (唯一 git 操作点), 再逐节点准备。
 
-    返回 {host: 是否就绪}; 节点未定义时返回 None。
+    节点准备: 联网时镜像 pull (不存在才拉); 远程节点清理旧代码仓后从
+    执行机整仓复制 (联网/离线均执行), 保证各节点代码与执行机严格一致。
+
+    返回 {host: 是否就绪}; 节点未定义或执行机代码仓就绪失败时返回 None。
     """
+    # 代码准备只发生在执行机; 失败则所有节点都无代码可分发, 直接终止
+    if not prepare_local_repo(cfg, dry_run):
+        _log("[错误] 执行机代码仓准备失败, 各节点无法分发代码, 终止")
+        return None
     prepared = {}
     for host in dict.fromkeys(h for s in cfg.suites for h in _suite_hosts(s)):
         node = cfg.find_node(host)

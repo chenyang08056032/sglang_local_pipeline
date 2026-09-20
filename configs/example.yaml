@@ -4,10 +4,10 @@
 
 run:
   workspace: /root/sglang_local_pipeline   # 节点上的工作目录; sglang 仓固定在 {workspace}/sglang, 结果目录固定在 {workspace}/results, 均不可另配
-  prepare: false                            # true=联网: 镜像 pull + 代码 clone/fetch/checkout (需配 run.code.git_remote); false=离线: 镜像/代码已手动就位, 不联网不动代码
+  prepare: false                            # true=联网: 节点镜像 pull + 执行机代码 clone/fetch/checkout 后复制到各节点 (需配 run.code.git_remote); false=离线: 节点镜像手动就位, 执行机代码仓手动准备, 两种模式均会清理各节点旧仓后从执行机复制
   code:                                     # 仅 prepare: true 时生效; 离线模式可整段省略
-    git_remote: https://github.com/sgl-project/sglang.git   # clone/fetch 来源; 联网模式必填
-    ref: main                               # 目标版本: 分支名 / tag / commit SHA; 联网模式 checkout, 默认 main
+    git_remote: https://github.com/sgl-project/sglang.git   # 执行机 clone/fetch 来源 (节点不再做 git 操作); 联网模式必填
+    ref: main                               # 目标版本: 分支名 / tag / commit SHA; 联网模式在执行机 checkout, 默认 main
   docker:
     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # 测试容器镜像
     devices: auto                           # auto=按节点 arch 推导卡数映射 /dev/davinci0..N-1 (a3=16, a5=8) + 管理设备; 或显式列表如 [0,1,2,3]

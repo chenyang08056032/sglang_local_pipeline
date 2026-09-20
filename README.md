@@ -24,9 +24,11 @@ sglang_local_pipeline/
 | sglang_local_pipeline 代码 | clone 或拷贝本目录 |
 | Python 3 | 加 `pip install pyyaml`（唯一第三方依赖） |
 | ssh 客户端 + tar | 仅远程节点需要（本地节点直接 subprocess 执行，无需 ssh） |
-| 网络 | 远程节点需可达 22 端口 |
+| sglang 代码仓 | 放在 `{workspace}/sglang`（**唯一代码准备点**，各节点代码均由此复制）。联网模式由流水线自动 clone/checkout（需 git + 可达 git remote）；离线模式手动放好 |
+| 网络 | 远程节点需可达 22 端口；联网模式另需可达 docker registry（节点拉镜像）/ git remote（执行机 clone） |
+| 磁盘 | workspace（含 sglang 仓 + results） |
 
-执行机**不需要** Docker、NPU 驱动、git、sglang 仓库——这些全部在节点上。
+执行机**不需要** Docker、NPU 驱动——这些在节点上。
 执行机也可以就是节点本身（如 A3 上直接跑）：pipeline 自动检测节点 host 是否指向本机，是则直接本地执行（不走 SSH、无需免密配置、无需 sshd），否则走 SSH。
 
 ### 节点（A3 / A5 等目标机器）
@@ -36,10 +38,11 @@ sglang_local_pipeline/
 | SSH 免密 | 仅远程节点需要（本地节点=执行机时自动走 subprocess，无需 SSH） |
 | Docker | 已安装并运行 |
 | NPU 驱动 | 存在 `/usr/local/Ascend/driver`、`/usr/local/Ascend/firmware`、`/dev/davinci*`、`/dev/davinci_manager`、`/dev/hisi_hdc`、`/etc/ascend_install.info` |
-| 网络（可选） | 可达 docker registry 和 git remote（用于自动 pull / clone / fetch；离线时可提前手动准备） |
-| 磁盘 | 模型缓存 `~/.cache`（几十 GB）+ 仓库 + workspace |
+| 网络（可选） | 仅联网模式需可达 docker registry（自动 pull 镜像）；**代码无需外网/git**——各节点代码由流水线从执行机整仓复制（先清理节点旧仓），保证多节点版本严格一致 |
+| 磁盘 | 模型缓存 `~/.cache`（几十 GB）+ workspace（含复制过来的 sglang 仓 + runs） |
 
-镜像、sglang 仓库：`prepare: true` 时由流水线自动准备（pull / clone / checkout），无需提前操作；默认 `prepare: false`（离线）时需提前手动 `docker pull`、把代码放到 `{workspace}/sglang`，流水线不联网、不动代码。
+镜像：`prepare: true` 时各节点自动 pull（不存在才拉）；默认 `prepare: false`（离线）时需提前在**各节点**手动 `docker pull`。
+sglang 代码仓：只需在**执行机**准备——联网模式流水线自动 clone/checkout `{workspace}/sglang`，离线模式手动放好；无论哪种模式，prepare 阶段都会先清理各节点旧仓（`rm -rf {workspace}/sglang`）再从执行机整仓复制（tar 经 ssh，含 `.git`）。
 
 ## 3. 配置文件说明
 
@@ -50,9 +53,9 @@ sglang_local_pipeline/
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
 | `run.workspace` | 无 | 是 | 节点上的工作目录。sglang 仓固定在 `{workspace}/sglang`，执行机结果目录固定在 `{workspace}/results`（与节点 `runs/` 平级，同机不冲突），均不可另配 |
-| `run.prepare` | `false` | 否 | `true`=联网：镜像 pull + 代码 clone/fetch/checkout；`false`=离线：镜像/代码需提前手动就位，流水线不联网、不动代码 |
-| `run.code.git_remote` | 无 | `prepare: true` 时必填 | clone/fetch 来源。**仅联网模式读取**；离线模式不生效，配置里可整段省略 |
-| `run.code.ref` | `main` | 否 | 目标版本：分支名 / tag / commit SHA。仅联网模式 checkout |
+| `run.prepare` | `false` | 否 | `true`=联网：节点镜像 pull + 执行机代码 clone/fetch/checkout；`false`=离线：节点镜像手动就位、执行机代码仓手动准备。**两种模式均会把执行机代码仓清理各节点旧仓后整仓复制过去** |
+| `run.code.git_remote` | 无 | `prepare: true` 时必填 | 执行机 clone/fetch 来源（节点不做 git 操作）。**仅联网模式读取**；离线模式不生效，配置里可整段省略 |
+| `run.code.ref` | `main` | 否 | 目标版本：分支名 / tag / commit SHA。仅联网模式在执行机 checkout |
 | `run.docker.image` | 无 | 是 | 测试容器镜像 |
 | `run.docker.devices` | `auto` | 否 | `auto`=按节点 arch 推导卡数映射 `/dev/davinci0..N-1`（a3=16、a5=8）+ 管理设备；或显式列表如 `[0,1,2,3]`，以列表为准 |
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
@@ -196,15 +199,21 @@ date +"%H:%M:%S"            # 输出形如 18:00:00
 ```
 python3 src/run.py
     │
-    ├─ [prepare] 每个被用到的节点执行一次（SSH 到节点）:
-    │     docker image inspect 镜像 || docker pull
-    │     仓库不存在则 git clone；remote 指向不符则 set-url
+    ├─ [prepare] 执行机准备代码仓 (唯一 git 操作点, 仅联网模式):
+    │     首次 git clone；remote 指向不符则 set-url
     │     git fetch origin --tags --force
     │     git checkout --force {ref}
     │     分支则 git reset --hard origin/{ref}   # 保证与远端严格一致
+    │     (离线模式: 使用执行机现状, 仅校验 {workspace}/sglang 存在)
+    │
+    ├─ [prepare] 每个被用到的节点执行一次（SSH 到节点）:
+    │     (联网) docker image inspect 镜像 || docker pull
+    │     (远程节点, 联网/离线均执行) 清理旧代码仓 rm -rf {workspace}/sglang
+    │       → 从执行机整仓复制 (tar 经 ssh, 含 .git)
     │     就绪后清理 sglang 残留（联网/离线均执行）:
-    │       杀宿主机 sglang / sglang_router 进程（pkill -f）
-    │       删 sgl-pipeline-* 及同镜像残留容器（docker rm -f）
+    │       杀宿主机 sglang 进程（pkill -f: python -m sglang.* /
+    │         sglang serve / sglang::* worker / sglang_router）
+    │       删 sgl-pipeline-* 残留容器（docker rm -f; 同镜像他人容器不删）
     │       → 确保没有进程占用 NPU 卡
     │
     ├─ [execute] 逐用例串行执行（SSH 到节点）:
@@ -483,10 +492,11 @@ results/{run_id}/
 ## 9. 常见问题
 
 **Q: 改了个人 fork 的分支，节点上的旧仓库会冲突吗？**
-不会。`prepare` 阶段会 `git remote set-url` 切到新 remote 再 fetch；分支用 `reset --hard origin/{ref}` 对齐，只影响当前 checkout 的分支，不影响其他本地分支。
+不会。git 操作只发生在执行机（`git remote set-url` 切新 remote 再 fetch；分支用 `reset --hard origin/{ref}` 对齐）；各节点代码每次运行前都会被清理后从执行机整仓复制，不存在节点侧残留冲突。
 
-**Q: 节点无法访问 GitHub / 镜像仓库怎么办？**
-节点预配代理；或用离线模式：提前手动 `git clone` + `docker pull`，配置里 `prepare: false`——pipeline 不联网、不动代码，完全使用节点现状。
+**Q: 节点无法访问 GitHub 怎么办？**
+代码不受影响：git 操作只在执行机做，节点无需外网（代码由流水线从执行机复制过去）。镜像则需节点可达 docker registry，或用离线模式提前手动 `docker pull`。
+离线模式代码也只需在执行机准备好：把代码放到执行机的 `{workspace}/sglang`（如手动 `git clone`），流水线会自动清理各节点旧仓后复制过去。
 gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前下载后放到任意本地目录（如 `/data/datasets/`），再配置 `run.datasets` 指向**绝对路径**——pipeline 自动把所在目录挂载进容器（同路径映射），容器启动时 cp 到 `/tmp/`（文件缺失则忽略，回退在线下载）：
 
 ```yaml

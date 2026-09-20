@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """节点执行器 (自动检测本地/远程)。
 
-执行链: (本地直执 或 SSH) → git checkout → docker run → 容器内跑用例文件 → 拉回日志
+执行链: 执行机准备代码仓 (git, 唯一代码准备点) → 清理各节点旧仓并从执行机复制
+→ (本地直执 或 SSH) docker run → 容器内跑用例文件 → 拉回日志
 """
 
 import json
@@ -240,6 +241,46 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
                  f"(检出 {len(future)} 个未来时间戳, 明细略), 建议校时")
     # 任一端失败都算拉回失败 (ssh 断开 / 远程 tar 出错 / 本地 tar 解压出错)
     return rc if rc != 0 else pull_rc
+
+
+def ssh_push_dir(node, local_dir, remote_dir, dry_run=False):
+    """推送执行机目录到远程节点: tar 打包经 ssh 管道, 远程解压 (fetch 的反方向)。
+
+    目标目录由调用方先清理 (sync_repo_to_node 先 rm -rf 旧仓), 此处只负责
+    传输; 远程 mkdir -p 兜底建目录。tar 用 "." 打包含隐藏文件 (.git 等),
+    整仓复制保证节点与执行机代码严格一致。
+    """
+    if dry_run:
+        print(f"[dry-run] push {local_dir} -> "
+              f"{node.user}@{node.host}:{remote_dir}")
+        return 0
+    push = subprocess.Popen(
+        ["tar", "czf", "-", "-C", local_dir, "."],
+        stdout=subprocess.PIPE,
+    )
+    q_dir = shlex.quote(remote_dir)
+    extract = subprocess.Popen(
+        ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+         "-o", "LogLevel=ERROR",
+         "-p", str(node.port), f"{node.user}@{node.host}",
+         f"mkdir -p {q_dir} && tar xzf - -C {q_dir}"],
+        stdin=push.stdout, stderr=subprocess.PIPE, text=True, errors="ignore")
+    push.stdout.close()
+    _, err = extract.communicate()
+    rc = extract.returncode
+    push_rc = push.wait()
+    if err:
+        # 与 fetch 同规则: 未来时间戳告警 (执行机时钟快于节点) 汇总为一行,
+        # 其余 tar 错误原样透出
+        future = [l for l in err.splitlines() if "in the future" in l]
+        for l in err.splitlines():
+            if "in the future" not in l:
+                _log(f"[push] tar: {l}")
+        if future:
+            _log(f"[push] 警告: 执行机时钟快于 {node.host} "
+                 f"(检出 {len(future)} 个未来时间戳, 明细略), 建议校时")
+    # 任一端失败都算推送失败 (本地 tar 出错 / ssh 断开 / 远程解压出错)
+    return rc if rc != 0 else push_rc
 
 
 def _log(msg):
@@ -624,31 +665,41 @@ def _stage_run_wrapper(node, run_dir, dry_run=False):
     return ssh_run(node, cmd)
 
 
-def prepare_node(cfg, node, dry_run=False):
-    """执行前准备一个节点。online=true: 镜像/代码自动就位+切到目标 ref;
-    false: 完全使用节点现状 (离线模式, 镜像/代码已手动准备好)。
+class _ExecMachine:
+    """执行机自身的伪节点: host=localhost 恒在 _local_ips() 集合内,
+    ssh_run 对其走本地 subprocess 分支——供执行机本地命令 (git 等) 复用
+    同一套实时回显 / [ssh] 诊断逻辑。
+    """
 
-    online 模式需节点网络可达 (docker registry / git remote), 代理由节点环境预置。
+    host = "localhost"
+    user = "root"
+    port = 22
+
+
+def prepare_local_repo(cfg, dry_run=False):
+    """在执行机上准备 sglang 代码仓 (唯一代码准备点, 各节点代码均由此复制)。
+
+    online: 首次 clone / remote 变更 set-url, fetch + checkout 目标 ref;
+    offline: 使用执行机现状 (需提前手动把代码放到 {workspace}/sglang)。
     """
     repo = cfg.run.repo
-    where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
-    lines = ["set -e"]
     if not cfg.run.prepare.online:
-        # 离线: 不 pull / 不 clone / 不 fetch / 不 checkout;
-        # ssh 诊断 quiet (连通性空命令无信息量), 失败时 rc!=0 仍会强制上控制台
-        _log(f"[prepare] {where} 离线就绪 (跳过镜像/代码准备, repo={repo} 自行确认)")
-        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run, quiet=True)
-        return rc == 0
+        if dry_run:
+            print(f"[dry-run] 执行机代码仓 {repo} 使用现状 (离线, "
+                  f"将清理各节点旧仓后复制过去)")
+            return True
+        if os.path.isdir(repo):
+            _log(f"[prepare] 执行机代码仓就绪 (离线, 使用现状): {repo}")
+            return True
+        _log(f"[错误] 执行机代码仓不存在: {repo}  离线模式需手动准备, 如: "
+             f"git clone <remote> -b <ref> {repo}")
+        return False
     remote = cfg.run.git_remote
-    # 镜像不存在才 pull
-    _log(f"[prepare] {where} 检查镜像 (不存在则 pull): {cfg.run.docker.image}")
-    image = shlex.quote(cfg.run.docker.image)
-    lines.append(f"docker image inspect {image} >/dev/null 2>&1 "
-                 f"|| docker pull {image}")
-    # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
-    _log(f"[prepare] {where} 确保仓库就位: {repo} (remote={remote})")
+    _log(f"[prepare] 执行机准备代码仓: {repo} (remote={remote})")
     q_repo = shlex.quote(repo)
     q_remote = shlex.quote(remote)
+    lines = ["set -e"]
+    # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
     lines.append(
         f"if [ -d {q_repo}/.git ]; then\n"
         f"  cd {q_repo}\n"
@@ -661,47 +712,95 @@ def prepare_node(cfg, node, dry_run=False):
     )
     # fetch 只更新 origin/* 指针; checkout 切版本; 分支还需 reset --hard 对齐远端
     # (否则本地分支停在旧提交, checkout 到的是旧代码)。tag/commit 不 reset。
-    _log(f"[prepare] {where} git fetch + checkout {cfg.run.ref}")
+    _log(f"[prepare] 执行机 git fetch + checkout {cfg.run.ref}")
     q_ref = shlex.quote(cfg.run.ref)
     lines.append(f"cd {q_repo} && git fetch origin --tags --force")
     lines.append(f"git checkout --force {q_ref}")
     lines.append(f"if git show-ref --verify --quiet refs/remotes/origin/{q_ref}; then "
                  f"git reset --hard origin/{q_ref}; fi")
-    rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    rc = ssh_run(_ExecMachine(), "\n".join(lines), dry_run=dry_run)
     if rc == 0:
-        _log(f"[prepare] {where} 就绪: 镜像+代码已对齐 ref={cfg.run.ref}")
+        _log(f"[prepare] 执行机代码仓就绪: ref={cfg.run.ref}")
     else:
-        _log(f"[prepare] {where} 失败 (rc={rc}), 详见上方节点输出")
+        _log(f"[prepare] 执行机代码仓准备失败 (rc={rc}), 详见上方输出")
     return rc == 0
 
 
-def cleanup_node_sglang(cfg, node, dry_run=False):
-    """清理节点上的 sglang 残留 (宿主机进程 + 容器), 释放 NPU 卡。
+def sync_repo_to_node(cfg, node, dry_run=False):
+    """把执行机的 sglang 代码仓同步到远程节点: 先清理节点旧仓, 再整仓复制。
 
-    prepare 阶段对每个就绪节点执行一次 (紧跟 prepare_node), 覆盖三类残留:
-      - 宿主机 sglang 进程 (python -m sglang.* / sglang_router, 手动调试残留)
+    各节点代码不再各自 git 操作 (节点无需外网/git), 统一以执行机为唯一来源,
+    保证多节点用例的代码版本严格一致。执行机自身节点无需同步。
+    """
+    repo = cfg.run.repo
+    where = f"{node.user}@{node.host}:{node.port}"
+    _log(f"[prepare] {where} 清理旧代码仓: {repo}")
+    if ssh_run(node, f"rm -rf {shlex.quote(repo)}", dry_run=dry_run) != 0:
+        _log(f"[prepare] {where} 清理旧代码仓失败, 手动排查: "
+             f"ssh {node.user}@{node.host} 'ls {repo}'")
+        return False
+    _log(f"[prepare] {where} 从执行机复制代码仓 -> {repo}")
+    if ssh_push_dir(node, repo, repo, dry_run=dry_run) != 0:
+        _log(f"[prepare] {where} 复制代码仓失败, 手动排查: "
+             f"ssh {node.user}@{node.host} 'ls {repo}'")
+        return False
+    return True
+
+
+def prepare_node(cfg, node, dry_run=False):
+    """执行前准备一个节点。
+
+    代码仓统一在执行机准备 (prepare_local_repo) 并复制到各节点
+    (sync_repo_to_node), 节点侧不做 git 操作 (节点无需外网):
+      - online=true: 镜像不存在则 pull;
+      - 远程节点: 清理旧代码仓 + 从执行机整仓复制 (联网/离线均执行);
+      - 执行机自身: 代码已在 prepare_local_repo 就位, 无需复制。
+    """
+    where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
+    if cfg.run.prepare.online:
+        # 镜像不存在才 pull
+        _log(f"[prepare] {where} 检查镜像 (不存在则 pull): {cfg.run.docker.image}")
+        image = shlex.quote(cfg.run.docker.image)
+        lines = ["set -e",
+                 f"docker image inspect {image} >/dev/null 2>&1 "
+                 f"|| docker pull {image}"]
+        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+        if rc != 0:
+            _log(f"[prepare] {where} 失败 (rc={rc}), 详见上方节点输出")
+            return False
+    if not _is_local(node) and not sync_repo_to_node(cfg, node, dry_run):
+        return False
+    _log(f"[prepare] {where} 就绪 (代码来自执行机 {cfg.run.repo})")
+    return True
+
+
+def cleanup_node_sglang(cfg, node, dry_run=False):
+    """清理节点上的 sglang 残留 (宿主机进程 + 本流水线容器), 释放 NPU 卡。
+
+    prepare 阶段对每个就绪节点执行一次 (紧跟 prepare_node), 覆盖两类残留:
+      - 宿主机 sglang 进程 (手动调试残留, 形态见下)
       - 本流水线容器 (name=sgl-pipeline-*): 上轮 timeout 只杀掉节点上的
         docker 客户端, 容器不会自停, 不清理则占卡 / --name 冲突
-      - 同镜像的其他容器 (CI / 手动 docker run 残留)
+    容器只删自己创建的 sgl-pipeline-*; 同镜像的其他容器 (CI / 手动
+    docker run 残留) 属他人创建, 不动 (占卡时按失败提示手动处理)。
 
-    模式中的 [.] / [_-] 防止 pgrep/pkill 匹配到清理命令自身 (其 cmdline
-    含模式原文), 也不会误杀 run.py (路径是 sglang_local_pipeline, 不匹配)。
+    模式覆盖四种 cmdline 形态: python -m sglang.* (经典启动) /
+    sglang serve (新版 CLI 启动) / sglang::* (scheduler 等 worker 被
+    setproctitle 改名后的 cmdline, 占 NPU 卡的正是它们) / sglang_router。
+    模式中的 [.:] / [ ] / [_-] 防止 pgrep/pkill 匹配到清理命令自身 (其
+    cmdline 含模式原文), 也不会误杀 run.py (路径是 sglang_local_pipeline)。
     """
-    image = shlex.quote(cfg.run.docker.image)
-    pattern = "'sglang[.]|sglang[_-]router'"
+    pattern = "'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
     lines = [
         # 先列后杀, 输出确认清掉了什么; pgrep 无匹配 (rc=1) 时打印 (无)
         "echo '[cleanup] 宿主机 sglang 进程:'",
         f"pgrep -af {pattern} || echo '  (无)'",
         f"pkill -9 -f {pattern} 2>/dev/null || true",
-        "echo '[cleanup] 残留容器 (sgl-pipeline-* / 同镜像):'",
+        "echo '[cleanup] 残留容器 (sgl-pipeline-*):'",
         "docker ps -a --filter name=sgl-pipeline- --format '  {.Names} ({.Status})'",
-        f"docker ps -a --filter ancestor={image} --format '  {{.Names}} ({{.Status}})'",
         # xargs -r: 无输入时不执行 (避免空参数报错); rm 失败 stderr 可见, 不阻断
         "docker ps -aq --filter name=sgl-pipeline- "
         "| xargs -r docker rm -f >/dev/null || true",
-        f"docker ps -aq --filter ancestor={image} "
-        f"| xargs -r docker rm -f >/dev/null || true",
     ]
     where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
     _log(f"[cleanup] {where} 清理 sglang 残留 (宿主机进程 + 容器)")
