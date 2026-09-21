@@ -3,11 +3,11 @@
 """sglang 本地测试流水线 (最小可用版)。
 
 用法:
-    python3 src/run.py --config configs/example.yaml
-    python3 src/run.py --config configs/example.yaml --suite qwen3-32b-gsm8k
-    python3 src/run.py --config configs/example.yaml --dry-run
-    python3 src/run.py --config configs/example.yaml --at "2026-09-17 18:00:00"
-    python3 src/run.py --config configs/example.yaml --at "18:00:00"   # 今天已过则取明天
+    python3 src/run.py --config configs/example_single.yaml   # 单机 / example_pd.yaml (PD 分离) / example_tp.yaml (混布 TP)
+    python3 src/run.py --config configs/example_single.yaml --suite qwen3-32b-gsm8k
+    python3 src/run.py --config configs/example_single.yaml --dry-run
+    python3 src/run.py --config configs/example_single.yaml --at "2026-09-17 18:00:00"
+    python3 src/run.py --config configs/example_single.yaml --at "18:00:00"   # 今天已过则取明天
 """
 
 import argparse

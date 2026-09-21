@@ -39,7 +39,7 @@ _LOCAL_IPS_CACHE = None
 
 
 def _log_filename(suite):
-    """用例脚本名去 .py 加 .log, 作为容器内 tee 和本地 log_path 的统一文件名。
+    """用例脚本名去 .py 加 .log, 作为容器内落盘日志和本地 log_path 的统一文件名。
     比固定的 'case.log' 更直观: 文件名即用例名, 一眼可知是哪个用例的日志。
     """
     return os.path.splitext(os.path.basename(suite.file))[0] + ".log"
@@ -92,8 +92,8 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     prefix: 多角色并发执行时给控制台每行加前缀 (如 "[prefill] "); 日志文件始终是原始输出。
     quiet: 不回显控制台, 只写日志文件 (多机用例的 PD/worker 角色, 控制台只留测试角色);
         [ssh] 连接诊断同样只落日志, 失败 (rc!=0) 时强制上控制台, 不静默失败。
-    log_path: 容器实时输出 (stdout 流) 写入此文件; fetch 阶段会被容器内 tee 版本覆盖
-        (tee 版本更完整: 不受 SSH 断开/timeout 截断影响)。
+    log_path: 容器实时输出 (stdout 流) 写入此文件; fetch 阶段会被容器内落盘版本覆盖
+        (容器内重定向直写 /output, 更完整: 不受 SSH 断开/timeout 截断影响)。
     diag_path: [ssh] 连接诊断 (开始/结束/rc/耗时) 写入此独立文件; fetch 不覆盖,
         保证用例日志被覆盖后仍可查连接记录。无 diag_path 时回退写 log_path。
     开始/结束打印 [ssh] 连接诊断 (执行方式/目标节点/rc/耗时), 便于排查多机连接问题。
@@ -109,7 +109,7 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     target = "本机" if local else f"ssh {node.user}@{node.host}:{node.port}"
     preview = " ".join(command.split())[:120]
     tic = time.perf_counter()
-    # 实时流文件 (用例名.log): fetch 阶段会被容器 tee 版本覆盖
+    # 实时流文件 (用例名.log): fetch 阶段会被容器内落盘版本覆盖
     # 诊断文件 (ssh.log): 独立保留, fetch 不覆盖, 保证连接记录可查
     log_f = None
     diag_f = None
@@ -327,11 +327,16 @@ _DEFAULT_TIMEOUT_MINUTES = 60
 # 多机用例的角色 (每个角色对应一个节点配置)
 _MULTI_ROLES = ("prefill", "decode", "router")
 
-# 注入容器的 sitecustomize.py: 拦截 kubernetes 导入, 重定向到协调服务。
-# 仅实现用例实际用到的接口子集 (read/patch ConfigMap, list Pod 仅打日志用)。
+# 注入容器的 sitecustomize.py (经 PYTHONPATH=/output 加载, 单机/多机统一):
+#   - 多机用例: 拦截 kubernetes 导入, 重定向到协调服务。仅实现用例实际用到
+#     的接口子集 (read/patch ConfigMap, list Pod 仅打日志用);
+#   - 精度用例: evalscope venv 进程关闭 requests SSL 校验 (见文件内注释)。
 _SITECUSTOMIZE = '''\
-# sglang_local_pipeline 注入: 无 K8s 环境下, 把多机用例依赖的 kubernetes
-# 客户端重定向到流水线协调服务 (SGLANG_COORD_URL)。仅当该变量设置时激活。
+# sglang_local_pipeline 注入 (经 PYTHONPATH=/output 加载):
+#   - 无 K8s 环境下, 把多机用例依赖的 kubernetes 客户端重定向到流水线协调
+#     服务 (SGLANG_COORD_URL)。仅当该变量设置时激活。
+#   - evalscope venv (test_env_evalscope) 的 python 进程: 关闭 requests SSL
+#     校验, 规避企业代理自签证书导致数据集下载 CERTIFICATE_VERIFY_FAILED。
 import json
 import os
 import sys
@@ -398,6 +403,32 @@ if _COORD_URL and "kubernetes" not in sys.modules:
         "kubernetes.config": _config,
         "kubernetes.client.rest": _rest,
     })
+
+# evalscope venv (test_env_evalscope) 的 python 进程: 关闭 requests SSL 校验。
+# 企业代理以自签证书劫持外网 HTTPS, venv 内 requests 下载 modelscope 数据集
+# 报 CERTIFICATE_VERIFY_FAILED; 补丁放在 merge_environment_settings 层, 覆盖
+# 会话默认值与调用方显式传入的 verify (含 verify=True)。其余 python 进程
+# (sglang server / 用例主进程 / 系统 python) 前缀不匹配, 完全不受影响。
+if "test_env_evalscope" in sys.prefix:
+    try:
+        import contextlib
+
+        import requests
+        import urllib3
+
+        _orig_merge = requests.Session.merge_environment_settings
+
+        @contextlib.contextmanager
+        def _merge_no_verify(self, *args, **kwargs):
+            with _orig_merge(self, *args, **kwargs) as settings:
+                settings["verify"] = False
+                yield settings
+
+        requests.Session.merge_environment_settings = _merge_no_verify
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        print("[py_hook] requests SSL verification disabled (evalscope venv)")
+    except Exception:
+        pass
 '''
 
 
@@ -636,15 +667,15 @@ def _local_ip_towards(host):
 
 def _stage_sitecustomize(node, run_dir, dry_run=False, prefix=None, quiet=False,
                          diag_path=None):
-    """把 fake kubernetes 桥接写到节点 run 目录 (容器内 /output, 经 PYTHONPATH 生效)。
-
+    """把 sitecustomize.py 写到节点 run 目录 (容器内 /output, 经 PYTHONPATH 生效):
+    fake kubernetes 协调桥接 (多机用例) + evalscope venv 的 requests SSL 补丁。
     prefix/quiet/diag_path 透传 ssh_run: 与主命令同规则, quiet 角色的 [ssh] 诊断
     只落 ssh.log 不刷控制台 (失败时仍上控制台), 保证连接记录完整。
     staging 只记诊断不记实时流 (一条 cat 命令, 无容器 stdout)。
     """
     path = f"{run_dir}/sitecustomize.py"
     if dry_run:
-        print(f"[dry-run] 写入 {path}: fake kubernetes 协调桥接 "
+        print(f"[dry-run] 写入 {path}: fake k8s 桥接 + evalscope venv SSL 补丁 "
               f"({len(_SITECUSTOMIZE.splitlines())} 行, 内容见 pipeline.py)")
         return 0
     cmd = (f"mkdir -p {shlex.quote(run_dir)} && "
@@ -1024,9 +1055,16 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
                  f"({node_run_dir}/run_case.py)")
             if _stage_run_wrapper(node, node_run_dir, dry_run) != 0:
                 raise RuntimeError("写入 run_case.py 失败")
+        # 注入 sitecustomize.py (容器内 /output, 经 PYTHONPATH 生效): evalscope
+        # venv 的 requests SSL 校验关闭; fake k8s 桥接仅在 SGLANG_COORD_URL
+        # 设置 (多机用例) 时激活, 单机用例为空操作
+        if _stage_sitecustomize(node, node_run_dir, dry_run) != 0:
+            raise RuntimeError("写入 sitecustomize.py 失败")
         # A5 单机用例专属环境变量 (run.a5_env, 如灵衢 FIA 互联 ASCEND_USE_FIA);
         # 未配置时为空, 不注入; 多机用例不注入
-        extra_env = dict(cfg.run.a5_env) if node.arch == "a5" else None
+        extra_env = dict(cfg.run.a5_env) if node.arch == "a5" else {}
+        # /output/sitecustomize.py 的加载路径 (与多机用例的注入方式一致)
+        extra_env["PYTHONPATH"] = "/output"
         cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving,
                          extra_env=extra_env)
         _log(f"[execute] @ {where} 启动容器 (超时={suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES}分钟)")
@@ -1130,7 +1168,8 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 "NAMESPACE": "sglang",
                 "KUBE_CONFIG_MAP": "sglang-coord",
                 "SGLANG_COORD_URL": coord_url,
-                # /output/sitecustomize.py 注入 fake kubernetes (重定向到协调服务)
+                # /output/sitecustomize.py: fake kubernetes 桥接 + evalscope venv
+                # 的 requests SSL 补丁 (与单机用例注入内容一致)
                 "PYTHONPATH": "/output",
             }
             unit_tic = time.perf_counter()

@@ -1,0 +1,37 @@
+# 单机用例模板: 一个用例在一个节点上执行 (node 指定节点)
+# 用法: python3 src/run.py --config configs/example_single.yaml --dry-run
+# 完整字段与默认值见 README 第 3 节; 未配项取默认值, 注释项按需取消注释
+
+run:
+  workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
+  docker:
+    image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
+    extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载, 追加到默认挂载之后; 不需要可整段删
+      - "/data/weights/DeepSeek-V4-Flash-w8a8:/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8"
+  datasets:                                # 常用: 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载)
+    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # gsm8k; 路径不存在时忽略, 回退在线下载
+  # ---- 以下按需取消注释 ----
+  # prepare: true                          # 联网模式: 节点自动 pull 镜像 + 执行机自动 clone 代码 (需配 code 段); 默认 false 离线
+  # code:                                  # 仅 prepare: true 时需要
+  #   git_remote: https://github.com/sgl-project/sglang.git
+  #   ref: main
+  # env:                                   # 覆盖/追加内置 7 项容器环境变量 (默认值见 README 3.4), 不配则用内置默认
+  #   STREAMS_PER_DEVICE: "32"
+  # a5_env:                                # 仅 a5 节点单机用例容器注入 (覆盖 env 同名键), 多机用例不注入
+  #   ASCEND_USE_FIA: "1"                  # A5 灵衢互联 (FIA) 开启
+  # evalscope_source: /root/evalscope      # 精度框架 evalscope 本地源码路径; 不配则回退在线安装 (仅精度用例需要)
+
+nodes:
+  - host: 192.168.10.1   # [必填] 节点 IP; 指向执行机本身时自动本地执行 (不走 SSH)
+    arch: a3             # [必填] a3=16 卡 / a5=8 卡; 决定挂卡数量, a5 单机用例 --tp-size 自动减半
+    # user: root         # SSH 用户名, 默认 root
+    # port: 22           # SSH 端口, 默认 22
+  # - host: 192.168.10.5 # A5 (8 卡) 节点示例
+  #   arch: a5
+
+suites:
+  # 单机用例: node 指定执行节点 (与 roles/multinode 互斥, 见 example_pd.yaml / example_tp.yaml)
+  - name: test_npu_qwen3_32b   # [必填] 用例名称 (--suite 过滤用)
+    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例文件路径, 相对 repo; 绝对路径须在容器可见挂载内
+    timeout_minutes: 60        # docker run 超时 (分钟), 默认 60
+    node: 192.168.10.1         # 执行节点; nodes 仅定义 1 个节点时可省略

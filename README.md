@@ -10,7 +10,9 @@ sglang_local_pipeline/
 │   ├── run.py          # 入口: 加载配置、节点准备、编排执行、汇总结果
 │   └── pipeline.py     # 核心: 节点执行 (自动检测本地/SSH)、节点准备、docker 命令构造、日志拉回
 ├── configs/
-│   └── example.yaml    # 配置模板
+│   ├── example_single.yaml   # 单机用例配置模板
+│   ├── example_pd.yaml       # 多机 PD 分离用例配置模板
+│   └── example_tp.yaml       # 多机混布 TP 用例配置模板
 ├── README.md
 └── .gitignore
 ```
@@ -46,7 +48,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 
 ## 3. 配置文件说明
 
-复制 `configs/example.yaml` 修改。各参数的默认值、是否必填按段落列表如下，YAML 里不写即取默认值。
+按场景复制 `configs/` 下对应模板修改：`example_single.yaml`（单机）、`example_pd.yaml`（PD 分离）、`example_tp.yaml`（混布 TP）。模板中必填项裸露、可选项已注释（取消注释即用）。各参数的默认值、是否必填按段落列表如下，YAML 里不写即取默认值。
 
 ### 3.1 run 段
 
@@ -61,7 +63,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
 | `run.docker.shm_size` | `16g` | 否 | 容器共享内存大小；固定附加 `--privileged --ipc=host` |
 | `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"` |
-| `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
+| `run.env` | 内置 7 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；单机用例需该 `node` 节点存在，多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，缺失不影响（路径不存在时 cp 静默忽略） |
 | `run.evalscope_source` | 无（不干预） | 否 | 精度框架 evalscope 本地源码路径（节点本地绝对路径）；所在目录自动挂载进容器，并软链到容器内 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装。未配置时不干预：节点预置 `~/.cache/.cache/evalscope` 则同样本地安装，否则回退清华镜像在线安装（需外网）。路径在节点缺失时软链悬空，自动回退在线安装，无害。仅跑评测的节点会用到（单机=node，混布 TP=master，PD 分离=router） |
@@ -90,21 +92,25 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 
 ### 3.4 run.env 内置默认值
 
-不写 `run.env` 时容器自动注入以下 6 项（与 CI 一致）；需覆盖某项或追加新键时才写：
+不写 `run.env` 时容器自动注入以下 7 项（与 CI 一致）；需覆盖某项或追加新键时才写：
 
 | 环境变量 | 默认值 |
 |---|---|
 | `SGLANG_USE_MODELSCOPE` | `true` |
 | `HF_ENDPOINT` | `https://hf-mirror.com` |
 | `SGLANG_IS_IN_CI` | `true` |
+| `SGLANG_TEST_MAX_RETRY` | `0` |
 | `TORCH_EXTENSIONS_DIR` | `/tmp/torch_extensions` |
 | `PYTORCH_NPU_ALLOC_CONF` | `expandable_segments:True` |
 | `STREAMS_PER_DEVICE` | `32` |
+
+其中 `SGLANG_TEST_MAX_RETRY=0` 关闭用例方法级外层重试（性能基准重跑无意义且耗时；内层 `@retry()` 与精度用例的数据集重试不受影响）。
 
 此外流水线会自动为所有容器注入：
 
 - `TZ=Asia/Shanghai`：容器默认 UTC，与流水线日志时区混排会造成时序误判，统一对齐（需其他时区在 `run.env` 覆盖 `TZ`）；
 - `no_proxy`/`NO_PROXY`（含全部节点 IP + 协调服务地址 + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
+- `PYTHONPATH=/output`：注入 sitecustomize.py（单机/多机用例一致）——多机用例的 fake kubernetes 协调桥接（见第 7/8 节）+ 关闭 evalscope venv 内 requests 的 SSL 校验（规避企业代理自签证书导致 modelscope 数据集下载报 `CERTIFICATE_VERIFY_FAILED`；仅 venv 进程生效，其余 python 进程无副作用）。
 
 ### 3.5 配置示例（联网模式）
 
@@ -158,17 +164,17 @@ suites:
 
 ```bash
 # 1. 首次验证: 只打印将在节点上执行的命令，不消耗 NPU 资源
-python3 src/run.py --config configs/example.yaml --dry-run
+python3 src/run.py --config configs/example_single.yaml --dry-run
 
 # 2. 执行全部用例
-python3 src/run.py --config configs/example.yaml
+python3 src/run.py --config configs/example_single.yaml
 
 # 3. 只执行指定用例（--suite 可传多次）
-python3 src/run.py --config configs/example.yaml --suite test_npu_qwen3_32b
+python3 src/run.py --config configs/example_single.yaml --suite test_npu_qwen3_32b
 
 # 4. 定时执行（等到指定时间再开始，便于夜间无人值守跑用例）
-python3 src/run.py --config configs/example.yaml --at "2026-09-17 18:00:00"
-python3 src/run.py --config configs/example.yaml --at "18:00:00"   # 今天已过则取明天
+python3 src/run.py --config configs/example_single.yaml --at "2026-09-17 18:00:00"
+python3 src/run.py --config configs/example_single.yaml --at "18:00:00"   # 今天已过则取明天
 ```
 
 `--at` 按**执行机本地时间**计算（不是节点时间）。执行机与节点跨时区时尤其要注意。
@@ -242,8 +248,8 @@ python3 src/run.py
 下面用一个完整示例说明。假设：
 
 - 执行机就是 A3 本身（192.168.10.1）
-- 配置使用默认值：`workspace: /root/sglang_local_pipeline`（结果目录固定为 `/root/sglang_local_pipeline/results`）
-- 执行的用例为 `qwen3-32b-gsm8k`，run_id 为 `20260916-100000`
+- 配置文件为 `configs/single.yaml`（复制自 `example_single.yaml`），workspace 使用默认值 `/root/sglang_local_pipeline`（结果目录固定为 `/root/sglang_local_pipeline/results`）
+- 执行的用例为 `qwen3-32b-gsm8k`，run_id 为 `single-20260916-100000`
 
 执行机和节点使用**不同的目录**（`results/` vs `runs/`），即使同一台机器也不冲突。
 
@@ -252,8 +258,8 @@ python3 src/run.py
 路径由 `workspace` + `runs` + `run_id` + `用例名` 拼成。日志文件名 = 用例脚本名去 `.py` 加 `.log`（如 `test_npu_qwen3_32b.py` → `test_npu_qwen3_32b.log`）：
 
 ```
-/root/sglang_local_pipeline/runs/example-20260916-100000/qwen3-32b-gsm8k/
-├── test_npu_qwen3_32b.log   # 容器内 tee /output/ 写入
+/root/sglang_local_pipeline/runs/single-20260916-100000/qwen3-32b-gsm8k/
+├── test_npu_qwen3_32b.log   # 容器内重定向写入 /output
 ├── tmp/                     # 容器内 /tmp 挂载（数据集、torch 编译缓存）
 ├── plog/                    # 容器内 /root/ascend/log 挂载（NPU 底层日志）
 └── run_case.py              # 仅 A5 节点：--tp-size 减半包装器（流水线注入）
@@ -266,13 +272,13 @@ python3 src/run.py
 
 ### 6.2 执行机上的日志（拉回副本 + 实时回显）
 
-路径由 `{workspace}/results` + `run_id` + `用例名` 拼成（不受执行目录影响），与节点的 `runs/` 分开。`run_id` 格式为 `{yaml_stem}-{timestamp}`（如 `example-20260916-100000`），目录名同时体现来源 yaml 与执行时间：
+路径由 `{workspace}/results` + `run_id` + `用例名` 拼成（不受执行目录影响），与节点的 `runs/` 分开。`run_id` 格式为 `{yaml_stem}-{timestamp}`（如 `single-20260916-100000`），目录名同时体现来源 yaml 与执行时间：
 
 ```
-/root/sglang_local_pipeline/results/example-20260916-100000/
+/root/sglang_local_pipeline/results/single-20260916-100000/
 ├── summary.json                       # run.py 写入的汇总 (每跑完一条用例即更新)
 └── qwen3-32b-gsm8k/
-    ├── test_npu_qwen3_32b.log         # ssh_run 实时回显 → fetch 覆盖为容器 tee 版本
+    ├── test_npu_qwen3_32b.log         # ssh_run 实时回显 → fetch 覆盖为容器内落盘版本
     ├── ssh.log                        # SSH 连接诊断（本地直写，fetch 不覆盖）
     └── plog/                          # 从节点拉回的 NPU 底层日志
 ```
@@ -285,7 +291,7 @@ python3 src/run.py
 多个用例时，每个用例各占一个子目录，互不干扰：
 
 ```
-/root/sglang_local_pipeline/results/example-20260916-100000/
+/root/sglang_local_pipeline/results/single-20260916-100000/
 ├── summary.json
 ├── qwen3-32b-gsm8k/
 │   ├── test_npu_qwen3_32b.log
@@ -297,7 +303,7 @@ python3 src/run.py
     └── plog/
 ```
 
-run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_local_pipeline/results/example-20260916-100000`
+run 结束时控制台最后一行打印绝对路径：`结果: /root/sglang_local_pipeline/results/single-20260916-100000`
 
 summary.json **每跑完一条用例即全量重写一次**（非结束时统一写）：run.py 中途被杀（Ctrl+C、终端断开、执行机重启等）时，已完成用例的汇总与日志均已落盘可查；被中断时正在执行的用例不计入 summary，但其过程日志仍实时写在用例子目录的 `{脚本名}.log` 里。
 
@@ -308,18 +314,18 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
 ```
 /root/sglang_local_pipeline/
 ├── runs/                                    ← 节点（容器挂载写入）
-│   └── example-20260916-100000/
+│   └── single-20260916-100000/
 │       └── qwen3-32b-gsm8k/
-│           ├── test_npu_qwen3_32b.log       ← 容器 tee 写
+│           ├── test_npu_qwen3_32b.log       ← 容器重定向写
 │           ├── tmp/                         ← mkdir -p + 挂载（fetch 不回传）
 │           ├── plog/                        ← mkdir -p + 挂载
 │           └── run_case.py                  ← 仅 A5：注入的包装器（fetch 不回传）
 │
 └── results/                                 ← 执行机（run.py + ssh_run + fetch 写入）
-    └── example-20260916-100000/
+    └── single-20260916-100000/
         ├── summary.json                     ← run.py 写
         └── qwen3-32b-gsm8k/
-            ├── test_npu_qwen3_32b.log       ← ssh_run 回显 → fetch 覆盖为容器 tee 版本
+            ├── test_npu_qwen3_32b.log       ← ssh_run 回显 → fetch 覆盖为容器内落盘版本
             ├── ssh.log                      ← ssh_run 诊断直写
             └── plog/                        ← fetch 从节点拉回
 ```
@@ -334,10 +340,10 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
 
 ```bash
 cd /home
-python3 /root/sglang_local_pipeline/src/run.py --config /root/sglang_local_pipeline/configs/example.yaml
+python3 /root/sglang_local_pipeline/src/run.py --config /root/sglang_local_pipeline/configs/single.yaml
 ```
 
-结果目录固定为 `{workspace}/results`（如上例为 `/root/sglang_local_pipeline/results/example-20260916-100000/`），不随 cwd 变化，无需配置。
+结果目录固定为 `{workspace}/results`（如上例为 `/root/sglang_local_pipeline/results/single-20260916-100000/`），不随 cwd 变化，无需配置。
 
 ## 7. 多机（PD 分离）用例
 
