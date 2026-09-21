@@ -93,6 +93,10 @@ class RunConfig:
     # 所在目录自动挂载进容器 (同路径映射)。未配置时不预置任何数据集,
     # 由用例在线下载或自行读取
     datasets: List[str] = field(default_factory=list)
+    # 精度框架 evalscope 本地源码路径 (节点本地绝对路径), 自动挂载所在目录并
+    # 软链到 run_evalscope.sh 硬编码的 /root/.cache/.cache/evalscope。未配置时
+    # 不干预: 节点预置该约定路径则本地安装, 否则回退清华镜像在线安装
+    evalscope_source: str = None
 
     @property
     def repo(self):
@@ -178,6 +182,18 @@ def load_config(path):
             raise ValueError(
                 f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
                 f"请移入子目录: {x!r}")
+    # evalscope 源码路径: 须为节点本地绝对路径 (所在目录自动挂载进容器)
+    evalscope_source = run_raw.get("evalscope_source")
+    if evalscope_source is not None:
+        if not isinstance(evalscope_source, str) or not evalscope_source.startswith("/"):
+            raise ValueError(
+                f"run.evalscope_source 须为节点本地绝对路径 (以 / 开头), 如:\n"
+                f"  evalscope_source: /data/evalscope\n"
+                f"实际: {evalscope_source!r}")
+        if evalscope_source.rsplit("/", 1)[0] == "":
+            raise ValueError(
+                f"run.evalscope_source 不支持根目录直属路径 (所在目录会整盘挂载), "
+                f"请移入子目录: {evalscope_source!r}")
     code_raw = run_raw.get("code", {})
     git_remote = code_raw.get("git_remote")
     if prepare.online and not git_remote:
@@ -194,6 +210,7 @@ def load_config(path):
              **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
+        evalscope_source=evalscope_source,
     )
 
     nodes = []

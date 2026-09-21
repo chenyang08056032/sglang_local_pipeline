@@ -64,6 +64,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 | `run.env` | 内置 6 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；单机用例需该 `node` 节点存在，多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，缺失不影响（路径不存在时 cp 静默忽略） |
+| `run.evalscope_source` | 无（不干预） | 否 | 精度框架 evalscope 本地源码路径（节点本地绝对路径）；所在目录自动挂载进容器，并软链到容器内 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装。未配置时不干预：节点预置 `~/.cache/.cache/evalscope` 则同样本地安装，否则回退清华镜像在线安装（需外网）。路径在节点缺失时软链悬空，自动回退在线安装，无害。仅跑评测的节点会用到（单机=node，混布 TP=master，PD 分离=router） |
 
 ### 3.2 nodes 段
 
@@ -83,7 +84,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 | `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 7 节）：prefill/decode/router → 节点 |
 | `suites[].multinode` | 无 | 三选一 | 多机混布 TP 用例（第 8 节）：节点列表，第一个 = master |
 | `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo 或 `~/.cache`） |
-| `suites[].timeout_minutes` | 无（不限时） | 否 | docker run 超时（分钟）。多机用例为每角色容器超时，prefill/decode/worker 实际再加 2 分钟余量 |
+| `suites[].timeout_minutes` | 无（兜底 60 分钟） | 否 | docker run 超时（分钟）。未配置时用默认 60 分钟兜底，防止容器内进程 hang 导致整个 run 卡死。多机用例为每角色容器超时，prefill/decode/worker 实际再加 2 分钟余量 |
 
 `node` / `roles` / `multinode` 三者互斥，只能配一个。
 
@@ -394,7 +395,7 @@ suites:
    - `POD_IP=节点 IP`：服务绑定与互访地址（容器 host 网络）；
    - prefill/decode 拉起 PD 服务后轮询等待结束信号；router 等 PD 端口（8000）全部就绪后拉起 router 进程，`/health` 就绪后执行基准测试；
 5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时。结束信号写入 60s 后仍未退出的容器（如卡在端口等待不查 ConfigMap）会被强制 `docker rm -f`（等价 CI 外层 runner 删 job，避免拖到容器超时）；
-6. 用例判定 = 全部节点退出码为 0（正常结束时 PD 角色不跑测试，收到结束信号后以 0 退出，基准结果与断言都在 router 的日志里）。
+6. 用例判定对齐 CI（CI 只看 router pod 日志的 `OK`/`FAILED`，判定后直接删 job，PD pod 是被连带杀掉的）：router 退出码为 0 即通过；prefill/decode 收到结束信号以 0 退出、或超过宽限期被强杀（rc=137）均不判失败，其余非 0 退出码视为 PD 崩溃判失败（等价 CI 检测 pod 非 Running）。基准结果与断言都在 router 的日志里。
 
 ### 7.3 前置条件（多机用例额外要求）
 
@@ -467,7 +468,8 @@ suites:
 | HOSTNAME | `sglang-prefill-0`, `sglang-decode-0` | `sglang-node-0`, `sglang-node-1` |
 | ConfigMap key | `sglang-prefill-0`, `sglang-decode-0` | `sglang-node-0`, `sglang-node-1` |
 | 谁跑测试 | router | master（node-0） |
-| 结束信号 | router 结束 → 广播 → PD 退出 | master 结束 → 广播 → worker 退出 |
+| 结束信号 | router 结束 → 广播 → PD 退出 | master 结束 → 广播（worker 不轮询该信号，sleep 3600s 保活，由流水线在宽限期后强杀清理） |
+| 判定 | router rc==0 即通过（PD 被强杀的 137 不判失败） | master rc==0 即通过（worker 被强杀的 137 不判失败） |
 
 用例的 `launch_pd_mix_node` 从 ConfigMap 查 `sglang-node-0` 的 IP，拼接 `--dist-init-addr={master_ip}:5000 --node-rank={pod_index}` 启动 sglang server。
 

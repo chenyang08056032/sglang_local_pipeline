@@ -31,6 +31,11 @@ run:
   datasets:
     - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl  # gsm8k
     - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.jsonl  # 任意本地路径
+  # 精度框架 evalscope 本地源码路径 (节点本地绝对路径), 自动软链到容器内
+  # /root/.cache/.cache/evalscope (run_evalscope.sh 的硬编码检查路径); 默认不配:
+  # 节点预置该约定路径则本地安装, 否则回退清华镜像在线安装 (需外网)
+  # 仅跑评测的节点用到: 单机=node, 混布 TP=master, PD 分离=router; 其余节点缺路径无害
+  # evalscope_source: /root/sglang_local_pipeline/evalscope
 
 nodes:
   - host: 192.168.10.1   # A3, 16 卡

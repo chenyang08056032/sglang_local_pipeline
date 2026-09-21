@@ -321,6 +321,9 @@ _RELEASE_VALUE = "__pipeline_released__"
 # 超时仍未退出的 (如 router 卡在 wait_for_all_ports_ready 不查 ConfigMap)
 # 主动 docker rm -f 杀掉, 等价 CI 外层 runner 检测 pod 非 Running 后删 job
 _GRACE_PERIOD_KILL_SEC = 60
+
+# 用例未配 timeout_minutes 时的兜底超时 (分钟), 防止容器内进程 hang 导致整个 run 卡死
+_DEFAULT_TIMEOUT_MINUTES = 60
 # 多机用例的角色 (每个角色对应一个节点配置)
 _MULTI_ROLES = ("prefill", "decode", "router")
 
@@ -818,6 +821,7 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     role: 多机用例的角色名 (prefill/decode/router), 决定容器名后缀;
     extra_env: 角色专属环境变量 (多机用例的 HOSTNAME/POD_IP/协调地址等);
     timeout_minutes: 覆盖 suite.timeout_minutes (多机用例 PD 角色加余量用);
+        suite/参数均为空时兜底 _DEFAULT_TIMEOUT_MINUTES, 杜绝无超时 hang 死;
     tp_halving: A5 单机用例, 经 /output/run_case.py 包装启动 (--tp-size 减半)。
     构造完成后打印 [cmd] 关键路径诊断 (容器名/节点/repo/输出目录/超时)。
     """
@@ -846,6 +850,18 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         f"cp -r {ascend_src}/* "
         f"$(python3 -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')/test/ascend/"
     )
+    # 精度框架 (run_evalscope) 硬编码 /root/sglang 调用 run_evalscope.sh, 与 CI
+    # K8s 把代码卷挂在 /root/sglang 对齐; 本地 repo 在 {workspace}/sglang, 建软链
+    # 让硬编码路径落到实际 repo (ln -sfn 覆盖既有目录/链接, 可重复执行)
+    parts.append(f"ln -sfn {q_repo} /root/sglang")
+    # evalscope 本地源: run_evalscope.sh 硬编码检查 /root/.cache/.cache/evalscope,
+    # 配置了 run.evalscope_source 则软链过去 (所在目录已挂载, 见下方 mount_args)。
+    # 不直接 -v 挂载到目标路径: 节点缺该路径时 docker 建空目录, [ -d ] 误命中后
+    # pip install -e 空目录报错; 软链悬空时 [ -d ] 为 false, 正确回退在线安装
+    if cfg.run.evalscope_source:
+        q_src = shlex.quote(cfg.run.evalscope_source)
+        parts.append(f"mkdir -p /root/.cache/.cache && "
+                     f"ln -sfn {q_src} /root/.cache/.cache/evalscope")
     # 预置数据集到 /tmp (与 CI 一致): /tmp 每次全新挂载, 不预置则会重复下载
     # (gsm8k) 或 perf 套件找不到数据; datasets 为节点本地绝对路径, 所在目录
     # 已自动挂载进容器 (见下方 mount_args); 未配置时跳过, 由用例在线下载或
@@ -889,8 +905,12 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
     # datasets 所在目录自动挂载 (同路径映射, 去重), 容器内路径与配置一致,
     # cp 命令直接使用原路径; 与默认挂载重叠时 (如 ~/.cache 下) docker 后挂载
-    # 遮蔽前者, 同一宿主机目录内容一致, 无害
-    for m in dict.fromkeys(f.rsplit("/", 1)[0] for f in cfg.run.datasets):
+    # 遮蔽前者, 同一宿主机目录内容一致, 无害; evalscope_source 所在目录同理
+    # (容器内软链指向原路径, 需可见)
+    _auto_dirs = [f.rsplit("/", 1)[0] for f in cfg.run.datasets]
+    if cfg.run.evalscope_source:
+        _auto_dirs.append(cfg.run.evalscope_source.rsplit("/", 1)[0])
+    for m in dict.fromkeys(_auto_dirs):
         mount_args += ["-v", shlex.quote(f"{m}:{m}")]
     # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;
     # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro")
@@ -934,14 +954,16 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         f"docker rm -f {container} >/dev/null 2>&1 || true",
     ]
     tmo = timeout_minutes if timeout_minutes is not None else suite.timeout_minutes
-    if tmo:
-        # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
-        lines.append(f"timeout -k 60 {int(tmo) * 60} " + " ".join(docker_args))
-    else:
-        lines.append(" ".join(docker_args))
+    if not tmo:
+        # 未配 timeout_minutes 时兜底, 防止容器内进程 hang 导致整个 run 卡死
+        tmo = _DEFAULT_TIMEOUT_MINUTES
+        _log(f"[cmd] {role or '单机用例'} @{node.host} 未配 timeout, "
+             f"使用默认 {tmo} 分钟")
+    # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
+    lines.append(f"timeout -k 60 {int(tmo) * 60} " + " ".join(docker_args))
     # [cmd] 每容器一行: 角色@节点+超时 (容器名/输出目录按固定规则可推导,
     # 完整命令看 dry-run 或各角色 ssh.log; 多机并发时靠 host 区分归属)
-    _log(f"[cmd] {role or '单机用例'} @{node.host} 超时={tmo or '无'}分钟")
+    _log(f"[cmd] {role or '单机用例'} @{node.host} 超时={tmo}分钟")
     return "\n".join(lines)
 
 
@@ -1007,7 +1029,7 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
         extra_env = dict(cfg.run.a5_env) if node.arch == "a5" else None
         cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving,
                          extra_env=extra_env)
-        _log(f"[execute] @ {where} 启动容器 (超时={suite.timeout_minutes or '无'}分钟)")
+        _log(f"[execute] @ {where} 启动容器 (超时={suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES}分钟)")
         rc = ssh_run(node, cmd,
                      log_path=os.path.join(local_suite_dir, _log_filename(suite)),
                      diag_path=os.path.join(local_suite_dir, "ssh.log"),
@@ -1045,7 +1067,9 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
          - router: 等 PD 端口就绪后拉起 router, /health 就绪后执行基准测试
       3. router 结束 (无论成败) 或任一 PD 提前退出 (服务崩溃) 后,
          向协调服务写结束信号, 通知剩余 PD 节点退出, 避免空等超时
-      4. 全部节点 rc==0 才算通过 (正常结束时 PD 角色不跑测试, 收到信号后以 0 退出)
+      4. 判定对齐 CI (CI 只监控 router pod 日志的 OK/FAILED, 判定后删 job):
+         router rc==0 即通过; PD 节点 rc==0 (收到信号退出) 或被强杀的 137
+         不判失败, 其余非 0 退出码视为 PD 崩溃 (等价 CI pod 非 Running 判失败)
 
     支持多节点 PD: prefill/decode 各可配多个节点 (如 2p2d),
     router 固定单节点 (sglang 框架限制)。
@@ -1091,7 +1115,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
             coord_url = f"http://{coord_host}:{coord.port}"
             coord.patch_data(coord_data)
         _log(f"[execute] 多机用例 @ {where_desc} "
-             f"(超时={suite.timeout_minutes or '无'}分钟/每节点)")
+             f"(超时={suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES}分钟/每节点)")
         _log(f"[execute] 协调服务: {coord_url} (已预置 {len(coord_data)} 个 pod 注册)")
 
         rc, errs, durs = {}, {}, {}
@@ -1215,18 +1239,34 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 _log(f"[execute] {key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
                      f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
 
+        # 判定对齐 CI (run_npu_e2e_test.py 只监控 router pod 日志的 OK/FAILED,
+        # 判定后直接删 job, PD pod 是被连带杀掉的): 以 router 的 rc 为准;
+        # PD 节点正常收到结束信号以 0 退出, 超过宽限期被强杀的 137 (轮询周期
+        # 较长等) 不判失败; 其余非 0 退出码视为 PD 崩溃, 判失败。
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
-        failed = {k: (errs.get(k)
-                      or (None if rc.get(k) == 0
-                          else (f"exit code {rc.get(k)}"
-                                if rc.get(k) is not None
-                                else "未执行 (线程异常退出)")))
-                  for k in keys}
-        if all(v is None for v in failed.values()):
+        failed = {}
+        if errs.get(router_key) or rc.get(router_key) != 0:
+            failed[router_key] = (errs.get(router_key)
+                                  or (f"exit code {rc.get(router_key)}"
+                                      if rc.get(router_key) is not None
+                                      else "未执行 (线程异常退出)"))
+        for k in pd_keys:
+            if errs.get(k):
+                failed[k] = errs[k]
+            elif rc.get(k) not in (0, 137):
+                failed[k] = (f"exit code {rc.get(k)}"
+                             if rc.get(k) is not None
+                             else "未执行 (线程异常退出)")
+        if not failed:
             result["status"] = "pass"
+            tolerated = [k for k in pd_keys
+                         if not errs.get(k) and rc.get(k) == 137]
+            if tolerated:
+                _log(f"[execute] {', '.join(tolerated)} 被强杀 (rc=137) "
+                     "不判失败: router 已成功 (对齐 CI)")
         else:
-            result["error"] = "; ".join(f"{k}: {v}" for k, v in failed.items() if v)
+            result["error"] = "; ".join(f"{k}: {v}" for k, v in failed.items())
 
         if not dry_run:
             for (role, idx, node), key in zip(units, keys):
@@ -1250,8 +1290,10 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
     与 PD 分离的区别:
       - 无 prefill/decode/router 角色, 所有节点组成一个 TP 实例
       - HOSTNAME = sglang-node-{idx} (用例框架据此区分 master/worker)
-      - master (node-0) 启动 sglang server 并执行测试; worker 只起 server
-      - master 测试结束后广播结束信号, worker 收到后正常退出
+      - master (node-0) 启动 sglang server 并执行测试; worker 只起 server,
+        随后 sleep MAX_SERVER_KEEP_ALIVE_TIME(3600s) 保活, 不轮询结束信号,
+        master 结束后只能由流水线强制清理 (rc=137)
+      - 判定对齐 CI: master rc==0 即通过, worker 被强杀的 137 不判失败
 
     协调机制与 PD 分离相同: CoordService + sitecustomize.py, 不修改 sglang 代码。
     """
@@ -1293,7 +1335,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             coord_url = f"http://{coord_host}:{coord.port}"
             coord.patch_data(coord_data)
         _log(f"[execute] 多机混布 @ {where_desc} "
-             f"(超时={suite.timeout_minutes or '无'}分钟/每节点)")
+             f"(超时={suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES}分钟/每节点)")
         _log(f"[execute] 协调服务: {coord_url} (已预置 {len(coord_data)} 个 pod 注册)")
 
         rc, errs, durs = {}, {}, {}
@@ -1388,18 +1430,32 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 # PD/worker 角色不回显控制台, 失败时指明日志位置便于排查
                 _log(f"[execute] {key} 异常结束 (rc={rc.get(key)}, 耗时 {dur}s), "
                      f"日志: {os.path.join(local_run_dir, suite.name, key, _log_filename(suite))}")
+        # 判定对齐 CI (run_npu_e2e_test.py 只监控 master pod 日志的 OK/FAILED,
+        # 判定后直接删 job, worker 是被连带杀掉的): master rc==0 即通过;
+        # worker 只起 server 且 sleep 保活不轮询结束信号, 被强杀的 137 属
+        # 预期收尾不判失败; 其余非 0 退出码 (worker 崩溃 / master 失败被杀) 判失败
         # rc.get(k) 为 None 时 (线程在赋值前异常退出, 如 KeyboardInterrupt) 归为
         # error 而非误导性的 "exit code None"
-        failed = {k: (errs.get(k)
-                      or (None if rc.get(k) == 0
-                          else (f"exit code {rc.get(k)}"
-                                if rc.get(k) is not None
-                                else "未执行 (线程异常退出)")))
-                  for k in keys}
-        if all(v is None for v in failed.values()):
+        failed = {}
+        if errs.get(master_key) or rc.get(master_key) != 0:
+            failed[master_key] = (errs.get(master_key)
+                                  or (f"exit code {rc.get(master_key)}"
+                                      if rc.get(master_key) is not None
+                                      else "未执行 (线程异常退出)"))
+        for k in worker_keys:
+            if errs.get(k):
+                failed[k] = errs[k]
+            elif rc.get(k) not in (0, 137):
+                failed[k] = (f"exit code {rc.get(k)}"
+                             if rc.get(k) is not None
+                             else "未执行 (线程异常退出)")
+        if not failed:
             result["status"] = "pass"
+            if any(not errs.get(k) and rc.get(k) == 137 for k in worker_keys):
+                _log("[execute] worker 被强杀 (rc=137) 不判失败: "
+                     "master 已成功 (对齐 CI)")
         else:
-            result["error"] = "; ".join(f"{k}: {v}" for k, v in failed.items() if v)
+            result["error"] = "; ".join(f"{k}: {v}" for k, v in failed.items())
 
         if not dry_run:
             for (idx, node), key in zip(units, keys):
