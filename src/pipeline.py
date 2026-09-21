@@ -858,7 +858,16 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
                f"{shlex.quote(suite.file)} -f")
     else:
         cmd = f"cd {q_repo} && python3 -u {shlex.quote(suite.file)} -f"
-    parts.append(f"{cmd} 2>&1 | tee /output/{_log_filename(suite)}")
+    # 不用 "| tee": 用例泄漏的子进程 (如 PD 分离 router 的 sglang_router) 会继承
+    # 管道写端, python 退出后 tee 等 EOF 永不退出 → 容器挂死。改为后台执行 +
+    # 重定向落盘 + tail --pid 跟踪屏显: python 退出 → wait 返回 → 脚本结束,
+    # 容器随 PID 1 退出被 Docker 整体回收 (对齐 CI: 主进程退出即杀 cgroup 全部
+    # 进程, 泄漏的 router 子进程一并清理); 退出码经 wait 透传 (与 pipefail 下
+    # tee 等价)
+    log_f = shlex.quote(f"/output/{_log_filename(suite)}")
+    parts.append(f"{cmd} > {log_f} 2>&1 & _case_pid=$!")
+    parts.append(f"tail -f {log_f} --pid=$_case_pid")
+    parts.append("wait $_case_pid")
 
     inner = "\n".join(parts)
 
