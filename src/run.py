@@ -41,6 +41,9 @@ _DEFAULT_ENV = {
     "SGLANG_USE_MODELSCOPE": "true",
     "HF_ENDPOINT": "https://hf-mirror.com",
     "SGLANG_IS_IN_CI": "true",
+    # 与 CI 一致: 关闭 CustomTestCase._callTestMethod 的方法级外层重试
+    # (性能基准重跑无意义且耗时; 内层 @retry() 与精度用例数据集重试不受影响)
+    "SGLANG_TEST_MAX_RETRY": "0",
     "TORCH_EXTENSIONS_DIR": "/tmp/torch_extensions",  # 与 CI 一致, 编译缓存落在挂载的 /tmp
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
