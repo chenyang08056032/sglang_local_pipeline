@@ -411,18 +411,17 @@ if _COORD_URL and "kubernetes" not in sys.modules:
 # (sglang server / 用例主进程 / 系统 python) 前缀不匹配, 完全不受影响。
 if "test_env_evalscope" in sys.prefix:
     try:
-        import contextlib
-
         import requests
         import urllib3
 
         _orig_merge = requests.Session.merge_environment_settings
 
-        @contextlib.contextmanager
         def _merge_no_verify(self, *args, **kwargs):
-            with _orig_merge(self, *args, **kwargs) as settings:
-                settings["verify"] = False
-                yield settings
+            # 原方法返回 dict (非上下文管理器), 包装成普通函数:
+            # 在合并结果上强制 verify=False, 覆盖默认值与调用方显式传参
+            settings = _orig_merge(self, *args, **kwargs)
+            settings["verify"] = False
+            return settings
 
         requests.Session.merge_environment_settings = _merge_no_verify
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
