@@ -57,7 +57,8 @@ sglang_local_pipeline/
 ├── configs/
 │   ├── example_single.yaml   # 单机用例配置模板
 │   ├── example_pd.yaml       # 多机 PD 分离用例配置模板
-│   └── example_tp.yaml       # 多机混布 TP 用例配置模板
+│   ├── example_tp.yaml       # 多机混布 TP 用例配置模板
+│   └── pip_deps.txt          # 单机共享容器依赖安装命令 (固定默认文件, 存在即生效)
 ├── README.md
 └── .gitignore
 ```
@@ -123,6 +124,25 @@ run:
 
 ② **evalscope（精度框架，零配置）**：源码固定在 `{workspace}/evalscope`（与 sglang 仓同约定），prepare 阶段执行机自动浅克隆官方仓（目录非空则跳过，想用自定义版本直接放入该目录；代理取 `run.env` 的 `http_proxy`/`https_proxy`），再以 sglang 仓同款方式（清理旧目录 + 整目录复制）同步到跑测试的节点（单机=node，混布 TP=master，PD 分离=router；worker/PD 节点只起 server 不需要）。节点就绪后容器内软链到 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装；clone/分发失败或节点无源码时不软链，回退清华镜像在线安装（需外网）。（旧版 `run.evalscope_source` 字段已移除，无需配置）
 
+③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置）并逐条执行 `configs/pip_deps.txt` 里的安装命令，随后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
+
+依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；任一条失败即初始化失败（该节点单机用例记 error，看 `.init.log` 定位）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源（可用 `run.env` 配 `http_proxy` 等代理）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
+
+```bash
+cd /root/sglang                    # 对齐 CI 的执行目录 (初始化建好的 repo 软链)
+# ---- 基础依赖 ----
+pip install sentence_transformers zss "wandb>=0.16.0" ...   # 照抄 CI Install dependencies
+# ---- sgl-eval ----
+. "${sglang_source_path}/scripts/ci/utils/sgl_eval_ref.sh"
+pip install "$SGL_EVAL_SPEC"
+# ---- lmms-eval (源码安装) ----
+git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+...
+# ---- sglang_router ----
+apt-get install -y libssl-dev
+pip install sglang_router
+```
+
 ### 3.2 nodes 段
 
 | 参数 | 默认值 | 必填 | 说明 |
@@ -141,7 +161,7 @@ run:
 | `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 7 节）：prefill/decode/router → 节点 |
 | `suites[].multinode` | 无 | 三选一 | 多机混布 TP 用例（第 8 节）：节点列表，第一个 = master |
 | `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo 或 `~/.cache`） |
-| `suites[].timeout_minutes` | 无（兜底 60 分钟） | 否 | docker run 超时（分钟）。未配置时用默认 60 分钟兜底，防止容器内进程 hang 导致整个 run 卡死。多机用例为每角色容器超时，prefill/decode/worker 实际再加 2 分钟余量 |
+| `suites[].timeout_minutes` | 无（兜底 60 分钟） | 否 | 用例执行超时（分钟）。未配置时用默认 60 分钟兜底，防止容器内进程 hang 导致整个 run 卡死。单机用例=容器内 `timeout` 包裹用例进程（超时退出码 124）；多机用例=每角色容器 docker run 超时，prefill/decode/worker 实际再加 2 分钟余量 |
 
 `node` / `roles` / `multinode` 三者互斥，只能配一个。
 
@@ -278,14 +298,19 @@ python3 src/run.py
     │       → 确保没有进程占用 NPU 卡
     │
     ├─ [execute] 逐用例串行执行（SSH 到节点）:
-    │     单机用例: docker run --rm --privileged --ipc=host
-    │       --device /dev/davinci0..N-1 + 管理设备
-    │       挂载: repo / workspace 输出目录 / driver / 模型缓存(~/.cache)
-    │              + run.datasets 所在目录 (自动, 可选)
+    │     单机用例: 每节点一个长驻共享容器 (sgl-pipeline-single, 首个单机
+    │       用例时启动, 初始化/依赖只做一次, run 结束统一删除):
+    │       docker run -d --privileged --ipc=host
+    │         --device /dev/davinci0..N-1 + 管理设备
+    │         挂载: repo / workspace 输出目录(runs/{run_id}) / driver /
+    │              模型缓存(~/.cache) + run.datasets 所在目录 (自动, 可选)
     │              + run.docker.extra_mounts (用户自定义, 可选)
-    │     容器内: 覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
-    │              → 单个用例文件 (A5 节点经 /output/run_case.py 包装启动,
-    │                 --tp-size 自动减半)
+    │       容器内初始化 (执行机轮询 .init-ok 标记确认完成):
+│         覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
+│         → 逐条执行 configs/pip_deps.txt 安装命令 (可选, 只装一次)
+    │       每条用例: docker exec 执行 (执行前清理上一条用例残留的 sglang
+    │         进程防占卡; 超时由容器内 timeout 控制; A5 节点经
+    │         /output/run_case.py 包装启动, --tp-size 自动减半)
     │     多机用例 (roles): router 容器先启动 (等其写入 active-test-class),
     │       再启动 PD 容器; 各节点 docker run 同一用例文件, 以
     │       HOSTNAME/POD_IP 环境变量区分角色 (见第 7 节; 混布 TP
@@ -309,20 +334,24 @@ python3 src/run.py
 
 ### 6.1 节点上的日志（原始产物）
 
-路径由 `workspace` + `runs` + `run_id` + `用例名` 拼成。日志文件名 = 用例脚本名去 `.py` 加 `.log`（如 `test_npu_qwen3_32b.py` → `test_npu_qwen3_32b.log`）：
+路径由 `workspace` + `runs` + `run_id` 拼成。日志文件名 = 用例脚本名去 `.py` 加 `.log`（如 `test_npu_qwen3_32b.py` → `test_npu_qwen3_32b.log`）。单机用例全部跑在一个长驻共享容器里（见 3.1 说明 ③），`run_id` 这一层即容器 `/output` 的挂载点，除每条用例的子目录外还含共享文件：
 
 ```
-/root/sglang_local_pipeline/runs/single-20260916-100000/qwen3-32b-gsm8k/
-├── test_npu_qwen3_32b.log   # 容器内重定向写入 /output
-├── tmp/                     # 容器内 /tmp 挂载（数据集、torch 编译缓存）
-├── plog/                    # 容器内 /root/ascend/log 挂载（NPU 底层日志）
-└── run_case.py              # 仅 A5 节点：--tp-size 减半包装器（流水线注入）
+/root/sglang_local_pipeline/runs/single-20260916-100000/   ← 共享容器 /output
+├── sitecustomize.py         # 流水线注入（evalscope SSL 补丁，经 PYTHONPATH 生效）
+├── run_case.py              # 仅 A5 节点：--tp-size 减半包装器（流水线注入）
+├── .init.log                # 共享容器初始化日志（含 pip 依赖安装输出）
+├── tmp/                     # 共享容器 /tmp 挂载（全部单机用例共用，fetch 不回传）
+├── plog/                    # 共享容器 /root/ascend/log 挂载（全部单机用例混写，fetch 不回传）
+└── qwen3-32b-gsm8k/         # 每条单机用例一个子目录
+    ├── test_npu_qwen3_32b.log
+    └── plog/                # 用例结束时从共享 plog/ 拷贝的快照（按用例隔离，随用例目录回传）
 ```
 
-多机用例在 `用例名` 下再按角色/节点序号分一层子目录（`prefill-0/`、`decode-0/`、`router-0/` 或 `node-0/`、`node-1/`），每个子目录内另有注入的协调桥接 `sitecustomize.py` 及其编译缓存 `__pycache__/`（见第 7/8 节）。
+多机用例在 `用例名` 下再按角色/节点序号分一层子目录（`prefill-0/`、`decode-0/`、`router-0/` 或 `node-0/`、`node-1/`），每个子目录内有自己的 `tmp/`、`plog/` 挂载及注入的协调桥接 `sitecustomize.py`（及其编译缓存 `__pycache__/`，见第 7/8 节）——多机用例仍每角色一个独立容器。
 
 拉回后远程节点的 `runs/` **不删除**，多次执行会按 run_id 各占一个子目录，累积保留；
-本机节点（执行机=节点）在拷贝成功后自动清理 `runs/` 侧副本（见 6.3）。
+本机节点（执行机=节点）在拷贝成功后自动清理用例目录，run 结束再清掉共享残留（见 6.3）。
 
 ### 6.2 执行机上的日志（拉回副本 + 实时回显）
 
@@ -339,8 +368,9 @@ python3 src/run.py
 
 以下内容 **fetch 不回传**（远程节点的 `runs/` 原件始终保留，需要深度排查时可手动重拉）：
 
-- `tmp/`（容器内 /tmp：预置数据集、torch 编译缓存）——体积大且排查价值低；
-- `run_case.py`、`sitecustomize.py`（流水线注入的固定脚本，内容为内置常量，各角色完全相同）及其编译缓存 `__pycache__/`——无回传价值。
+- `tmp/`（容器内 /tmp：预置数据集、torch 编译缓存；单机共享容器在 `run_id/` 层、多机角色在各自子目录）——体积大且排查价值低；
+- 共享容器的 `plog/`（`run_id/` 层，全部单机用例混写；每条用例目录内已有隔离快照副本）；
+- `run_case.py`、`sitecustomize.py`（流水线注入的固定脚本，内容为内置常量）及其编译缓存 `__pycache__/`、`.init.log`（共享容器初始化日志，排查依赖安装问题时直接看节点上该文件）——无回传价值。
 
 多个用例时，每个用例各占一个子目录，互不干扰：
 
@@ -367,13 +397,13 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
 
 ```
 /root/sglang_local_pipeline/
-├── runs/                                    ← 节点（容器挂载写入）
-│   └── single-20260916-100000/
-│       └── qwen3-32b-gsm8k/
+├── runs/                                    ← 节点（共享容器挂载写入）
+│   └── single-20260916-100000/              ← 共享容器 /output
+│       ├── sitecustomize.py / run_case.py / .init.log / tmp/ / plog/
+│       │                                      ← 共享文件（run 结束统一清理）
+│       └── qwen3-32b-gsm8k/                 ← 用例目录（fetch 成功后即清理）
 │           ├── test_npu_qwen3_32b.log       ← 容器重定向写
-│           ├── tmp/                         ← mkdir -p + 挂载（fetch 不回传）
-│           ├── plog/                        ← mkdir -p + 挂载
-│           └── run_case.py                  ← 仅 A5：注入的包装器（fetch 不回传）
+│           └── plog/                        ← 用例结束从共享 plog 拷贝的快照
 │
 └── results/                                 ← 执行机（run.py + ssh_run + fetch 写入）
     └── single-20260916-100000/
@@ -384,7 +414,7 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
             └── plog/                        ← fetch 从节点拉回
 ```
 
-两个目录完全独立，无并发写入同一文件的问题。且本机节点时 fetch 拷贝成功后会**自动删除**节点侧 `runs/{run_id}/{用例名}/`（避免与 `results/` 重复占磁盘），拷贝失败则保留原件；远程节点的 `runs/` 始终保留。
+两个目录完全独立，无并发写入同一文件的问题。本机节点时清理分两步：每条用例 fetch 拷贝成功后**自动删除**节点侧 `runs/{run_id}/{用例名}/`（避免与 `results/` 重复占磁盘，拷贝失败则保留原件）；run 结束再清掉 `run_id/` 层的共享残留（tmp/plog/注入脚本/.init 标记），全部用例产物均已拉回时连同 `runs/{run_id}/` 一并删除。远程节点的 `runs/` 始终保留。
 
 跨节点执行时同理：节点上留在 `runs/`，执行机上落在 `results/`，fetch 把节点 `runs/{id}/{suite}/` 内容拉回到执行机 `results/{id}/{suite}/`。
 
@@ -584,7 +614,7 @@ run:
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。
 
 **Q: A5 节点上跑单机用例，脚本里的 `--tp-size` 是按 A3 卡数配置的，怎么办？**
-该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` 自动除以 2 再执行用例（`{脚本名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size` 或不经 server 启动的用例不受影响。多机用例（`roles`/`multinode`）不做此适配。
+该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` **大于 2 时**自动除以 2 再执行用例（`{脚本名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size`、配了 1/2（视为已按 A5 卡数适配）或不经 server 启动的用例均不受影响。多机用例（`roles`/`multinode`）不做此适配。
 
 **Q: A5 单机用例需要开灵衢互联（FIA）怎么办？**
 配置 `run.a5_env`（仅对 a5 节点单机用例容器生效，其他容器不受影响）：
@@ -594,6 +624,9 @@ run:
   a5_env:
     ASCEND_USE_FIA: "1"
 ```
+
+**Q: 为什么 `docker ps` 只看到一个 `sgl-pipeline-single` 容器？**
+同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。初始化/依赖安装出问题时看节点上 `runs/{run_id}/.init.log`。
 
 ## <a id="sec-appendix-a"></a>附录 A: 配置 SSH 免密
 

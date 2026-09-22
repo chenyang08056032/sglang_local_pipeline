@@ -21,6 +21,8 @@ run:
   #   STREAMS_PER_DEVICE: "32"
   # a5_env:                                # 仅 a5 节点单机用例容器注入 (覆盖 env 同名键), 多机用例不注入
   #   ASCEND_USE_FIA: "1"                  # A5 灵衢互联 (FIA) 开启
+  # 依赖安装: 无需配置, 固定读流水线 configs/pip_deps.txt (已按 CI Install dependencies 步骤
+  #           预置, 按需增删/清空即关闭), 见 README 3.1 说明 ③
   # evalscope 无需配置: 精度用例 (如 gpqa/gsm8k) 的源码自动准备到 {workspace}/evalscope 并同步到测试节点
 
 nodes:
@@ -35,5 +37,5 @@ suites:
   # 单机用例: node 指定执行节点 (与 roles/multinode 互斥, 见 example_pd.yaml / example_tp.yaml)
   # name 可省略: 默认取 file basename → test_npu_qwen3_32b; node 在单节点时也可省略
   - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例文件路径, 相对 repo; 绝对路径须在容器可见挂载内
-    timeout_minutes: 60        # docker run 超时 (分钟), 默认 60
+    timeout_minutes: 60        # 用例执行超时 (分钟), 默认 60
     node: 192.168.10.1         # 执行节点; nodes 仅定义 1 个节点时可省略

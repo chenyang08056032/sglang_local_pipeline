@@ -1,0 +1,40 @@
+# 单机共享容器初始化时执行的 python 依赖安装命令 (固定默认文件, 零配置:
+# 存在即生效, 不想装任何依赖可清空或删除本文件)
+# 格式: 每行一条命令按序执行 (同一 shell, cd/变量状态延续); # 注释与空行忽略
+# 内容对齐 CI .github/workflows/_npu-pr-test-stage.yml 的 Install dependencies 步骤,
+# CI 更新后直接把对应行抄过来即可; 任一条失败 = 容器初始化失败 (看 runs/{run_id}/.init.log)
+# 每节点只装一次, 该节点全部单机用例复用; 多机用例容器不执行本文件 (依赖需打进镜像)
+
+# 对齐 CI 的执行目录 (repo 根); /root/sglang 是初始化建好的 repo 软链
+cd /root/sglang
+
+# ---- 基础依赖 ----
+pip install sentence_transformers zss "wandb>=0.16.0" tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
+pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
+pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
+pip install websocket-client
+pip install watchfiles granian whisper_normalizer msgpack
+pip install fastokens
+pip install mindstudio-probe --pre
+pip install "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
+pip install "uvicorn[standard]"
+
+# ---- sgl-eval (source CI 脚本取安装规格后安装) ----
+sglang_source_path=$(pwd)
+echo "Source code path: ${sglang_source_path}"
+. "${sglang_source_path}/scripts/ci/utils/sgl_eval_ref.sh"
+pip install "$SGL_EVAL_SPEC"
+
+# ---- lmms-eval (源码安装 + 去掉 decord 依赖) ----
+git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+cd ./lmms-eval
+sed -i "/decord; platform_system/d" pyproject.toml
+python3 -m pip install . > lmmslog.txt 2>&1 || { cat lmmslog.txt; exit 1; }
+python3 -c "import lmms_eval" || { echo "lmms_eval import check failed"; cat lmmslog.txt; exit 1; }
+cd ../
+hf download MMMU/MMMU --repo-type dataset
+pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc opentelemetry-exporter-otlp-proto-http
+
+# ---- sglang_router ----
+apt-get install -y libssl-dev
+pip install sglang_router

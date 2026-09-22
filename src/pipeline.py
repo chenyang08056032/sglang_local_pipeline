@@ -2,7 +2,8 @@
 """节点执行器 (自动检测本地/远程)。
 
 执行链: 执行机准备代码仓 (git, 唯一代码准备点) → 清理各节点旧仓并从执行机复制
-→ (本地直执 或 SSH) docker run → 容器内跑用例文件 → 拉回日志
+→ 单机用例: 每节点一个长驻共享容器 (依赖只装一次), 用例逐条 docker exec
+→ 多机用例: 各角色独立 docker run → 拉回日志
 """
 
 import json
@@ -115,12 +116,14 @@ _PY_LOG_LINE = re.compile(
 
 
 def ssh_run(node, command, log_path=None, diag_path=None,
-            dry_run=False, prefix=None, quiet=False):
+            dry_run=False, prefix=None, quiet=False, silent=False):
     """执行命令: 本机节点直接 subprocess, 远程走 SSH。实时回显 + 写日志。
 
     prefix: 多角色并发执行时给控制台每行加前缀 (如 "[prefill] "); 日志文件始终是原始输出。
     quiet: 不回显控制台, 只写日志文件 (多机用例的 PD/worker 角色, 控制台只留测试角色);
         [ssh] 连接诊断同样只落日志, 失败 (rc!=0) 时强制上控制台, 不静默失败。
+    silent: 完全不输出 (含失败诊断), 供内部高频轮询命令使用 (如共享容器就绪
+        探测: 每 10s 一次的 test -f, 刷 [ssh] 诊断会淹没正常日志)。
     log_path: 容器实时输出 (stdout 流) 写入此文件; fetch 阶段会被容器内落盘版本覆盖
         (容器内重定向直写 /output, 更完整: 不受 SSH 断开/timeout 截断影响)。
     diag_path: [ssh] 连接诊断 (开始/结束/rc/耗时) 写入此独立文件; fetch 不覆盖,
@@ -129,9 +132,10 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     """
     local = _is_local(node)
     if dry_run:
-        tag = "local" if local else f"{node.user}@{node.host}:{node.port}"
-        head = f"[dry-run] {prefix}{tag}$ " if prefix else f"[dry-run] {tag}$ "
-        print(head + command)
+        if not silent:
+            tag = "local" if local else f"{node.user}@{node.host}:{node.port}"
+            head = f"[dry-run] {prefix}{tag}$ " if prefix else f"[dry-run] {tag}$ "
+            print(head + command)
         return 0
     # [连接诊断] 执行方式 + 目标节点 + 命令概要 (压平换行并截断, 避免刷屏);
     # 多机并发时各角色的诊断行带 prefix, 便于区分是哪个节点的连接
@@ -157,6 +161,8 @@ def ssh_run(node, command, log_path=None, diag_path=None,
             if f:
                 f.write(msg + "\n")
                 f.flush()
+        if silent:  # 内部轮询命令: 连诊断都不出 (有专门的失败处理路径)
+            return
         if not quiet or force:  # quiet 角色失败时 (force) 仍上控制台, 不静默失败
             _log(msg)
 
@@ -465,6 +471,7 @@ if "test_env_evalscope" in sys.prefix:
 # --tp-size 均经 other_args 传入 sglang.test.test_utils.popen_launch_server,
 # 在此替换该函数实现减半, 不修改 sglang 代码 (与 sitecustomize 同思路,
 # 但仅作用于主测试进程, 不影响 server/基准测试子进程)。
+# 减半仅针对 >2 的值: 未配/配 1/配 2 均视为已按 A5 卡数适配, 保持不变。
 _RUN_CASE_WRAPPER = '''\
 import os
 import runpy
@@ -478,7 +485,7 @@ _orig_popen_launch_server = _tu.popen_launch_server
 def _halve_tp_size(other_args):
     """把 other_args 里的 --tp-size 值除以 2 (针对 A3 卡数配置的脚本)。
 
-    未配置 --tp-size 或值为 1 时保持不变 (1 减半会得到非法的 0)。
+    未配置 --tp-size 或值 <= 2 (1/2 已适配 A5 卡数) 时保持不变。
     """
     args = list(other_args or [])
     for i, a in enumerate(args):
@@ -488,7 +495,7 @@ def _halve_tp_size(other_args):
                 tp = int(args[i + 1])
             except (TypeError, ValueError):
                 continue
-            if tp >= 2:
+            if tp > 2:
                 print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
                 args[i + 1] = str(tp // 2)
         elif a.startswith("--tp-size="):
@@ -496,7 +503,7 @@ def _halve_tp_size(other_args):
                 tp = int(a.split("=", 1)[1])
             except (TypeError, ValueError):
                 continue
-            if tp >= 2:
+            if tp > 2:
                 print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
                 args[i] = f"--tp-size={tp // 2}"
     return args
@@ -981,26 +988,22 @@ def cleanup_node_sglang(cfg, node, dry_run=False):
     return rc
 
 
-def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
-               timeout_minutes=None, tp_halving=False):
-    """构造节点上执行的完整命令。
+# 单机用例共享容器名: 同节点全部单机用例复用一个长驻容器 (初始化/依赖只装一次)。
+# 多机用例容器恒带 -{角色} 后缀 (sgl-pipeline-{name}-{key}), 与此名不会冲突;
+# prepare 阶段 cleanup_node_sglang 按 sgl-pipeline- 前缀清理, 跨 run 残留可自愈
+_SHARED_CONTAINER = "sgl-pipeline-single"
 
-    role: 多机用例的角色名 (prefill/decode/router), 决定容器名后缀;
-    extra_env: 角色专属环境变量 (多机用例的 HOSTNAME/POD_IP/协调地址等);
-    timeout_minutes: 覆盖 suite.timeout_minutes (多机用例 PD 角色加余量用);
-        suite/参数均为空时兜底 _DEFAULT_TIMEOUT_MINUTES, 杜绝无超时 hang 死;
-    tp_halving: A5 单机用例, 经 /output/run_case.py 包装启动 (--tp-size 减半)。
-    构造完成后打印 [cmd] 关键路径诊断 (容器名/节点/repo/输出目录/超时)。
-    """
-    repo = cfg.run.repo
-    d = cfg.run.docker
-    container = f"sgl-pipeline-{suite.name}" + (f"-{role}" if role else "")
+# 共享容器初始化 (vendor 环境/软链/数据集预置/pip 依赖安装) 的轮询间隔与最长等待;
+# 失败/超时会打印 .init.log 尾部辅助定位 (日志经 /output 挂载落在宿主机 runs/ 下)
+_INIT_POLL_SEC = 10
+_INIT_WAIT_SEC = 1800  # 30 分钟: 覆盖走代理安装较重的依赖
 
-    # 容器内命令
-    parts = ["set -euo pipefail"]
-    # 自定义算子包环境 (DeepSeek-V4-Flash 等用例需要; 镜像未装时忽略, 与 CI 一致)。
-    # vendor 脚本可能引用未定义变量 (如 ZSH_VERSION), source 前临时关 -u
-    parts += [
+
+def _vendor_env_parts():
+    """自定义算子包环境 (DeepSeek-V4-Flash 等用例需要; 镜像未装时忽略, 与 CI 一致)。
+    vendor 脚本可能引用未定义变量 (如 ZSH_VERSION), source 前临时关 -u。
+    单机用例 docker exec 不继承容器 init 进程 source 的环境, 每条都要重新 source。"""
+    return [
         "set +u",
         "source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/"
         "customize/bin/set_env.bash || true",
@@ -1008,7 +1011,14 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         "custom_transformer/bin/set_env.bash || true",
         "set -u",
     ]
-    q_repo = shlex.quote(repo)
+
+
+def _container_init_parts(cfg):
+    """容器初始化命令段 (单机共享容器与多机角色容器共用): vendor 环境 →
+    覆盖 ascend 测试工具 → /root/sglang 与 evalscope 软链 → 预置数据集到 /tmp。
+    单机共享容器在此基础上追加 configs/pip_deps.txt 依赖安装 (见 _build_shared_container_cmd)。"""
+    repo = cfg.run.repo
+    parts = list(_vendor_env_parts())
     # 覆盖镜像内 ascend 工具 (学 CI nightly 做法)
     # 注意: 对完整路径做 shlex.quote, 不能只引用前缀 (否则 /python/... 落在引号外,
     # 路径含空格时会被 shell 拆断); glob * 留在引号外以便 shell 展开
@@ -1020,8 +1030,8 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     # 精度框架 (run_evalscope) 硬编码 /root/sglang 调用 run_evalscope.sh, 与 CI
     # K8s 把代码卷挂在 /root/sglang 对齐; 本地 repo 在 {workspace}/sglang, 建软链
     # 让硬编码路径落到实际 repo (ln -sfn 覆盖既有目录/链接, 可重复执行)
-    parts.append(f"ln -sfn {q_repo} /root/sglang")
-    # evalscope 本地源 (固定 {workspace}/evalscope, 已同路径挂载见下方 mount_args):
+    parts.append(f"ln -sfn {shlex.quote(repo)} /root/sglang")
+    # evalscope 本地源 (固定 {workspace}/evalscope, 已同路径挂载):
     # run_evalscope.sh 硬编码检查 /root/.cache/.cache/evalscope, 软链过去实现本地
     # pip install -e。条件软链 (非空才链): 节点缺源码时 docker 对挂载源建空目录,
     # 无条件软链会让 [ -d ] 误命中 → pip install -e 空目录报错; 不链则回退在线安装
@@ -1030,63 +1040,58 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         f'if [ -d {q_ev} ] && [ -n "$(ls -A {q_ev})" ]; then '
         f"mkdir -p /root/.cache/.cache && "
         f"ln -sfn {q_ev} /root/.cache/.cache/evalscope; fi")
-    # 预置数据集到 /tmp (与 CI 一致): /tmp 每次全新挂载, 不预置则会重复下载
-    # (gsm8k) 或 perf 套件找不到数据; datasets 为节点本地绝对路径, 所在目录
-    # 已自动挂载进容器 (见下方 mount_args); 未配置时跳过, 由用例在线下载或
-    # 自行读取; cp -r 兼容文件/目录, 缓存缺失时忽略, 回退在线下载
+    # 预置数据集到 /tmp (与 CI 一致): 不预置则会重复下载 (gsm8k) 或 perf 套件
+    # 找不到数据; datasets 为节点本地绝对路径, 所在目录已自动挂载进容器;
+    # cp -r 兼容文件/目录, 缓存缺失时忽略, 回退在线下载
     for f in cfg.run.datasets:
         parts.append(f"cp -r {shlex.quote(f)} /tmp/ 2>/dev/null || true")
-    if tp_halving:
-        # A5 适配: 经包装器启动, 自动把 other_args 里的 --tp-size 减半
-        cmd = (f"cd {q_repo} && python3 -u /output/run_case.py "
-               f"{shlex.quote(suite.file)} -f")
-    else:
-        cmd = f"cd {q_repo} && python3 -u {shlex.quote(suite.file)} -f"
-    # 不用 "| tee": 用例泄漏的子进程 (如 PD 分离 router 的 sglang_router) 会继承
-    # 管道写端, python 退出后 tee 等 EOF 永不退出 → 容器挂死。改为后台执行 +
-    # 重定向落盘 + tail --pid 跟踪屏显: python 退出 → wait 返回 → 脚本结束,
-    # 容器随 PID 1 退出被 Docker 整体回收 (对齐 CI: 主进程退出即杀 cgroup 全部
-    # 进程, 泄漏的 router 子进程一并清理); 退出码经 wait 透传 (与 pipefail 下
-    # tee 等价)
-    log_f = shlex.quote(f"/output/{_log_filename(suite)}")
-    parts.append(f"{cmd} > {log_f} 2>&1 & _case_pid=$!")
-    parts.append(f"tail -f {log_f} --pid=$_case_pid")
-    parts.append("wait $_case_pid")
+    return parts
 
-    inner = "\n".join(parts)
 
-    # docker run 参数 (devices=auto 时卡数由 arch 决定, 显式列表以配置为准)
+def _docker_device_args(node, d):
+    """--device 参数 (devices=auto 时卡数由 arch 决定, 显式列表以配置为准)。"""
     ids = range(_ARCH_NPUS[node.arch]) if d.devices == "auto" else d.devices
-    device_args = []
+    args = []
     for i in ids:
-        device_args += ["--device", f"/dev/davinci{i}"]
-    if device_args:
+        args += ["--device", f"/dev/davinci{i}"]
+    if args:
         # 挂了 davinci 卡才挂管理设备 (devices 显式配空列表时不挂)
         for dev in _MGMT_DEVICES:
-            device_args += ["--device", dev]
+            args += ["--device", dev]
+    return args
 
-    mount_args = [
-        "-v", shlex.quote(f"{repo}:{repo}"),
+
+def _docker_mount_args(cfg, output_dir):
+    """-v 挂载参数。output_dir: 挂到容器 /output 的宿主机目录 (tmp/plog 取其
+    子目录)——单机共享容器=runs/{run_id} (各用例写 /output/{用例名}/),
+    多机角色容器=runs/{run_id}/{用例名}/{角色}。"""
+    args = [
         # evalscope 源码 (与 repo 同模式: 同路径挂载; 节点缺目录时 docker 建空
-        # 目录, 由上方条件软链兜底回退在线安装)
+        # 目录, 由初始化脚本的条件软链兜底回退在线安装)
+        "-v", shlex.quote(f"{cfg.run.repo}:{cfg.run.repo}"),
         "-v", shlex.quote(f"{cfg.run.workspace}/evalscope:"
                           f"{cfg.run.workspace}/evalscope"),
-        "-v", shlex.quote(f"{node_run_dir}:/output"),
-        "-v", shlex.quote(f"{node_run_dir}/tmp:/tmp"),
-        "-v", shlex.quote(f"{node_run_dir}/plog:/root/ascend/log"),
+        "-v", shlex.quote(f"{output_dir}:/output"),
+        "-v", shlex.quote(f"{output_dir}/tmp:/tmp"),
+        "-v", shlex.quote(f"{output_dir}/plog:/root/ascend/log"),
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
     # datasets 所在目录自动挂载 (同路径映射, 去重), 容器内路径与配置一致,
     # cp 命令直接使用原路径; 与默认挂载重叠时 (如 ~/.cache 下) docker 后挂载
     # 遮蔽前者, 同一宿主机目录内容一致, 无害
     _auto_dirs = [f.rsplit("/", 1)[0] for f in cfg.run.datasets]
     for m in dict.fromkeys(_auto_dirs):
-        mount_args += ["-v", shlex.quote(f"{m}:{m}")]
+        args += ["-v", shlex.quote(f"{m}:{m}")]
     # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;
     # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro")
-    if d.extra_mounts:
-        mount_args += [x for m in d.extra_mounts for x in ("-v", shlex.quote(m))]
+    if cfg.run.docker.extra_mounts:
+        args += [x for m in cfg.run.docker.extra_mounts
+                 for x in ("-v", shlex.quote(m))]
+    return args
 
-    # shlex.quote: 值含空格等 shell 特殊字符时自动加引号, 保证 " ".join 后不被拆断
+
+def _docker_env_args(cfg, extra_env=None):
+    """-e 环境变量参数: run.env (+extra_env 按 key 覆盖) + TZ + no_proxy 注入。
+    shlex.quote: 值含空格等 shell 特殊字符时自动加引号, 保证 join 后不被拆断。"""
     envs = dict(cfg.run.env)
     if extra_env:
         envs.update(extra_env)
@@ -1103,15 +1108,48 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     combined = ",".join(sorted(no_proxy))
     for k in ("no_proxy", "NO_PROXY"):
         envs[k] = f"{envs[k]},{combined}" if envs.get(k) else combined
-    env_args = [v for k, val in envs.items()
-                for v in ("-e", f"{k}={shlex.quote(str(val))}")]
+    return [v for k, val in envs.items()
+            for v in ("-e", f"{k}={shlex.quote(str(val))}")]
 
+
+def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
+               timeout_minutes=None):
+    """构造多机用例角色容器的节点执行命令 (单机用例走共享容器 + docker exec,
+    见 SingleNodeContainers / _single_case_exec_cmd)。
+
+    role: 角色 key (prefill-0/decode-1/router-0 或 node-0/...), 决定容器名后缀;
+    extra_env: 角色专属环境变量 (多机用例的 HOSTNAME/POD_IP/协调地址等);
+    timeout_minutes: 覆盖 suite.timeout_minutes (PD/worker 角色加余量用);
+        suite/参数均为空时兜底 _DEFAULT_TIMEOUT_MINUTES, 杜绝无超时 hang 死;
+    构造完成后打印 [cmd] 关键路径诊断 (节点/超时)。
+    """
+    d = cfg.run.docker
+    container = f"sgl-pipeline-{suite.name}" + (f"-{role}" if role else "")
+
+    # 容器内命令
+    parts = ["set -euo pipefail"] + _container_init_parts(cfg)
+    cmd = (f"cd {shlex.quote(cfg.run.repo)} && "
+           f"python3 -u {shlex.quote(suite.file)} -f")
+    # 不用 "| tee": 用例泄漏的子进程 (如 PD 分离 router 的 sglang_router) 会继承
+    # 管道写端, python 退出后 tee 等 EOF 永不退出 → 容器挂死。改为后台执行 +
+    # 重定向落盘 + tail --pid 跟踪屏显: python 退出 → wait 返回 → 脚本结束,
+    # 容器随 PID 1 退出被 Docker 整体回收 (对齐 CI: 主进程退出即杀 cgroup 全部
+    # 进程, 泄漏的 router 子进程一并清理); 退出码经 wait 透传 (与 pipefail 下
+    # tee 等价)
+    log_f = shlex.quote(f"/output/{_log_filename(suite)}")
+    parts.append(f"{cmd} > {log_f} 2>&1 & _case_pid=$!")
+    parts.append(f"tail -f {log_f} --pid=$_case_pid")
+    parts.append("wait $_case_pid")
+
+    inner = "\n".join(parts)
     inner_escaped = inner.replace("'", "'\"'\"'")
     docker_args = (["docker", "run", "--rm", "--privileged",
                     "--net", d.net, "--ipc", "host",
                     "--shm-size", d.shm_size,
                     "--name", container]
-                   + device_args + mount_args + env_args
+                   + _docker_device_args(node, d)
+                   + _docker_mount_args(cfg, node_run_dir)
+                   + _docker_env_args(cfg, extra_env)
                    + [shlex.quote(d.image), "bash", "-c", f"'{inner_escaped}'"])
 
     # 宿主机命令 (镜像/代码/版本由 prepare_node 提前保证)
@@ -1126,14 +1164,221 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     if not tmo:
         # 未配 timeout_minutes 时兜底, 防止容器内进程 hang 导致整个 run 卡死
         tmo = _DEFAULT_TIMEOUT_MINUTES
-        _log(f"[cmd] {role or '单机用例'} @{node.host} 未配 timeout, "
-             f"使用默认 {tmo} 分钟")
+        _log(f"[cmd] {role} @{node.host} 未配 timeout, 使用默认 {tmo} 分钟")
     # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
     lines.append(f"timeout -k 60 {int(tmo) * 60} " + " ".join(docker_args))
     # [cmd] 每容器一行: 角色@节点+超时 (容器名/输出目录按固定规则可推导,
     # 完整命令看 dry-run 或各角色 ssh.log; 多机并发时靠 host 区分归属)
-    _log(f"[cmd] {role or '单机用例'} @{node.host} 超时={tmo}分钟")
+    _log(f"[cmd] {role} @{node.host} 超时={tmo}分钟")
     return "\n".join(lines)
+
+
+def _build_shared_container_cmd(cfg, node, runs_dir):
+    """构造单机共享容器启动命令: docker run -d + 初始化 (子 shell) + 保活。
+
+    初始化在子 shell 内 set -e 执行: 外层不设 -e, 子 shell 失败时外层需继续
+    写 .init-fail 标记而非直接退出容器 (set -e 放进子 shell 而非放在
+    "{ ... } && ... || ..." 的 AND-OR 链里, 避免链内 errexit 被抑制、
+    中途失败被末条命令的返回码掩盖)。输出重定向到挂载目录的 .init.log,
+    成功/失败各写一个标记文件, 执行机经宿主机路径轮询 (挂载双向可见)。
+    """
+    d = cfg.run.docker
+    init = _container_init_parts(cfg)
+    # 自定义 python 依赖 (流水线 configs/pip_deps.txt, 固定路径零配置, 内容
+    # 对齐 CI Install dependencies 步骤): 每行一条命令原样执行, 装进容器系统
+    # python (用例同解释器), 每节点只装一次, 该节点全部单机用例复用; 命令行
+    # 由 run.py 加载配置时读入 (注释/空行已剔除), 此处无需再解析文件
+    init += cfg.run.pip_cmds
+    inner = (
+        "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
+        " > /output/.init.log 2>&1\n"
+        "if [ $? -eq 0 ]; then touch /output/.init-ok; "
+        "else touch /output/.init-fail; fi\n"
+        "exec tail -f /dev/null"
+    )
+    inner_escaped = inner.replace("'", "'\"'\"'")
+    docker_args = (["docker", "run", "-d", "--privileged",
+                    "--net", d.net, "--ipc", "host",
+                    "--shm-size", d.shm_size,
+                    "--name", _SHARED_CONTAINER]
+                   + _docker_device_args(node, d)
+                   + _docker_mount_args(cfg, runs_dir)
+                   + _docker_env_args(cfg)
+                   + [shlex.quote(d.image), "bash", "-c", f"'{inner_escaped}'"])
+    # 宿主机命令: 清理残留同名容器 (prepare 阶段已清过, 双保险) 后后台启动;
+    # -d 长驻, 用例经 docker exec 执行, run 结束由 cleanup() 统一删除
+    return "\n".join([
+        "set -e",
+        f"mkdir -p {shlex.quote(f'{runs_dir}/tmp')} {shlex.quote(f'{runs_dir}/plog')}",
+        f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
+        " ".join(docker_args),
+    ])
+
+
+def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
+                          extra_env, tmo):
+    """构造单机用例在共享容器内的执行命令 (宿主机侧): mkdir 输出目录 + docker exec。
+
+    容器内脚本: 清理上一条用例残留 → vendor 环境 (exec 不继承 init 的 source,
+    每条重新加载) → timeout 包裹用例 (超时杀得干净, 退出码 124 透传) →
+    日志落 /output/{用例名}/ (挂载回宿主机 runs/) + tail 跟踪屏显 →
+    plog 快照到用例目录 (共享 /root/ascend/log 全用例混写, 拷贝实现按用例隔离)。
+    外层 timeout (tmo+300s) 仅兜底 docker exec 客户端本身 hang 的极端情况。
+    """
+    if tp_halving:
+        # A5 适配: 经包装器启动 (容器 /output = runs/{run_id}), 自动把 other_args
+        # 里的 --tp-size 减半 (仅值 >2 时; 未配/配 1/2 不动)
+        py = f"/output/run_case.py {shlex.quote(suite.file)}"
+    else:
+        py = shlex.quote(suite.file)
+    log_f = shlex.quote(f"/output/{suite.name}/{_log_filename(suite)}")
+    plog_dst = shlex.quote(f"/output/{suite.name}/plog")
+    parts = [
+        "set -euo pipefail",
+        # 上一条用例残留的 sglang 进程清理: 共享容器的进程不随用例退出,
+        # 崩溃/超时遗留的 server 会占卡, 不清则本条用例报 NPU 卡被占用
+        "pkill -9 -f 'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
+        " 2>/dev/null || true",
+    ]
+    parts += _vendor_env_parts()
+    parts.append(
+        f"cd {shlex.quote(cfg.run.repo)} && "
+        f"timeout -k 60 {int(tmo) * 60} python3 -u {py} -f "
+        f"> {log_f} 2>&1 & _case_pid=$!")
+    parts.append(f"tail -f {log_f} --pid=$_case_pid")
+    # 退出码透传: wait 失败不经 set -e 提前退出 (|| 接住), 保证 plog 拷贝执行
+    parts.append("_rc=0; wait $_case_pid || _rc=$?")
+    parts.append(f"cp -r /root/ascend/log {plog_dst} 2>/dev/null || true")
+    parts.append("exit $_rc")
+
+    inner = "\n".join(parts)
+    inner_escaped = inner.replace("'", "'\"'\"'")
+    exec_env = [v for k, val in (extra_env or {}).items()
+                for v in ("-e", f"{k}={shlex.quote(str(val))}")]
+    return "\n".join([
+        "set -e",
+        f"mkdir -p {shlex.quote(node_run_dir)}",
+        f"timeout -k 60 {int(tmo) * 60 + 300} docker exec "
+        + (" ".join(exec_env) + " " if exec_env else "")
+        + f"{container} bash -c '{inner_escaped}'",
+    ])
+
+
+class SingleNodeContainers:
+    """单机用例共享容器管理: 每节点一个长驻容器, 跑该节点全部单机用例。
+
+    旧实现每条单机用例单独 docker run, 初始化 + pip 依赖每条重做一遍;
+    共享容器把初始化摊销到一次 (configs/pip_deps.txt 依赖只装一次), 用例经
+    docker exec 执行, exec 自动继承 docker run 时的容器环境 (run.env/
+    TZ/no_proxy 等), 角色专属变量 (PYTHONPATH/a5_env) 经 exec -e 注入。
+      - get(node): 惰性启动该节点的共享容器 (首个单机用例触发), 轮询初始化
+        就绪后返回容器名; 初始化失败抛 RuntimeError (调用方记 error, 该节点
+        后续单机用例快速失败)
+      - cleanup(): run 结束统一 docker rm -f (容器内残留进程随 cgroup 整体回收)
+    """
+
+    def __init__(self, cfg, run_id, dry_run=False):
+        self._cfg = cfg
+        self._run_id = run_id
+        self._dry_run = dry_run
+        self._started = {}   # host -> node (已启动共享容器的节点)
+        self._failed = set()  # 初始化失败的 host (后续单机用例快速失败)
+
+    def get(self, node):
+        """返回节点共享容器名; 未启动则启动并等初始化完成 (失败抛 RuntimeError)。"""
+        if node.host in self._started:
+            return _SHARED_CONTAINER
+        if node.host in self._failed:
+            raise RuntimeError(
+                f"节点 {node.host} 共享容器初始化已失败, 该节点单机用例全部跳过")
+        runs_dir = f"{self._cfg.run.workspace}/runs/{self._run_id}"
+        where = ("本机" if _is_local(node)
+                 else f"{node.user}@{node.host}:{node.port}")
+        deps = (f"configs/pip_deps.txt 共 {len(self._cfg.run.pip_cmds)} 条命令"
+                if self._cfg.run.pip_cmds else "无 (pip_deps.txt 缺失或为空)")
+        _log(f"[execute] {where} 启动单机共享容器 {_SHARED_CONTAINER} "
+             f"(pip 依赖: {deps})")
+        # 注入 sitecustomize (容器 /output = runs/{run_id}, 经 PYTHONPATH 生效;
+        # 单机用例只需 evalscope SSL 补丁, fake k8s 桥接不激活)
+        if _stage_sitecustomize(node, runs_dir, self._dry_run) != 0:
+            self._failed.add(node.host)
+            raise RuntimeError(f"节点 {node.host} 写入 sitecustomize.py 失败")
+        # A5 节点注入 --tp-size 减半包装器 (单机用例专属适配, 启动时装一次)
+        if (node.arch == "a5"
+                and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
+            self._failed.add(node.host)
+            raise RuntimeError(f"节点 {node.host} 写入 run_case.py 失败")
+        rc = ssh_run(node, _build_shared_container_cmd(self._cfg, node, runs_dir),
+                     dry_run=self._dry_run)
+        if rc != 0:
+            self._failed.add(node.host)
+            raise RuntimeError(f"节点 {node.host} 共享容器启动失败 (rc={rc})")
+        if not self._dry_run:
+            self._wait_init(node, runs_dir)  # 失败抛 RuntimeError
+        self._started[node.host] = node
+        return _SHARED_CONTAINER
+
+    def _wait_init(self, node, runs_dir):
+        """轮询初始化标记 (.init-ok/.init-fail 经 /output 挂载落在宿主机
+        runs/ 下, 直接查宿主机路径, 不经 docker exec)。"""
+        q_runs = shlex.quote(runs_dir)
+        alive_cmd = (f"docker inspect -f '{{{{.State.Running}}}}' "
+                     f"{_SHARED_CONTAINER} | grep -qx true")
+        tic = time.perf_counter()
+        last_note = 0.0
+        while True:
+            if ssh_run(node, f"test -f {q_runs}/.init-ok",
+                       quiet=True, silent=True) == 0:
+                _log(f"[execute] 共享容器初始化完成 (耗时 "
+                     f"{round(time.perf_counter() - tic, 1)}s)")
+                return
+            # 初始化子 shell 失败 (依赖安装出错等): 打印 .init.log 尾部定位
+            if ssh_run(node, f"test -f {q_runs}/.init-fail",
+                       quiet=True, silent=True) == 0:
+                self._fail(node, runs_dir, "初始化失败 (依赖安装出错?)")
+            # 容器本身退出 (镜像缺 bash/OOM 等): 轮询会一直落空, 主动检出
+            if ssh_run(node, alive_cmd, quiet=True, silent=True) != 0:
+                self._fail(node, runs_dir, "容器意外退出")
+            if time.perf_counter() - tic > _INIT_WAIT_SEC:
+                self._fail(node, runs_dir,
+                           f"初始化超时 (>{_INIT_WAIT_SEC}s)")
+            if time.perf_counter() - last_note >= 60:
+                last_note = time.perf_counter()
+                _log(f"[execute] 共享容器初始化中... (已等 "
+                     f"{int(time.perf_counter() - tic)}s, "
+                     f"最长 {_INIT_WAIT_SEC}s)")
+            time.sleep(_INIT_POLL_SEC)
+
+    def _fail(self, node, runs_dir, reason):
+        """初始化失败收尾: 删容器 + 打印 .init.log 尾部 + 抛错 (含 fast-fail 标记)。"""
+        self._failed.add(node.host)
+        ssh_run(node, f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
+                quiet=True, silent=True)
+        # init 日志经 /output 挂载落在宿主机 runs/ 下, 直接 tail 到控制台
+        ssh_run(node,
+                f"tail -n 100 {shlex.quote(runs_dir)}/.init.log 2>/dev/null || true")
+        raise RuntimeError(f"节点 {node.host} 共享容器{reason}, 详见上方 .init.log 尾部")
+
+    def cleanup(self):
+        """run 结束统一清理: docker rm -f (容器内残留进程随 cgroup 整体回收)。"""
+        for host, node in self._started.items():
+            _log(f"[cleanup] {host} 删除单机共享容器 {_SHARED_CONTAINER}")
+            ssh_run(node,
+                    f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
+                    quiet=True, dry_run=self._dry_run)
+            # 本机节点: 清理仅剩的 run 级残留 (共享 tmp/plog/标记/注入脚本,
+            # 用例目录已随 fetch 删除); rmdir 仅在全部用例产物均已拉回时成功
+            # (有 fetch 失败的残留则整目录保留), 与旧"每用例独立目录"的清理
+            # 语义对齐; 远程节点 runs/ 原件始终保留 (可手动重拉), 不清理
+            if _is_local(node) and not self._dry_run:
+                q = shlex.quote(
+                    f"{self._cfg.run.workspace}/runs/{self._run_id}")
+                ssh_run(node,
+                        f"rm -rf {q}/tmp {q}/plog {q}/sitecustomize.py "
+                        f"{q}/run_case.py {q}/__pycache__ {q}/.init-ok "
+                        f"{q}/.init-fail {q}/.init.log; "
+                        f"rmdir {q} 2>/dev/null || true", quiet=True)
+        self._started.clear()
 
 
 def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
@@ -1175,8 +1420,13 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
     _log(f"[fetch] {who}拉回完成 ({note})")
 
 
-def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
-    """执行一个单机用例, 返回结果 dict。"""
+def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False):
+    """执行一个单机用例 (节点共享容器内 docker exec), 返回结果 dict。
+
+    shared: SingleNodeContainers, 该节点首个单机用例时启动共享容器 (含
+    configs/pip_deps.txt 依赖安装, 只装一次), 后续用例复用; sitecustomize/run_case
+    包装器也随容器启动注入一次 (容器 /output = runs/{run_id})。
+    """
     result = {"name": suite.name, "node": node.host,
               "status": "fail", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
               "duration_sec": 0, "error": None}
@@ -1186,26 +1436,21 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
 
     tic = time.perf_counter()
     try:
-        # A5 节点: 脚本 --tp-size 按 A3 卡数配置, 注入包装器减半 (仅单机用例)
+        container = shared.get(node)
+        # A5 节点: 脚本 --tp-size 按 A3 卡数配置, 经包装器减半 (仅单机用例,
+        # 包装器已在容器启动时注入 /output/run_case.py)
         tp_halving = node.arch == "a5"
-        if tp_halving:
-            _log(f"[execute] A5 适配: 注入 --tp-size 减半包装器 "
-                 f"({node_run_dir}/run_case.py)")
-            if _stage_run_wrapper(node, node_run_dir, dry_run) != 0:
-                raise RuntimeError("写入 run_case.py 失败")
-        # 注入 sitecustomize.py (容器内 /output, 经 PYTHONPATH 生效): evalscope
-        # venv 的 requests SSL 校验关闭; fake k8s 桥接仅在 SGLANG_COORD_URL
-        # 设置 (多机用例) 时激活, 单机用例为空操作
-        if _stage_sitecustomize(node, node_run_dir, dry_run) != 0:
-            raise RuntimeError("写入 sitecustomize.py 失败")
         # A5 单机用例专属环境变量 (run.a5_env, 如灵衢 FIA 互联 ASCEND_USE_FIA);
         # 未配置时为空, 不注入; 多机用例不注入
         extra_env = dict(cfg.run.a5_env) if node.arch == "a5" else {}
         # /output/sitecustomize.py 的加载路径 (与多机用例的注入方式一致)
         extra_env["PYTHONPATH"] = "/output"
-        cmd = _build_cmd(cfg, suite, node, node_run_dir, tp_halving=tp_halving,
-                         extra_env=extra_env)
-        _log(f"[execute] @ {where} 启动容器 (超时={suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES}分钟)")
+        tmo = suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES
+        if not suite.timeout_minutes:
+            _log(f"[execute] {suite.name} 未配 timeout, 使用默认 {tmo} 分钟")
+        cmd = _single_case_exec_cmd(cfg, suite, container, node_run_dir,
+                                    tp_halving, extra_env, tmo)
+        _log(f"[execute] @ {where} 共享容器执行 (超时={tmo}分钟)")
         rc = ssh_run(node, cmd,
                      log_path=os.path.join(local_suite_dir, _log_filename(suite)),
                      diag_path=os.path.join(local_suite_dir, "ssh.log"),
@@ -1214,12 +1459,12 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, dry_run=False):
         result["error"] = None if rc == 0 else f"exit code {rc}"
         dur = round(time.perf_counter() - tic, 1)
         if rc == 0:
-            _log(f"[execute] 容器正常结束 (rc=0, 耗时 {dur}s)")
+            _log(f"[execute] 用例正常结束 (rc=0, 耗时 {dur}s)")
         elif dry_run:
             _log(f"[execute] dry-run 完成命令打印")
         else:
             # 失败保留完整日志路径便于排查
-            _log(f"[execute] 容器异常结束 (rc={rc}, 耗时 {dur}s), "
+            _log(f"[execute] 用例异常结束 (rc={rc}, 耗时 {dur}s), "
                  f"日志: {os.path.join(local_suite_dir, _log_filename(suite))}")
         if not dry_run:
             _fetch_artifacts(node, node_run_dir, local_suite_dir, "",

@@ -30,10 +30,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, cleanup_node_sglang,
-                      execute_multinode_suite, execute_multinode_tp_suite,
-                      execute_suite, prepare_evalscope, prepare_local_repo,
-                      prepare_node)
+from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, SingleNodeContainers,
+                      cleanup_node_sglang, execute_multinode_suite,
+                      execute_multinode_tp_suite, execute_suite,
+                      prepare_evalscope, prepare_local_repo, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -90,6 +90,10 @@ class RunConfig:
     # 所在目录自动挂载进容器 (同路径映射)。未配置时不预置任何数据集,
     # 由用例在线下载或自行读取
     datasets: List[str] = field(default_factory=list)
+    # 单机共享容器启动时执行的依赖安装命令 (读自流水线 configs/pip_deps.txt,
+    # 固定路径零配置: 文件存在即生效, 不存在跳过; # 注释/空行剔除后逐条嵌入
+    # 容器初始化脚本, 如 CI Install dependencies 步骤的 pip install ...)
+    pip_cmds: List[str] = field(default_factory=list)
 
     @property
     def repo(self):
@@ -177,6 +181,17 @@ def load_config(path):
             raise ValueError(
                 f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
                 f"请移入子目录: {x!r}")
+    # 依赖安装命令固定读流水线 configs/pip_deps.txt (零配置: 存在即生效,
+    # 不存在跳过不报错——空文件/删文件 = 不装); 用 __file__ 定位, 不受
+    # run.py 调用 cwd 影响 (支持任意路径执行)
+    _deps_file = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "configs", "pip_deps.txt")
+    pip_cmds = []
+    if os.path.isfile(_deps_file):
+        # utf-8-sig 兼容 Windows BOM; 文本模式通用换行 + strip 兜底 \r
+        with open(_deps_file, "r", encoding="utf-8-sig") as df:
+            pip_cmds = [ln.strip() for ln in df
+                        if ln.strip() and not ln.strip().startswith("#")]
     code_raw = run_raw.get("code") or {}
     git_remote = code_raw.get("git_remote")
 
@@ -193,6 +208,7 @@ def load_config(path):
              **{str(k): str(v) for k, v in (run_raw.get("env") or {}).items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
+        pip_cmds=pip_cmds,
     )
 
     nodes = []
@@ -416,31 +432,40 @@ def prepare_nodes(cfg, dry_run):
 
 
 def run_suites(cfg, prepared, run_id, run_dir, dry_run):
-    """逐个执行用例, 返回结果列表。"""
+    """逐个执行用例, 返回结果列表。
+
+    单机用例经 SingleNodeContainers 复用节点长驻共享容器 (每节点一个,
+    configs/pip_deps.txt 依赖只装一次), run 结束 (含中途异常/中断) finally 统一清理。
+    """
     results = []
-    for i, suite in enumerate(cfg.suites):
-        print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
-        hosts = _suite_hosts(suite)
-        if not all(prepared.get(h) for h in hosts):
-            missing = [h for h in hosts if not prepared.get(h)]
-            _log(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
-            res = {"name": suite.name, "node": ",".join(hosts),
-                   "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                   "duration_sec": 0, "error": "节点准备失败, 未执行"}
-        elif suite.roles:
-            res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
-        elif suite.multinode:
-            res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir, dry_run)
-        else:
-            node = cfg.find_node(suite.node)
-            res = execute_suite(cfg, suite, node, run_id, run_dir, dry_run)
-        res["file"] = suite.file
-        if dry_run:
-            res["status"] = "dryrun"
-        results.append(res)
-        _log(f"[结果] {suite.name}: {res['status']}")
-        # 每跑完一条即写 summary.json, 中途被杀也能看到已完成用例的结果
-        write_summary(results, run_id, run_dir)
+    shared = SingleNodeContainers(cfg, run_id, dry_run)
+    try:
+        for i, suite in enumerate(cfg.suites):
+            print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
+            hosts = _suite_hosts(suite)
+            if not all(prepared.get(h) for h in hosts):
+                missing = [h for h in hosts if not prepared.get(h)]
+                _log(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
+                res = {"name": suite.name, "node": ",".join(hosts),
+                       "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "duration_sec": 0, "error": "节点准备失败, 未执行"}
+            elif suite.roles:
+                res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
+            elif suite.multinode:
+                res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir, dry_run)
+            else:
+                node = cfg.find_node(suite.node)
+                res = execute_suite(cfg, suite, node, run_id, run_dir, shared,
+                                    dry_run)
+            res["file"] = suite.file
+            if dry_run:
+                res["status"] = "dryrun"
+            results.append(res)
+            _log(f"[结果] {suite.name}: {res['status']}")
+            # 每跑完一条即写 summary.json, 中途被杀也能看到已完成用例的结果
+            write_summary(results, run_id, run_dir)
+    finally:
+        shared.cleanup()
     return results
 
 
