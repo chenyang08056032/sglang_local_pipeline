@@ -32,7 +32,8 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, cleanup_node_sglang,
                       execute_multinode_suite, execute_multinode_tp_suite,
-                      execute_suite, prepare_local_repo, prepare_node)
+                      execute_suite, prepare_evalscope, prepare_local_repo,
+                      prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -71,20 +72,16 @@ class DockerConfig:
 
 
 @dataclass
-class PrepareConfig:
-    """节点准备。online=true 需执行机可达 registry/git remote (节点侧
-    只拉镜像); false 则离线: 节点镜像手动就位, 执行机代码仓手动准备,
-    两种模式均会把执行机代码仓清理后复制到各远程节点。"""
-    online: bool = False
-
-
-@dataclass
 class RunConfig:
     workspace: str
+    # 执行机代码仓准备 (无 prepare 开关, 由 {workspace}/sglang 是否存在决定):
+    #   - 已存在: 直接使用现状, 不做任何 git 操作 (用户对版本有完全控制)
+    #   - 不存在: 用 run.env 配置的代理执行 git clone (只 clone, 配了 ref 用 -b)
+    #     ; 失败报错 (无 git_remote 时也报错, 提示手动准备)
     git_remote: str = None
-    ref: str = "main"
+    # clone 时若指定则用 git clone -b {ref}; 未配 (None) 时用远端默认分支
+    ref: str = None
     docker: DockerConfig = None
-    prepare: PrepareConfig = None
     env: Dict[str, str] = field(default_factory=dict)
     # 仅注入 a5 节点单机用例容器的环境变量 (如 ASCEND_USE_FIA);
     # 多机用例及其他 arch 节点不注入, 覆盖 env 同名键
@@ -93,10 +90,6 @@ class RunConfig:
     # 所在目录自动挂载进容器 (同路径映射)。未配置时不预置任何数据集,
     # 由用例在线下载或自行读取
     datasets: List[str] = field(default_factory=list)
-    # 精度框架 evalscope 本地源码路径 (节点本地绝对路径), 自动挂载所在目录并
-    # 软链到 run_evalscope.sh 硬编码的 /root/.cache/.cache/evalscope。未配置时
-    # 不干预: 节点预置该约定路径则本地安装, 否则回退清华镜像在线安装
-    evalscope_source: str = None
 
     @property
     def repo(self):
@@ -156,7 +149,6 @@ def load_config(path):
         shm_size=docker_raw.get("shm_size", "16g"),
         extra_mounts=list(extra_mounts),
     )
-    prepare = PrepareConfig(online=run_raw.get("prepare", False))
     # a5_env 须为键值映射 (键值自动转字符串, YAML 写 1 即 "1");
     # 误写成列表/标量时报清晰错误
     a5_env_raw = run_raw.get("a5_env") or {}
@@ -182,35 +174,19 @@ def load_config(path):
             raise ValueError(
                 f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
                 f"请移入子目录: {x!r}")
-    # evalscope 源码路径: 须为节点本地绝对路径 (所在目录自动挂载进容器)
-    evalscope_source = run_raw.get("evalscope_source")
-    if evalscope_source is not None:
-        if not isinstance(evalscope_source, str) or not evalscope_source.startswith("/"):
-            raise ValueError(
-                f"run.evalscope_source 须为节点本地绝对路径 (以 / 开头), 如:\n"
-                f"  evalscope_source: /data/evalscope\n"
-                f"实际: {evalscope_source!r}")
-        if evalscope_source.rsplit("/", 1)[0] == "":
-            raise ValueError(
-                f"run.evalscope_source 不支持根目录直属路径 (所在目录会整盘挂载), "
-                f"请移入子目录: {evalscope_source!r}")
     code_raw = run_raw.get("code", {})
     git_remote = code_raw.get("git_remote")
-    if prepare.online and not git_remote:
-        raise ValueError("联网模式 (prepare: true) 必须配置 run.code.git_remote")
 
     workspace = run_raw["workspace"]
     run = RunConfig(
         workspace=workspace,
         git_remote=git_remote,
-        ref=code_raw.get("ref", "main"),
+        ref=code_raw.get("ref"),
         docker=docker,
-        prepare=prepare,
         env={**_DEFAULT_ENV,
              **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
-        evalscope_source=evalscope_source,
     )
 
     nodes = []
@@ -227,6 +203,10 @@ def load_config(path):
 
     suites = []
     for s in raw.get("suites", []):
+        # name 可省略: 默认取 file basename 去 .py (如 .../test_npu_qwen3_32b.py
+        # → test_npu_qwen3_32b), --suite 过滤与目录命名均自然匹配
+        file_path = s["file"]
+        name = s.get("name") or os.path.splitext(os.path.basename(file_path))[0]
         roles = s.get("roles")
         multinode = s.get("multinode")
         # node / roles / multinode 三选一
@@ -235,14 +215,14 @@ def load_config(path):
                                     ("multinode", multinode)) if v]
         if len(specified) > 1:
             raise ValueError(
-                f"用例 {s['name']}: {'/'.join(specified)} 互斥, 只能配一个")
+                f"用例 {name}: {'/'.join(specified)} 互斥, 只能配一个")
         node = s.get("node")
         if not specified:
             # 三者均未配: 恰好只定义 1 个节点时默认该节点 (单机配置可省略 node);
             # 多节点时无法推断, 显式报错
             if len(nodes) != 1:
                 raise ValueError(
-                    f"用例 {s['name']}: 须配 node/roles/multinode 之一 "
+                    f"用例 {name}: 须配 node/roles/multinode 之一 "
                     f"(仅当 nodes 恰好定义 1 个节点时 node 才可省略, "
                     f"当前定义了 {len(nodes)} 个)")
             node = nodes[0].host
@@ -250,12 +230,12 @@ def load_config(path):
             missing = set(_MULTI_ROLES) - set(roles)
             if missing:
                 raise ValueError(
-                    f"用例 {s['name']}: roles 缺少角色 {', '.join(sorted(missing))} "
+                    f"用例 {name}: roles 缺少角色 {', '.join(sorted(missing))} "
                     f"(需 {'/'.join(_MULTI_ROLES)})")
             unknown = set(roles) - set(_MULTI_ROLES)
             if unknown:
                 raise ValueError(
-                    f"用例 {s['name']}: 未知角色 {', '.join(sorted(unknown))} "
+                    f"用例 {name}: 未知角色 {', '.join(sorted(unknown))} "
                     f"(仅支持 {'/'.join(_MULTI_ROLES)})")
             # router 只能单个节点 (sglang 框架: 多个 router pod 会各自起 router 进程,
             # 造成端口冲突和路由混乱); prefill/decode 归一化为列表以统一处理
@@ -266,20 +246,20 @@ def load_config(path):
                     val = [val]
                 elif not isinstance(val, list):
                     raise ValueError(
-                        f"用例 {s['name']}: roles.{r} 须为字符串或列表, 实际 {type(val).__name__}")
+                        f"用例 {name}: roles.{r} 须为字符串或列表, 实际 {type(val).__name__}")
                 if r == "router" and len(val) > 1:
                     raise ValueError(
-                        f"用例 {s['name']}: router 角色只支持单个节点, "
+                        f"用例 {name}: router 角色只支持单个节点, "
                         f"实际配了 {len(val)} 个")
                 norm[r] = val
             roles = norm
         if multinode:
             if not isinstance(multinode, list) or len(multinode) < 2:
                 raise ValueError(
-                    f"用例 {s['name']}: multinode 须为 ≥2 个节点的列表"
+                    f"用例 {name}: multinode 须为 ≥2 个节点的列表"
                     f" (单节点请用 node)")
         suites.append(SuiteConfig(
-            name=s["name"], node=node, file=s["file"],
+            name=name, node=node, file=file_path,
             timeout_minutes=s.get("timeout_minutes"),
             roles=roles, multinode=multinode,
         ))
@@ -333,9 +313,9 @@ def parse_args():
 
 
 def print_config(cfg, config_path):
-    _log(f"[配置] {config_path}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)} "
-        f"prepare={'联网' if cfg.run.prepare.online else '离线'} ref={cfg.run.ref} "
-        f"repo={cfg.run.repo}")
+    ref_desc = f" ref={cfg.run.ref}" if cfg.run.ref else ""
+    _log(f"[配置] {config_path}: 节点={len(cfg.nodes)} 用例={len(cfg.suites)}"
+        f"{ref_desc} repo={cfg.run.repo}")
     _log(f"[配置] 镜像: {cfg.run.docker.image}")
 
 
@@ -360,6 +340,19 @@ def _suite_hosts(suite):
     if suite.multinode:
         return list(suite.multinode)
     return [suite.node]
+
+
+def _suite_master_host(suite):
+    """跑测试逻辑的节点 host (单机=node; PD 分离=router; 混布 TP=第一个节点)。
+
+    worker/PD 节点只起 server, 不跑测试、不装精度框架 (与 run.datasets
+    仅测试节点需要同理)。PD 分离 router 恒为 1 个 (框架限制), 取 [0]。
+    """
+    if suite.roles:
+        return suite.roles["router"][0]
+    if suite.multinode:
+        return suite.multinode[0]
+    return suite.node
 
 
 def prepare_nodes(cfg, dry_run):
@@ -388,6 +381,13 @@ def prepare_nodes(cfg, dry_run):
             # 就绪后清理 sglang 残留 (宿主机进程 + 容器), 确保 NPU 卡无占用;
             # 失败不阻断 (用例报卡占用时按 [cleanup] 提示手动检查)
             cleanup_node_sglang(cfg, node, dry_run)
+    # evalscope 源码 (固定 {workspace}/evalscope): 执行机 clone 一次 + 仅分发
+    # 到跑测试的节点 (去重); 失败不阻断 (回退在线安装)
+    prepare_evalscope(
+        cfg,
+        [h for h in dict.fromkeys(_suite_master_host(s) for s in cfg.suites)
+         if prepared.get(h)],
+        dry_run)
     return prepared
 
 

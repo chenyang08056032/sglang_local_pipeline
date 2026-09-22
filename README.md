@@ -26,8 +26,8 @@ sglang_local_pipeline/
 | sglang_local_pipeline 代码 | clone 或拷贝本目录 |
 | Python 3 | 加 `pip install pyyaml`（唯一第三方依赖） |
 | ssh 客户端 + tar | 仅远程节点需要（本地节点直接 subprocess 执行，无需 ssh） |
-| sglang 代码仓 | 放在 `{workspace}/sglang`（**唯一代码准备点**，各节点代码均由此复制）。联网模式由流水线自动 clone/checkout（需 git + 可达 git remote）；离线模式手动放好 |
-| 网络 | 远程节点需可达 22 端口；联网模式另需可达 docker registry（节点拉镜像）/ git remote（执行机 clone） |
+| sglang 代码仓 | 放在 `{workspace}/sglang`（**唯一代码准备点**，各节点代码均由此复制）。仓存在且非空则直接使用现状（不做任何 git 操作）；仓缺失（不存在或为空目录，如上轮 clone 失败残留）且配了 `run.code.git_remote` 时，用 `run.env` 代理执行 `git clone` 拉一份（自动自愈） |
+| 网络 | 远程节点需可达 22 端口；节点缺镜像时会尝试 `docker pull`（需可达 docker registry，失败不阻断）；执行机 clone 代码需可达 git remote（仓缺失时） |
 | 磁盘 | workspace（含 sglang 仓 + results） |
 
 执行机**不需要** Docker、NPU 驱动——这些在节点上。
@@ -40,11 +40,11 @@ sglang_local_pipeline/
 | SSH 免密 | 仅远程节点需要（本地节点=执行机时自动走 subprocess，无需 SSH） |
 | Docker | 已安装并运行 |
 | NPU 驱动 | 存在 `/usr/local/Ascend/driver`、`/usr/local/Ascend/firmware`、`/dev/davinci*`、`/dev/davinci_manager`、`/dev/hisi_hdc`、`/etc/ascend_install.info` |
-| 网络（可选） | 仅联网模式需可达 docker registry（自动 pull 镜像）；**代码无需外网/git**——各节点代码由流水线从执行机整仓复制（先清理节点旧仓），保证多节点版本严格一致 |
+| 网络（可选） | 节点缺镜像时会尝试 `docker pull`（需可达 docker registry，失败不阻断，离线节点需提前手动 `docker pull`）；**代码无需外网/git**——各节点代码由流水线从执行机整仓复制（先清理节点旧仓），保证多节点版本严格一致 |
 | 磁盘 | 模型缓存 `~/.cache`（几十 GB）+ workspace（含复制过来的 sglang 仓 + runs） |
 
-镜像：`prepare: true` 时各节点自动 pull（不存在才拉）；默认 `prepare: false`（离线）时需提前在**各节点**手动 `docker pull`。
-sglang 代码仓：只需在**执行机**准备——联网模式流水线自动 clone/checkout `{workspace}/sglang`，离线模式手动放好；无论哪种模式，prepare 阶段都会先清理各节点旧仓（`rm -rf {workspace}/sglang`）再从执行机整仓复制（tar 经 ssh，含 `.git`）。
+镜像：节点缺镜像时流水线自动尝试 `docker pull`（失败不阻断，离线节点需提前手动 `docker pull`）。
+sglang 代码仓：只需在**执行机**准备——仓存在且非空则直接使用现状（不做任何 git 操作，用户对版本完全控制）；仓缺失（不存在或为空）且配了 `run.code.git_remote` 时，用 `run.env` 代理执行 `git clone` 拉一份（空目录多为上轮 clone 失败残留，重新 clone 自动自愈）。无论哪种情况，prepare 阶段都会先清理各节点旧仓（`rm -rf {workspace}/sglang`）再从执行机整仓复制（tar 经 ssh，含 `.git`）。
 
 ## 3. 配置文件说明
 
@@ -55,9 +55,8 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
 | `run.workspace` | 无 | 是 | 节点上的工作目录。sglang 仓固定在 `{workspace}/sglang`，执行机结果目录固定在 `{workspace}/results`（与节点 `runs/` 平级，同机不冲突），均不可另配 |
-| `run.prepare` | `false` | 否 | `true`=联网：节点镜像 pull + 执行机代码 clone/fetch/checkout；`false`=离线：节点镜像手动就位、执行机代码仓手动准备。**两种模式均会把执行机代码仓清理各节点旧仓后整仓复制过去** |
-| `run.code.git_remote` | 无 | `prepare: true` 时必填 | 执行机 clone/fetch 来源（节点不做 git 操作）。**仅联网模式读取**；离线模式不生效，配置里可整段省略 |
-| `run.code.ref` | `main` | 否 | 目标版本：分支名 / tag / commit SHA。仅联网模式在执行机 checkout |
+| `run.code.git_remote` | 无 | 否 | 执行机 `{workspace}/sglang` **不存在或为空目录时**用于 `git clone`（节点不做 git 操作）。仓已存在且非空则忽略此字段，直接使用现状。未配且仓缺失/为空时报错提示手动准备 |
+| `run.code.ref` | 无 | 否 | `git clone -b {ref}` 的分支/tag/commit。仅仓缺失/为空 clone 时生效；仓已存在不干预版本（用户自行 checkout）。未配时 clone 用远端默认分支 |
 | `run.docker.image` | 无 | 是 | 测试容器镜像 |
 | `run.docker.devices` | `auto` | 否 | `auto`=按节点 arch 推导卡数映射 `/dev/davinci0..N-1`（a3=16、a5=8）+ 管理设备；或显式列表如 `[0,1,2,3]`，以列表为准 |
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
@@ -66,7 +65,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 | `run.env` | 内置 7 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 容器启动后 cp 到 `/tmp/` 的数据集路径列表；**节点本地绝对路径**（以 `/` 开头），所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略，回退在线下载。未配置时不预置；单机用例需该 `node` 节点存在，多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，缺失不影响（路径不存在时 cp 静默忽略） |
-| `run.evalscope_source` | 无（不干预） | 否 | 精度框架 evalscope 本地源码路径（节点本地绝对路径）；所在目录自动挂载进容器，并软链到容器内 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装。未配置时不干预：节点预置 `~/.cache/.cache/evalscope` 则同样本地安装，否则回退清华镜像在线安装（需外网）。路径在节点缺失时软链悬空，自动回退在线安装，无害。仅跑评测的节点会用到（单机=node，混布 TP=master，PD 分离=router） |
+| `run.evalscope_source` | （已移除） | — | 精度框架 evalscope 源码已**零配置自动准备**：路径固定 `{workspace}/evalscope`（与 sglang 仓同约定），prepare 阶段执行机浅克隆官方仓一次（staging 非空跳过，自定义版本可直接放入该目录，代理取 `run.env` 的 `http_proxy`/`https_proxy`），再以 sglang 仓同款方式（清理旧目录 + 内网整目录复制）同步到跑测试的节点（单机=node，混布 TP=master，PD 分离=router；worker/PD 节点只起 server 不需要）。节点就绪后容器内非空目录软链到 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装；clone/分发失败或节点无源码时不软链，回退清华镜像在线安装（需外网） |
 
 ### 3.2 nodes 段
 
@@ -81,7 +80,7 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
-| `suites[].name` | 无 | 是 | 用例名称（`--suite` 过滤用） |
+| `suites[].name` | 取 `file` basename 去 `.py` | 否 | 用例名称（`--suite` 过滤用）。未配置时默认取 `file` 的 basename 去掉 `.py`（如 `.../test_npu_qwen3_32b.py` → `test_npu_qwen3_32b`）|
 | `suites[].node` | 无 | 三选一 | 单机用例：执行的节点 host。**nodes 仅定义 1 个节点时可省略**，默认用该节点；多节点时必须显式指定 |
 | `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 7 节）：prefill/decode/router → 节点 |
 | `suites[].multinode` | 无 | 三选一 | 多机混布 TP 用例（第 8 节）：节点列表，第一个 = master |
@@ -112,15 +111,14 @@ sglang 代码仓：只需在**执行机**准备——联网模式流水线自动
 - `no_proxy`/`NO_PROXY`（含全部节点 IP + 协调服务地址 + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
 - `PYTHONPATH=/output`：注入 sitecustomize.py（单机/多机用例一致）——多机用例的 fake kubernetes 协调桥接（见第 7/8 节）+ 关闭 evalscope venv 内 requests 的 SSL 校验（规避企业代理自签证书导致 modelscope 数据集下载报 `CERTIFICATE_VERIFY_FAILED`；仅 venv 进程生效，其余 python 进程无副作用）。
 
-### 3.5 配置示例（联网模式）
+### 3.5 配置示例（仓缺失时由流水线 clone）
 
 ```yaml
 run:
   workspace: /root/sglang_local_pipeline
-  prepare: true                                # 离线改 false, 且 code: 段可整段删除
-  code:
+  code:                                        # 仓存在且非空时整段可删 (流水线不动 git, 直接用现状)
     git_remote: https://github.com/sgl-project/sglang.git
-    ref: main
+    ref: main                                  # 可省: 不配时 clone 用远端默认分支
   docker:
     image: <镜像地址>
 
@@ -131,14 +129,14 @@ nodes:
     arch: a5
 
 suites:
-  - name: qwen3-32b-gsm8k
-    node: 192.168.10.1
+  - node: 192.168.10.1
     file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
     timeout_minutes: 120
+    # name 可省略: 默认取 file basename → test_npu_qwen3_32b
   # 多机用例用 roles / multinode 代替 node, 见第 7/8 节
 ```
 
-### 3.6 最小配置（单节点离线）
+### 3.6 最小配置（单节点，仓已就位）
 
 `nodes` 仅定义 1 个节点时，用例的 `node` 可省略（默认用该节点），单机快速验证的配置精简到：
 
@@ -153,9 +151,9 @@ nodes:
     arch: a3
 
 suites:
-  - name: qwen3-32b-gsm8k
-    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
+  - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py
     timeout_minutes: 120
+    # name/node 均可省略: name 默认取 file basename, node 默认取唯一节点
 ```
 
 注意：该默认仅在**恰好 1 个节点**时生效。多节点配置下用例漏配 `node`/`roles`/`multinode` 会在启动时直接报错（不会静默选择某个节点）。
@@ -206,18 +204,18 @@ date +"%H:%M:%S"            # 输出形如 18:00:00
 ```
 python3 src/run.py
     │
-    ├─ [prepare] 执行机准备代码仓 (唯一 git 操作点, 仅联网模式):
-    │     首次 git clone；remote 指向不符则 set-url
-    │     git fetch origin --tags --force
-    │     git checkout --force {ref}
-    │     分支则 git reset --hard origin/{ref}   # 保证与远端严格一致
-    │     (离线模式: 使用执行机现状, 仅校验 {workspace}/sglang 存在)
+    ├─ [prepare] 执行机准备代码仓 (唯一 git 操作点, 仓缺失时):
+    │     仓存在且非空 ({workspace}/sglang) → 直接使用, 不做任何 git 操作
+    │     仓缺失 + 配了 git_remote → git clone [-b {ref}] {remote} {workspace}/sglang
+    │                                (用 run.env 代理; 只 clone, 不 fetch/checkout/reset;
+    │                                 空目录 = 上轮 clone 失败残留, 重 clone 自愈)
+    │     仓缺失 + 未配 git_remote → 报错提示手动准备
     │
     ├─ [prepare] 每个被用到的节点执行一次（SSH 到节点）:
-    │     (联网) docker image inspect 镜像 || docker pull
-    │     (远程节点, 联网/离线均执行) 清理旧代码仓 rm -rf {workspace}/sglang
+    │     docker image inspect 镜像 || docker pull   # 镜像不存在则尝试 pull, 失败不阻断
+    │     (远程节点) 清理旧代码仓 rm -rf {workspace}/sglang
     │       → 从执行机整仓复制 (tar 经 ssh, 含 .git)
-    │     就绪后清理 sglang 残留（联网/离线均执行）:
+    │     就绪后清理 sglang 残留:
     │       杀宿主机 sglang 进程（pkill -f: python -m sglang.* /
     │         sglang serve / sglang::* worker / sglang_router）
     │       删 sgl-pipeline-* 残留容器（docker rm -f; 同镜像他人容器不删）
@@ -504,11 +502,11 @@ results/{run_id}/
 ## 9. 常见问题
 
 **Q: 改了个人 fork 的分支，节点上的旧仓库会冲突吗？**
-不会。git 操作只发生在执行机（`git remote set-url` 切新 remote 再 fetch；分支用 `reset --hard origin/{ref}` 对齐）；各节点代码每次运行前都会被清理后从执行机整仓复制，不存在节点侧残留冲突。
+不会。仓存在且非空时流水线不动 git（用户自行 `git fetch/checkout/分支切换`）；各节点代码每次运行前都会被清理后从执行机整仓复制，不存在节点侧残留冲突。换 fork 时自己在执行机 `git remote set-url` + `git fetch` 切即可，流水线不干预。
 
 **Q: 节点无法访问 GitHub 怎么办？**
-代码不受影响：git 操作只在执行机做，节点无需外网（代码由流水线从执行机复制过去）。镜像则需节点可达 docker registry，或用离线模式提前手动 `docker pull`。
-离线模式代码也只需在执行机准备好：把代码放到执行机的 `{workspace}/sglang`（如手动 `git clone`），流水线会自动清理各节点旧仓后复制过去。
+代码不受影响：git 操作只在执行机做（且仅仓缺失时才 clone），节点无需外网（代码由流水线从执行机复制过去）。镜像则需节点可达 docker registry，节点缺镜像时流水线会尝试 `docker pull`，失败不阻断——离线节点提前手动 `docker pull` 即可。
+代码也只需在执行机准备好：把代码放到执行机的 `{workspace}/sglang`（如手动 `git clone`），流水线会自动清理各节点旧仓后复制过去。
 gsm8k 数据集默认从 GitHub 在线下载，离线节点可提前下载后放到任意本地目录（如 `/data/datasets/`），再配置 `run.datasets` 指向**绝对路径**——pipeline 自动把所在目录挂载进容器（同路径映射），容器启动时 cp 到 `/tmp/`（文件缺失则忽略，回退在线下载）：
 
 ```yaml
@@ -521,13 +519,13 @@ run:
 未配置 `run.datasets` 时不会预置任何数据集，由用例在线下载或自行读取。单机用例需该 `node` 节点存在该路径；多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，路径不存在时 cp 静默忽略不影响启动。
 
 **Q: 如何测某个特定 commit？**
-`run.code.ref` 改为 commit SHA 即可，checkout 逻辑对分支/tag/SHA 通用。
+仓存在且非空时自己在执行机 `git checkout <commit>` 即可（流水线不动 git）。仓缺失且想让流水线 clone 时指定版本：`run.code.ref` 改为分支/tag/commit SHA（`git clone -b {ref}` 对三者通用）。
 
 **Q: `file` 能配 repo 外的自定义用例吗？**
 能，但用例跑在容器里，文件必须在容器可见的挂载内。最简单的做法：把用例放到节点的 `~/.cache/` 下（随模型缓存挂载进容器），然后 `file` 配绝对路径，如 `/root/.cache/my_tests/test_foo.py`。其他节点路径（如 `/data/...`）容器内不可见，会报 `No such file or directory`。
 
 **Q: 需要登录的私有镜像？**
-在节点上提前 `docker login`，`prepare: true` 即可 pull。
+在节点上提前 `docker login`，节点缺镜像时流水线自动 `docker pull`（私有 registry 已登录即可拉）。
 
 **Q: 只想看会执行什么命令？**
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。

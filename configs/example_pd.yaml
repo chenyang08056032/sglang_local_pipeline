@@ -1,7 +1,7 @@
 # 多机 PD 分离用例模板: prefill/decode 各自拉起服务, router 等 PD 就绪后执行基准测试 (roles 配角色节点)
 # 用法: python3 src/run.py --config configs/example_pd.yaml --dry-run
 # 前置: 节点间 8000/8995/24666 端口互通, 且各节点可达执行机 9377 协调端口 (见 README 7.3)
-# 完整字段与默认值见 README 第 3 节; run 段可选字段 (prepare/code/env/evalscope_source) 见 example_single.yaml
+# 完整字段与默认值见 README 第 3 节; run 段可选字段 (prepare/code/env) 见 example_single.yaml
 
 run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
@@ -23,7 +23,8 @@ nodes:
 suites:
   # PD 分离用例: roles 配角色节点 (与 node/multinode 互斥)
   # prefill/decode 支持多节点 (列表), router 只能单个 (框架限制); router 不占 NPU, 通常复用 P/D 节点
-  - name: dsv4-flash-w8a8-1p1d-16p   # [必填] 用例名称 (--suite 过滤用)
+  # name 可省略: 默认取 file basename; 此处文件名较长故显式配短名
+  - name: dsv4-flash-w8a8-1p1d-16p   # 用例名称 (--suite 过滤用); 省略则取 file basename
     roles:
       prefill: 192.168.10.1         # 拉起 prefill 服务; 字符串=单节点
       decode: 192.168.10.2          # 拉起 decode 服务

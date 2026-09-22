@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import uuid
 import socket
 import subprocess
 import threading
@@ -22,6 +23,9 @@ from urllib.parse import urlparse
 _ARCH_NPUS = {"a3": 16, "a5": 8}
 
 _MGMT_DEVICES = ["/dev/davinci_manager", "/dev/hisi_hdc"]
+
+# evalscope 官方源码仓 (精度框架; prepare 阶段浅克隆到执行机 {workspace}/evalscope)
+_EVALSCOPE_REPO = "https://github.com/modelscope/evalscope.git"
 
 # A3 节点标准挂载 (宿主机:容器), 与运维手册的 docker run 命令保持一致
 _NODE_MOUNTS = [
@@ -76,6 +80,31 @@ def _local_ips():
 def _is_local(node):
     """节点 host 是否指向本机。"""
     return node.host in _local_ips()
+
+
+def _workspace_shared_with_exec(node, workspace, dry_run=False):
+    """检测节点的 {workspace} 是否与执行机同一物理目录 (共享存储如 NFS)。
+
+    用于跳过 sync_repo_to_node / evalscope 分发的 rm+push, 防止共享目录下
+    自毁执行机代码仓。原理: 执行机写唯一标记文件, SSH 到节点检查能否看到,
+    看到即共享 (本机节点调用方已过滤, 此处必为远程)。dry_run 不做探测,
+    返回 False 走默认打印路径。
+    """
+    if dry_run:
+        return False
+    probe = os.path.join(workspace, f".sglang-share-probe-{uuid.uuid4().hex[:8]}")
+    try:
+        open(probe, "w").close()
+    except OSError:
+        return False  # workspace 不存在或不可写, 走 sync 让它正常报错
+    try:
+        rc = ssh_run(node, f"test -f {shlex.quote(probe)}", quiet=True)
+        return rc == 0
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
 
 
 # 容器内 Python logging 行 (asctime,mmm - LEVEL - msg): 控制台改写为与 _log
@@ -712,50 +741,70 @@ class _ExecMachine:
 def prepare_local_repo(cfg, dry_run=False):
     """在执行机上准备 sglang 代码仓 (唯一代码准备点, 各节点代码均由此复制)。
 
-    online: 首次 clone / remote 变更 set-url, fetch + checkout 目标 ref;
-    offline: 使用执行机现状 (需提前手动把代码放到 {workspace}/sglang)。
+    无 prepare 开关, 由 {workspace}/sglang 是否存在且非空决定行为 (与
+    evalscope 同语义; os.listdir 不滤隐藏文件, .git 也算非空):
+      - 存在且非空: 直接使用现状, 不做任何 git 操作 (用户对版本有完全
+        控制, 自行 clone/checkout/分支切换; 流水线不干预)
+      - 不存在/空目录: 用 run.env 配置的代理 (http_proxy/https_proxy)
+        执行原子 clone (先落 {repo}.cloning 临时目录, 成功后清主目录
+        再同分区 rename 发布); 配了 ref 用 git clone -b {ref} (只
+        clone, 不 fetch/checkout/reset); 无 git_remote 时报错提示
+        手动准备。clone 中断只留残骸在 .cloning (下次无条件清理),
+        主目录只有 "缺失/空" 与 "完整" 两种状态, 非空检查不会被
+        半成品误判 (失败重跑即恢复)
     """
     repo = cfg.run.repo
-    if not cfg.run.prepare.online:
+    # 无条件清理上次中断 clone 留下的临时目录 (原子 clone 残骸; dry-run 不动磁盘)
+    if not dry_run:
+        shutil.rmtree(f"{repo}.cloning", ignore_errors=True)
+    if os.path.isdir(repo) and os.listdir(repo):
         if dry_run:
-            print(f"[dry-run] 执行机代码仓 {repo} 使用现状 (离线, "
-                  f"将清理各节点旧仓后复制过去)")
+            print(f"[dry-run] 执行机代码仓 {repo} 已存在且非空, 使用现状 (不做 git 操作)")
             return True
-        if os.path.isdir(repo):
-            _log(f"[prepare] 执行机代码仓就绪 (离线, 使用现状): {repo}")
-            return True
-        _log(f"[错误] 执行机代码仓不存在: {repo}  离线模式需手动准备, 如: "
-             f"git clone <remote> -b <ref> {repo}")
-        return False
+        _log(f"[prepare] 执行机代码仓就绪 (使用现状, 不做 git 操作): {repo}")
+        return True
+
     remote = cfg.run.git_remote
-    _log(f"[prepare] 执行机准备代码仓: {repo} (remote={remote})")
+    if not remote:
+        state = "不存在" if not os.path.isdir(repo) else "为空目录"
+        if dry_run:
+            print(f"[dry-run] 执行机代码仓 {repo} {state} 且未配 run.code.git_remote, "
+                  f"将报错")
+            return False
+        _log(f"[错误] 执行机代码仓{state}: {repo}  且未配 run.code.git_remote, "
+             f"无法 clone; 手动准备如: git clone <remote> -b <ref> {repo}")
+        return False
+
+    # 代理显式取 run.env (http_proxy 等): 该配置只注入容器, 执行机 shell 拿不到
+    proxy_env = " ".join(
+        f"{k}={shlex.quote(str(cfg.run.env[k]))}"
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+        if cfg.run.env.get(k))
+    proxy_prefix = f"env {proxy_env} " if proxy_env else ""
+
     q_repo = shlex.quote(repo)
+    q_tmp = shlex.quote(f"{repo}.cloning")  # 临时目录与主目录同父, mv 必为同分区 rename
     q_remote = shlex.quote(remote)
-    lines = ["set -e"]
-    # remote 变更时改指向 (保留仓库对象, 免重新 clone); 首次则 clone
-    lines.append(
-        f"if [ -d {q_repo}/.git ]; then\n"
-        f"  cd {q_repo}\n"
-        f"  [ \"$(git remote get-url origin)\" = {q_remote} ] || "
-        f"git remote set-url origin {q_remote}\n"
-        f"  cd - >/dev/null\n"
-        f"else\n"
-        f"  git clone {q_remote} {q_repo}\n"
-        f"fi"
-    )
-    # fetch 只更新 origin/* 指针; checkout 切版本; 分支还需 reset --hard 对齐远端
-    # (否则本地分支停在旧提交, checkout 到的是旧代码)。tag/commit 不 reset。
-    _log(f"[prepare] 执行机 git fetch + checkout {cfg.run.ref}")
-    q_ref = shlex.quote(cfg.run.ref)
-    lines.append(f"cd {q_repo} && git fetch origin --tags --force")
-    lines.append(f"git checkout --force {q_ref}")
-    lines.append(f"if git show-ref --verify --quiet refs/remotes/origin/{q_ref}; then "
-                 f"git reset --hard origin/{q_ref}; fi")
-    rc = ssh_run(_ExecMachine(), "\n".join(lines), dry_run=dry_run)
+    ref = cfg.run.ref
+    # 只 clone, 不做 fetch/checkout/reset: 用户对版本有完全控制, 流水线
+    # 仅在仓不存在时帮忙拉一份默认/指定 ref 的代码; 后续版本切换由用户做。
+    # 原子 clone: 成功后才清主目录 (此时必为空/缺失) 并 rename 发布,
+    # 中断只留残骸在 .cloning, 主目录不会出现非空半成品
+    ref_desc = f", ref={ref}" if ref else ""
+    _log(f"[prepare] 执行机 clone 代码仓: {repo} (remote={remote}{ref_desc})")
+    ref_opt = f" -b {shlex.quote(ref)}" if ref else ""
+    # 清主目录 + mv 单独成段: clone 失败时 rm/mv 不执行, 主目录保持缺失/空
+    cmd = (f"{proxy_prefix}git clone{ref_opt} {q_remote} {q_tmp} "
+           f"&& rm -rf {q_repo} && mv {q_tmp} {q_repo}")
+    if dry_run:
+        print(f"[dry-run] {cmd}")
+        return True
+    rc = ssh_run(_ExecMachine(), cmd)
     if rc == 0:
-        _log(f"[prepare] 执行机代码仓就绪: ref={cfg.run.ref}")
+        _log(f"[prepare] 执行机代码仓就绪: {repo}")
     else:
-        _log(f"[prepare] 执行机代码仓准备失败 (rc={rc}), 详见上方输出")
+        _log(f"[prepare] 执行机代码仓 clone 失败 (rc={rc}), 详见上方输出; "
+             f"或手动准备: git clone {remote} -b {ref or '<branch>'} {repo}")
     return rc == 0
 
 
@@ -780,29 +829,109 @@ def sync_repo_to_node(cfg, node, dry_run=False):
     return True
 
 
+def prepare_evalscope(cfg, master_hosts, dry_run=False):
+    """准备 evalscope 源码 (固定 {workspace}/evalscope, 与 sglang 仓同约定)。
+
+    与 sglang 仓同模式 (执行机唯一 git 点 + 同路径内网分发): 各节点不 clone
+    (慢且需外网); 分发与 sync_repo_to_node 一致——先清理节点旧目录再整目录
+    复制, 节点内容与执行机严格一致。自定义版本直接放执行机 {workspace}/evalscope
+    (非空即跳过 clone, 同样被分发)。master_hosts 只含跑测试的节点 (单机=node,
+    PD 分离=router, 混布 TP=第一个节点); worker/PD 节点只起 server 不装精度
+    框架 (与 run.datasets 仅测试节点需要同理)。
+    staging 幂等: 非空跳过 clone (跨 run 复用, rm -rf 后重跑可强制刷新)。
+    clone 为原子式 (先 .cloning 后 rename), 中断不留半成品, 下次重跑自愈。
+    clone 失败整体跳过分发 (离线执行机无外网时的预期降级; 节点无源码 →
+    容器内软链不生效 → run_evalscope.sh 回退在线安装); 单节点清理/复制失败
+    不阻断, 该节点同样回退在线安装。
+    """
+    if not master_hosts:
+        return
+    staging = f"{cfg.run.workspace}/evalscope"
+    q_staging = shlex.quote(staging)
+    # ---- 执行机 staging ----
+    # 代理显式取 run.env (http_proxy 等): 该配置只注入容器, 执行机 shell 拿不到
+    proxy_env = " ".join(
+        f"{k}={shlex.quote(str(cfg.run.env[k]))}"
+        for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
+        if cfg.run.env.get(k))
+    proxy_prefix = f"env {proxy_env} " if proxy_env else ""
+    # 原子 clone 临时目录 (与主目录同父, mv 必为同分区 rename)
+    q_tmp = shlex.quote(f"{staging}.cloning")
+    # 原子 clone: 先落 .cloning, 成功后清主目录 (此时必为空/缺失) 再 rename
+    # 发布——主目录只有 "缺失/空" 与 "完整" 两种状态, clone 中断只留残骸在
+    # .cloning (下次无条件清理), 不会被非空检查误判为就绪
+    lines = ["set -e",
+             f"rm -rf {q_tmp}",
+             f'if [ -d {q_staging} ] && [ -n "$(ls -A {q_staging})" ]; then',
+             '  echo "evalscope staging 已存在, 跳过 clone"',
+             "else",
+             f"  {proxy_prefix}git clone --depth 1 {_EVALSCOPE_REPO} {q_tmp}",
+             f"  rm -rf {q_staging}",
+             f"  mv {q_tmp} {q_staging}",
+             "fi"]
+    _log(f"[prepare] 执行机准备 evalscope 源码 (staging): {staging}")
+    if ssh_run(_ExecMachine(), "\n".join(lines), dry_run=dry_run) != 0:
+        _log(f"[prepare] evalscope clone 失败, 跳过分发 (各节点回退在线安装); "
+             f"手动命令: git clone --depth 1 {_EVALSCOPE_REPO} {staging}")
+        return
+    # ---- 分发到各测试节点: 清理旧目录 + 整目录复制 (与 sync_repo_to_node 一致) ----
+    for host in master_hosts:
+        node = cfg.find_node(host)
+        # 本机节点: staging 即节点路径 (同为 {workspace}/evalscope), 天然就绪
+        if _is_local(node):
+            continue
+        where = f"{node.user}@{node.host}:{node.port}"
+        # workspace 与执行机共享时 (NFS/共享卷), rm+push 会删执行机的 staging;
+        # 共享即同一物理目录, evalscope 源码天然可见, 跳过分发
+        if _workspace_shared_with_exec(node, cfg.run.workspace, dry_run):
+            _log(f"[prepare] {where} workspace 与执行机共享, 跳过 evalscope 分发 "
+                 f"(源码已在执行机 staging, 共享目录天然可见)")
+            continue
+        _log(f"[prepare] {where} 清理旧 evalscope 源码: {staging}")
+        if ssh_run(node, f"rm -rf {q_staging}", dry_run=dry_run) != 0:
+            _log(f"[prepare] {where} 清理失败, 跳过分发, 该节点回退在线安装; "
+                 f"手动检查: ssh {node.user}@{node.host} 'ls {staging}'")
+            continue
+        _log(f"[prepare] {where} 从执行机分发 evalscope 源码 -> {staging}")
+        if ssh_push_dir(node, staging, staging, dry_run=dry_run) != 0:
+            _log(f"[prepare] {where} evalscope 源码分发失败, 该节点回退在线安装; "
+                 f"手动检查: ssh {node.user}@{node.host} 'ls {staging}'")
+
+
 def prepare_node(cfg, node, dry_run=False):
     """执行前准备一个节点。
 
     代码仓统一在执行机准备 (prepare_local_repo) 并复制到各节点
     (sync_repo_to_node), 节点侧不做 git 操作 (节点无需外网):
-      - online=true: 镜像不存在则 pull;
-      - 远程节点: 清理旧代码仓 + 从执行机整仓复制 (联网/离线均执行);
+      - 镜像: 不存在则尝试 docker pull; 失败不阻断 (节点可能离线,
+        镜像应手动 docker pull 就位; 执行时若仍缺, docker run 自然报错);
+      - 远程节点: 清理旧代码仓 + 从执行机整仓复制;
       - 执行机自身: 代码已在 prepare_local_repo 就位, 无需复制。
     """
     where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
-    if cfg.run.prepare.online:
-        # 镜像不存在才 pull
-        _log(f"[prepare] {where} 检查镜像 (不存在则 pull): {cfg.run.docker.image}")
-        image = shlex.quote(cfg.run.docker.image)
-        lines = ["set -e",
-                 f"docker image inspect {image} >/dev/null 2>&1 "
-                 f"|| docker pull {image}"]
-        rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
-        if rc != 0:
-            _log(f"[prepare] {where} 失败 (rc={rc}), 详见上方节点输出")
+    # 镜像不存在则尝试 pull; 失败不阻断 (节点可能离线, 镜像应手动准备):
+    # 用 if + || true 让 pull 失败也不影响整体 rc, 只打日志提示手动准备
+    _log(f"[prepare] {where} 检查镜像 (不存在则尝试 pull): {cfg.run.docker.image}")
+    image = shlex.quote(cfg.run.docker.image)
+    lines = [
+        f"if ! docker image inspect {image} >/dev/null 2>&1; then",
+        f"  echo '[prepare] 镜像不存在, 尝试 pull: {cfg.run.docker.image}'",
+        f"  if ! docker pull {image}; then",
+        f"    echo '[prepare] 镜像 pull 失败, 不阻断; 如节点离线请手动准备: docker pull {cfg.run.docker.image}'",
+        f"  fi",
+        f"fi",
+    ]
+    rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    # pull 失败不阻断 (rc 由 if/|| true 兜底为 0, 这里仅 ssh 自身失败才 != 0);
+    # 但 ssh 失败意味着节点不可达, sync_repo_to_node 也会失败, 让它去报错
+    if not _is_local(node):
+        # workspace 与执行机共享时 (NFS/共享卷), rm+push 会删执行机自己的仓;
+        # 共享即节点与执行机同一物理目录, 代码天然一致, 跳过 sync
+        if _workspace_shared_with_exec(node, cfg.run.workspace, dry_run):
+            _log(f"[prepare] {where} workspace 与执行机共享, 跳过代码同步 "
+                 f"(sglang 仓已在执行机准备, 共享目录天然可见)")
+        elif not sync_repo_to_node(cfg, node, dry_run):
             return False
-    if not _is_local(node) and not sync_repo_to_node(cfg, node, dry_run):
-        return False
     _log(f"[prepare] {where} 就绪 (代码来自执行机 {cfg.run.repo})")
     return True
 
@@ -884,14 +1013,15 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     # K8s 把代码卷挂在 /root/sglang 对齐; 本地 repo 在 {workspace}/sglang, 建软链
     # 让硬编码路径落到实际 repo (ln -sfn 覆盖既有目录/链接, 可重复执行)
     parts.append(f"ln -sfn {q_repo} /root/sglang")
-    # evalscope 本地源: run_evalscope.sh 硬编码检查 /root/.cache/.cache/evalscope,
-    # 配置了 run.evalscope_source 则软链过去 (所在目录已挂载, 见下方 mount_args)。
-    # 不直接 -v 挂载到目标路径: 节点缺该路径时 docker 建空目录, [ -d ] 误命中后
-    # pip install -e 空目录报错; 软链悬空时 [ -d ] 为 false, 正确回退在线安装
-    if cfg.run.evalscope_source:
-        q_src = shlex.quote(cfg.run.evalscope_source)
-        parts.append(f"mkdir -p /root/.cache/.cache && "
-                     f"ln -sfn {q_src} /root/.cache/.cache/evalscope")
+    # evalscope 本地源 (固定 {workspace}/evalscope, 已同路径挂载见下方 mount_args):
+    # run_evalscope.sh 硬编码检查 /root/.cache/.cache/evalscope, 软链过去实现本地
+    # pip install -e。条件软链 (非空才链): 节点缺源码时 docker 对挂载源建空目录,
+    # 无条件软链会让 [ -d ] 误命中 → pip install -e 空目录报错; 不链则回退在线安装
+    q_ev = shlex.quote(f"{cfg.run.workspace}/evalscope")
+    parts.append(
+        f'if [ -d {q_ev} ] && [ -n "$(ls -A {q_ev})" ]; then '
+        f"mkdir -p /root/.cache/.cache && "
+        f"ln -sfn {q_ev} /root/.cache/.cache/evalscope; fi")
     # 预置数据集到 /tmp (与 CI 一致): /tmp 每次全新挂载, 不预置则会重复下载
     # (gsm8k) 或 perf 套件找不到数据; datasets 为节点本地绝对路径, 所在目录
     # 已自动挂载进容器 (见下方 mount_args); 未配置时跳过, 由用例在线下载或
@@ -929,17 +1059,18 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
 
     mount_args = [
         "-v", shlex.quote(f"{repo}:{repo}"),
+        # evalscope 源码 (与 repo 同模式: 同路径挂载; 节点缺目录时 docker 建空
+        # 目录, 由上方条件软链兜底回退在线安装)
+        "-v", shlex.quote(f"{cfg.run.workspace}/evalscope:"
+                          f"{cfg.run.workspace}/evalscope"),
         "-v", shlex.quote(f"{node_run_dir}:/output"),
         "-v", shlex.quote(f"{node_run_dir}/tmp:/tmp"),
         "-v", shlex.quote(f"{node_run_dir}/plog:/root/ascend/log"),
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
     # datasets 所在目录自动挂载 (同路径映射, 去重), 容器内路径与配置一致,
     # cp 命令直接使用原路径; 与默认挂载重叠时 (如 ~/.cache 下) docker 后挂载
-    # 遮蔽前者, 同一宿主机目录内容一致, 无害; evalscope_source 所在目录同理
-    # (容器内软链指向原路径, 需可见)
+    # 遮蔽前者, 同一宿主机目录内容一致, 无害
     _auto_dirs = [f.rsplit("/", 1)[0] for f in cfg.run.datasets]
-    if cfg.run.evalscope_source:
-        _auto_dirs.append(cfg.run.evalscope_source.rsplit("/", 1)[0])
     for m in dict.fromkeys(_auto_dirs):
         mount_args += ["-v", shlex.quote(f"{m}:{m}")]
     # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;

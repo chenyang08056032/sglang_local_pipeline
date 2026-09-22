@@ -11,15 +11,17 @@ run:
   datasets:                                # 常用: 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载)
     - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # gsm8k; 路径不存在时忽略, 回退在线下载
   # ---- 以下按需取消注释 ----
-  # prepare: true                          # 联网模式: 节点自动 pull 镜像 + 执行机自动 clone 代码 (需配 code 段); 默认 false 离线
-  # code:                                  # 仅 prepare: true 时需要
+  # code:                                  # 执行机 {workspace}/sglang 缺失 (不存在或为空, 如上轮 clone 失败残留) 时,
+  #                                         # 用 run.env 代理执行 git clone 拉一份 (空目录重 clone 自愈);
+  #                                         # 仓存在且非空则不做任何 git 操作 (用户对版本完全控制)。
+  #                                         # 镜像 pull 由节点状态决定: 不存在就尝试 pull, 失败不阻断 (离线节点需提前手动 docker pull)
   #   git_remote: https://github.com/sgl-project/sglang.git
-  #   ref: main
+  #   ref: main                            # 可选: clone -b {ref}; 不配则用远端默认分支
   # env:                                   # 覆盖/追加内置 7 项容器环境变量 (默认值见 README 3.4), 不配则用内置默认
   #   STREAMS_PER_DEVICE: "32"
   # a5_env:                                # 仅 a5 节点单机用例容器注入 (覆盖 env 同名键), 多机用例不注入
   #   ASCEND_USE_FIA: "1"                  # A5 灵衢互联 (FIA) 开启
-  # evalscope_source: /root/evalscope      # 精度框架 evalscope 本地源码路径; 不配则回退在线安装 (仅精度用例需要)
+  # evalscope 无需配置: 精度用例 (如 gpqa/gsm8k) 的源码自动准备到 {workspace}/evalscope 并同步到测试节点
 
 nodes:
   - host: 192.168.10.1   # [必填] 节点 IP; 指向执行机本身时自动本地执行 (不走 SSH)
@@ -31,7 +33,7 @@ nodes:
 
 suites:
   # 单机用例: node 指定执行节点 (与 roles/multinode 互斥, 见 example_pd.yaml / example_tp.yaml)
-  - name: test_npu_qwen3_32b   # [必填] 用例名称 (--suite 过滤用)
-    file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例文件路径, 相对 repo; 绝对路径须在容器可见挂载内
+  # name 可省略: 默认取 file basename → test_npu_qwen3_32b; node 在单节点时也可省略
+  - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例文件路径, 相对 repo; 绝对路径须在容器可见挂载内
     timeout_minutes: 60        # docker run 超时 (分钟), 默认 60
     node: 192.168.10.1         # 执行节点; nodes 仅定义 1 个节点时可省略

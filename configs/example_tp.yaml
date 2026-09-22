@@ -1,7 +1,7 @@
 # 多机混布 TP 用例模板: 多节点组成一个 sglang server 实例 (TP 跨节点), 无 PD/router 角色 (multinode 配节点列表)
 # 用法: python3 src/run.py --config configs/example_tp.yaml --dry-run
 # 前置: 节点间互通, 且各节点可达执行机 9377 协调端口 (见 README 8.3)
-# 完整字段与默认值见 README 第 3 节; run 段可选字段 (prepare/code/env/evalscope_source) 见 example_single.yaml
+# 完整字段与默认值见 README 第 3 节; run 段可选字段 (prepare/code/env) 见 example_single.yaml
 
 run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
@@ -11,7 +11,7 @@ run:
       - "/data/weights/GLM-5.2-w8a8:/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
   datasets:                                # 常用: 预置到容器 /tmp/ 的数据集; 仅 master (列表第一个) 节点需要存在
     - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
-  # evalscope_source: /root/evalscope      # 精度用例 (如 gpqa/gsm8k) 建议配: evalscope 本地源码路径, 免在线安装
+  # evalscope 无需配置: 精度用例源码自动准备到 {workspace}/evalscope 并同步到 master 节点
 
 nodes:
   - host: 192.168.10.1   # [必填] master (A3, 16 卡)
@@ -22,7 +22,7 @@ nodes:
 suites:
   # 混布 TP 用例: multinode 配节点列表 (与 node/roles 互斥)
   # 第一个 = master (起 server + 跑测试), 其余 = worker (只起 server)
-  - name: glm5_2-16p-gpqa   # [必填] 用例名称 (--suite 过滤用)
-    multinode: [192.168.10.1, 192.168.10.2]   # [必填] 节点列表 (≥2 个, 第一个 = master)
+  # name 可省略: 默认取 file basename → test_npu_glm_5_2_w8a8_16p_gpqa
+  - multinode: [192.168.10.1, 192.168.10.2]   # [必填] 节点列表 (≥2 个, 第一个 = master)
     file: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py   # [必填] 用例文件路径, 相对 repo
     timeout_minutes: 120    # 节点容器超时 (分钟), 默认 60; worker 实际再加 2 分钟余量
