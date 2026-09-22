@@ -7,10 +7,10 @@ run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
   docker:
     image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
-    extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载; 所有节点均需预置模型缓存或挂载
-      - "/data/weights/GLM-5.2-w8a8:/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
-  datasets:                                # 常用: 预置到容器 /tmp/ 的数据集; 仅 master (列表第一个) 节点需要存在
-    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
+  # extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载; 所有节点均需预置模型缓存或挂载
+  #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
+  # datasets:                              # 常用: 预置到容器 /tmp/ 的数据集; 仅 master (列表第一个) 节点需要存在
+  #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
   # evalscope 无需配置: 精度用例源码自动准备到 {workspace}/evalscope 并同步到 master 节点
 
 nodes:

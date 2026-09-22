@@ -6,10 +6,10 @@ run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
   docker:
     image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
-    extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载, 追加到默认挂载之后; 不需要可整段删
-      - "/data/weights/DeepSeek-V4-Flash-w8a8:/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8"
-  datasets:                                # 常用: 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载)
-    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # gsm8k; 路径不存在时忽略, 回退在线下载
+  # extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载, 追加到默认挂载之后; 不需要可整段删
+  #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
+  # datasets:                              # 常用: 预置到容器 /tmp/ 的数据集 (节点本地绝对路径, 所在目录自动挂载)
+  #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl   # 路径不存在时忽略, 回退在线下载
   # ---- 以下按需取消注释 ----
   # code:                                  # 执行机 {workspace}/sglang 缺失 (不存在或为空, 如上轮 clone 失败残留) 时,
   #                                         # 用 run.env 代理执行 git clone 拉一份 (空目录重 clone 自愈);

@@ -7,10 +7,10 @@ run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
   docker:
     image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
-    extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载; prefill/decode 节点均需预置模型缓存或挂载
-      - "/data/weights/DeepSeek-V4-Flash-w8a8:/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-w8a8"
-  datasets:                                # 常用: 预置到容器 /tmp/ 的数据集; 仅 router 节点需要存在 (PD 节点只起 server 不读数据集, 缺失自动忽略)
-    - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
+  # extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载; prefill/decode 节点均需预置模型缓存或挂载
+  #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
+  # datasets:                              # 常用: 预置到容器 /tmp/ 的数据集; 仅 router 节点需要存在 (PD 节点只起 server 不读数据集, 缺失自动忽略)
+  #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
 
 nodes:
   - host: 192.168.10.1   # [必填] prefill + router 复用 (A3, 16 卡)
@@ -24,13 +24,13 @@ suites:
   # PD 分离用例: roles 配角色节点 (与 node/multinode 互斥)
   # prefill/decode 支持多节点 (列表), router 只能单个 (框架限制); router 不占 NPU, 通常复用 P/D 节点
   # name 可省略: 默认取 file basename; 此处文件名较长故显式配短名
-  - name: dsv4-flash-w8a8-1p1d-16p   # 用例名称 (--suite 过滤用); 省略则取 file basename
+  - name: dsv4-flash-w8a8-1p1d-16p
     roles:
-      prefill: 192.168.10.1         # 拉起 prefill 服务; 字符串=单节点
-      decode: 192.168.10.2          # 拉起 decode 服务
-      router: 192.168.10.1          # 等 PD 就绪后拉起 router 并执行测试
+      prefill: 192.168.10.1               # 字符串=单节点, 列表=多节点
+      decode: 192.168.10.2
+      router: 192.168.10.1                # 等 PD 就绪后拉起 router 并执行测试
     file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py   # [必填]
-    timeout_minutes: 120            # 角色容器超时 (分钟), 默认 60; prefill/decode 实际再加 2 分钟余量
+    timeout_minutes: 120                  # 角色容器超时 (分钟), 默认 60; prefill/decode 实际再加 2 分钟余量
 
   # 2p2d: prefill/decode 各 2 节点 (列表写法)
   # - name: dsv4-flash-w8a8-2p2d-16p

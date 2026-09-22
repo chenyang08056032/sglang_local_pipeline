@@ -248,7 +248,7 @@ def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
         ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
          "-o", "LogLevel=ERROR",
          "-p", str(node.port), f"{node.user}@{node.host}",
-         f"tar czf - -C '{remote_dir}'{excludes} ."],
+         f"tar czf - -C {shlex.quote(remote_dir)}{excludes} ."],
         stdout=subprocess.PIPE,
     )
     # tar 的 "time stamp in the future" 告警是节点时钟偏差的免费探测器: 逐条刷屏
@@ -482,15 +482,23 @@ def _halve_tp_size(other_args):
     """
     args = list(other_args or [])
     for i, a in enumerate(args):
-        if a != "--tp-size" or i + 1 >= len(args):
-            continue
-        try:
-            tp = int(args[i + 1])
-        except (TypeError, ValueError):
-            continue
-        if tp >= 2:
-            print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
-            args[i + 1] = str(tp // 2)
+        # 支持 --tp-size 8 和 --tp-size=8 两种写法
+        if a == "--tp-size" and i + 1 < len(args):
+            try:
+                tp = int(args[i + 1])
+            except (TypeError, ValueError):
+                continue
+            if tp >= 2:
+                print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
+                args[i + 1] = str(tp // 2)
+        elif a.startswith("--tp-size="):
+            try:
+                tp = int(a.split("=", 1)[1])
+            except (TypeError, ValueError):
+                continue
+            if tp >= 2:
+                print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
+                args[i] = f"--tp-size={tp // 2}"
     return args
 
 
@@ -865,7 +873,7 @@ def prepare_evalscope(cfg, master_hosts, dry_run=False):
              f'if [ -d {q_staging} ] && [ -n "$(ls -A {q_staging})" ]; then',
              '  echo "evalscope staging 已存在, 跳过 clone"',
              "else",
-             f"  {proxy_prefix}git clone --depth 1 {_EVALSCOPE_REPO} {q_tmp}",
+             f"  {proxy_prefix}git clone --depth 1 {shlex.quote(_EVALSCOPE_REPO)} {q_tmp}",
              f"  rm -rf {q_staging}",
              f"  mv {q_tmp} {q_staging}",
              "fi"]
@@ -959,7 +967,7 @@ def cleanup_node_sglang(cfg, node, dry_run=False):
         f"pgrep -af {pattern} || echo '  (无)'",
         f"pkill -9 -f {pattern} 2>/dev/null || true",
         "echo '[cleanup] 残留容器 (sgl-pipeline-*):'",
-        "docker ps -a --filter name=sgl-pipeline- --format '  {.Names} ({.Status})'",
+        "docker ps -a --filter name=sgl-pipeline- --format '  {{.Names}} ({{.Status}})'",
         # xargs -r: 无输入时不执行 (避免空参数报错); rm 失败 stderr 可见, 不阻断
         "docker ps -aq --filter name=sgl-pipeline- "
         "| xargs -r docker rm -f >/dev/null || true",
@@ -1316,9 +1324,8 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                 # PD 节点比 router 多留 2 分钟: router 结束后它们
                 # 还需一个轮询周期 (~30s) 才收到结束信号退出,
                 # 不留余量会被 timeout 误杀造成假失败
-                tmo = (suite.timeout_minutes + 2
-                       if suite.timeout_minutes and role != "router"
-                       else suite.timeout_minutes)
+                base_tmo = suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES
+                tmo = base_tmo + 2 if role != "router" else base_tmo
                 cmd = _build_cmd(cfg, suite, node, node_run_dir,
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)
@@ -1534,9 +1541,8 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                 # worker 比 master 多留 2 分钟: master 结束后 worker
                 # 还需一个轮询周期才收到结束信号退出
                 is_master = key == master_key
-                tmo = (suite.timeout_minutes
-                       if is_master or not suite.timeout_minutes
-                       else suite.timeout_minutes + 2)
+                base_tmo = suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES
+                tmo = base_tmo if is_master else base_tmo + 2
                 cmd = _build_cmd(cfg, suite, node, node_run_dir,
                                  role=key, extra_env=unit_env,
                                  timeout_minutes=tmo)

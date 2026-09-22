@@ -133,8 +133,8 @@ def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
-    run_raw = raw.get("run", {})
-    docker_raw = run_raw.get("docker", {})
+    run_raw = raw.get("run") or {}
+    docker_raw = run_raw.get("docker") or {}
     # list(字符串) 会逐字符拆分, 单条挂载误写成字符串时报清晰错误而非 -v 单字符灾难
     extra_mounts = docker_raw.get("extra_mounts") or []
     if not isinstance(extra_mounts, list):
@@ -142,11 +142,14 @@ def load_config(path):
             f"run.docker.extra_mounts 须为列表 (格式同 docker -v), 如:\n"
             f"  extra_mounts:\n    - \"/data/models:/models\"\n"
             f"实际: {extra_mounts!r}")
+    # 显式空值 (devices: 等 null) 时 .get 的 default 不生效, 需 is None 判断兜底;
+    # 不能用 or: devices 显式空列表 [] 是合法配置 (不挂卡)
+    devices_raw = docker_raw.get("devices")
     docker = DockerConfig(
         image=docker_raw["image"],
-        devices=docker_raw.get("devices", "auto"),
-        net=docker_raw.get("net", "host"),
-        shm_size=docker_raw.get("shm_size", "16g"),
+        devices="auto" if devices_raw is None else devices_raw,
+        net=docker_raw.get("net") or "host",
+        shm_size=docker_raw.get("shm_size") or "16g",
         extra_mounts=list(extra_mounts),
     )
     # a5_env 须为键值映射 (键值自动转字符串, YAML 写 1 即 "1");
@@ -174,23 +177,26 @@ def load_config(path):
             raise ValueError(
                 f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
                 f"请移入子目录: {x!r}")
-    code_raw = run_raw.get("code", {})
+    code_raw = run_raw.get("code") or {}
     git_remote = code_raw.get("git_remote")
 
     workspace = run_raw["workspace"]
+    if not workspace.startswith("/"):
+        raise ValueError(
+            f"run.workspace 须为绝对路径 (以 / 开头), 实际: {workspace!r}")
     run = RunConfig(
         workspace=workspace,
         git_remote=git_remote,
         ref=code_raw.get("ref"),
         docker=docker,
         env={**_DEFAULT_ENV,
-             **{str(k): str(v) for k, v in run_raw.get("env", {}).items()}},
+             **{str(k): str(v) for k, v in (run_raw.get("env") or {}).items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
     )
 
     nodes = []
-    for n in raw.get("nodes", []):
+    for n in raw.get("nodes") or []:
         # arch 必填且须为已知架构 (挂卡数量与 A5 适配都依赖它, 拼错直接报错)
         arch = str(n.get("arch") or "").lower()
         if arch not in _ARCH_NPUS:
@@ -198,15 +204,30 @@ def load_config(path):
                 f"节点 {n['host']}: arch 必填且须为 {'/'.join(_ARCH_NPUS)} 之一 "
                 f"(a3=16 卡, a5=8 卡), 实际 {n.get('arch')!r}")
         nodes.append(NodeConfig(host=n["host"], arch=arch,
-                                user=n.get("user", "root"),
-                                port=n.get("port", 22)))
+                                user=n.get("user") or "root",
+                                port=n.get("port") or 22))
 
     suites = []
-    for s in raw.get("suites", []):
+    seen_names = set()
+    for s in raw.get("suites") or []:
         # name 可省略: 默认取 file basename 去 .py (如 .../test_npu_qwen3_32b.py
         # → test_npu_qwen3_32b), --suite 过滤与目录命名均自然匹配
         file_path = s["file"]
-        name = s.get("name") or os.path.splitext(os.path.basename(file_path))[0]
+        raw_name = s.get("name")
+        # str() 化: YAML 写数字 (name: 123) 时避免后续 re.match/os.path.join 对 int 报错
+        name = (str(raw_name) if raw_name
+                else os.path.splitext(os.path.basename(file_path))[0])
+        # suite name 重复: 容器名/目录名/summary 均按 name 区分, 重复会互相覆盖
+        if name in seen_names:
+            raise ValueError(
+                f"用例 name 重复: {name!r} (容器名/目录名/summary 均按 name 区分, "
+                f"重复会互相覆盖)")
+        seen_names.add(name)
+        # name 用作 docker 容器名 (sgl-pipeline-{name}), 含空格/中文等特殊字符
+        # 会导致 docker 报错; 允许字母数字/下划线/连字符/点
+        if not re.match(r'^[A-Za-z0-9_.-]+$', name):
+            raise ValueError(
+                f"用例 name 只允许字母数字/下划线/连字符/点: {name!r}")
         roles = s.get("roles")
         multinode = s.get("multinode")
         # node / roles / multinode 三选一
@@ -271,7 +292,7 @@ def parse_at(at_str):
     """解析 --at 字符串为目标 datetime。
 
     支持两种格式:
-      - "YYYY-MM-DD HH:MM:SS" (绝对时间)
+      - "YYYY-MM-DD HH:MM:SS" (绝对时间, 已过则立即执行并警告)
       - "HH:MM:SS"            (今天此刻, 已过则取明天)
     """
     now = datetime.datetime.now()
@@ -282,6 +303,9 @@ def parse_at(at_str):
                 dt = dt.replace(year=now.year, month=now.month, day=now.day)
                 if dt <= now:
                     dt += datetime.timedelta(days=1)
+            elif dt <= now:
+                _log(f"[定时] 指定时间 {dt.strftime('%Y-%m-%d %H:%M:%S')} 已过, "
+                     f"立即开始执行")
             return dt
         except ValueError:
             continue
