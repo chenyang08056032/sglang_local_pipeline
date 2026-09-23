@@ -995,11 +995,11 @@ def cleanup_node_sglang(cfg, node, dry_run=False):
 # prepare 阶段 cleanup_node_sglang 按 sgl-pipeline- 前缀清理, 跨 run 残留可自愈
 _SHARED_CONTAINER = "sgl-pipeline-single"
 
-# 共享容器初始化 (vendor 环境/软链/数据集预置/pip 依赖安装) 的轮询间隔与最长等待;
-# 失败/超时会打印 .init.log 尾部辅助定位 (日志经 /output 挂载落在宿主机 runs/ 下)
+# 共享容器初始化 (vendor 环境/软链/数据集预置/pip 依赖安装) 的轮询间隔;
+# 最长等待取 run.init_timeout_minutes (默认 120 分钟, 慢代理冷缓存装依赖
+# 可在 yaml 调大); 失败/超时会打印 .init.log 尾部辅助定位 (日志经 /output
+# 挂载落在宿主机 runs/ 下)
 _INIT_POLL_SEC = 10
-_INIT_WAIT_SEC = 3600  # 60 分钟: 首次冷缓存时 lmms-eval 源码安装 + MMMU 数据集
-                        # 下载 (走代理) 可能超 30 分钟; 二次运行有 ~/.cache 缓存会快很多
 
 
 def _vendor_env_parts():
@@ -1169,7 +1169,8 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
         tmo = _DEFAULT_TIMEOUT_MINUTES
         _log(f"[cmd] {role} @{node.host} 未配 timeout, 使用默认 {tmo} 分钟")
     # -k: SIGTERM 后 60s 仍未退出则 SIGKILL, 防止容器内进程卡死挂住整个 run
-    lines.append(f"timeout -k 60 {int(tmo) * 60} " + " ".join(docker_args))
+    # int(tmo * 60) 而非 int(tmo)*60: 校验允许亚分钟 (如 0.5), 后者会把 30s 截成 0
+    lines.append(f"timeout -k 60 {int(tmo * 60)} " + " ".join(docker_args))
     # [cmd] 每容器一行: 角色@节点+超时 (容器名/输出目录按固定规则可推导,
     # 完整命令看 dry-run 或各角色 ssh.log; 多机并发时靠 host 区分归属)
     _log(f"[cmd] {role} @{node.host} 超时={tmo}分钟")
@@ -1191,16 +1192,24 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     # 对齐 CI Install dependencies 步骤): 每行一条命令, 装进容器系统 python
     # (用例同解释器), 每节点只装一次, 该节点全部单机用例复用; 命令行由 run.py
     # 加载配置时读入 (注释/空行已剔除), 此处无需再解析文件。
+    # 每条命令打进度行进 .init.log (开始执行/结束+耗时): 装得慢时定位卡在
+    # 哪条全靠它 (等待期间控制台也每分钟回显最新一条, 见 _wait_init);
     # 单条失败不终止初始化: "{ cmd; } || echo WARN" 逐条兜底 —— 花括号组在
     # 当前 shell 执行 (cd/变量状态对后续行延续), || 接住非零返回码打 WARN 进
-    # .init.log 后继续下一条 (依赖缺失的影响留给用例自身暴露); WARN 内嵌命令
-    # 原文, 单引号转义防变量在 echo 处被展开
+    # .init.log 后继续下一条 (依赖缺失的影响留给用例自身暴露); 开始/WARN 行
+    # 内嵌命令原文, 单引号转义防变量在 echo 处被展开
     n_pip = len(cfg.run.pip_cmds)
-    init += [
-        "{ %s; } || echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'"
-        % (c, i, n_pip, c.replace("'", "'\\''"))
-        for i, c in enumerate(cfg.run.pip_cmds, 1)
-    ]
+    for i, c in enumerate(cfg.run.pip_cmds, 1):
+        q = c.replace("'", "'\\''")
+        init += [
+            f"echo '[pip_deps] [{i}/{n_pip}] 开始执行: {q}'",
+            "_pip_t0=$(date +%s)",
+            "{ %s; } || echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'"
+            % (c, i, n_pip, q),
+            # 结束行双引号: 让 $(( $(date +%s) - _pip_t0 )) 在容器内展开算耗时
+            'echo "[pip_deps] [%d/%d] 结束, 耗时 $(( $(date +%s) - _pip_t0 ))s"'
+            % (i, n_pip),
+        ]
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
         " > /output/.init.log 2>&1\n"
@@ -1259,7 +1268,8 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     parts += _vendor_env_parts()
     parts.append(
         f"cd {shlex.quote(cfg.run.repo)} && "
-        f"timeout -k 60 {int(tmo) * 60} python3 -u {py} -f "
+        # int(tmo * 60) 而非 int(tmo)*60: 亚分钟 (如 0.5) 不被截成 0 秒
+        f"timeout -k 60 {int(tmo * 60)} python3 -u {py} -f "
         f"> {log_f} 2>&1 & _case_pid=$!")
     parts.append(f"tail -f {log_f} --pid=$_case_pid")
     # 退出码透传: wait 失败不经 set -e 提前退出 (|| 接住), 保证 plog 拷贝执行
@@ -1274,7 +1284,9 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     return "\n".join([
         "set -e",
         f"mkdir -p {shlex.quote(node_run_dir)}",
-        f"timeout -k 60 {int(tmo) * 60 + 300} docker exec "
+        # 外层超时 = 内层 + 300s (兜底 docker exec 客户端 hang); 亚分钟取整
+        # 规则同内层: int(tmo * 60)
+        f"timeout -k 60 {int(tmo * 60) + 300} docker exec "
         + (" ".join(exec_env) + " " if exec_env else "")
         + f"{container} bash -c '{inner_escaped}'",
     ])
@@ -1336,10 +1348,18 @@ class SingleNodeContainers:
 
     def _wait_init(self, node, runs_dir):
         """轮询初始化标记 (.init-ok/.init-fail 经 /output 挂载落在宿主机
-        runs/ 下, 直接查宿主机路径, 不经 docker exec)。"""
+        runs/ 下, 直接查宿主机路径, 不经 docker exec)。等待期间每分钟回显
+        .init.log 最新一条 pip 进度行 (装得慢时无需 ssh 上节点 tail)。"""
         q_runs = shlex.quote(runs_dir)
         alive_cmd = (f"docker inspect -f '{{{{.State.Running}}}}' "
                      f"{_SHARED_CONTAINER} | grep -qx true")
+        # 最长等待可配 (run.init_timeout_minutes, 默认 120 分钟): 慢代理
+        # 冷缓存装依赖可能很久, 不够在 yaml 调大
+        wait_sec = self._cfg.run.init_timeout_minutes * 60
+        # 最新 pip 进度行 (开始/结束/WARN 行都匹配); 早期阶段 (vendor 环境
+        # 等) 尚无 pip 行时无输出; 管道 rc 取 tail 恒为 0, 不触发失败回显
+        prog_cmd = (f"grep -F '[pip_deps] [' {q_runs}/.init.log 2>/dev/null"
+                    f" | tail -1")
         tic = time.perf_counter()
         last_note = 0.0
         while True:
@@ -1357,14 +1377,15 @@ class SingleNodeContainers:
             # 容器本身退出 (镜像缺 bash/OOM 等): 轮询会一直落空, 主动检出
             if ssh_run(node, alive_cmd, quiet=True, silent=True) != 0:
                 self._fail(node, runs_dir, "容器意外退出")
-            if time.perf_counter() - tic > _INIT_WAIT_SEC:
-                self._fail(node, runs_dir,
-                           f"初始化超时 (>{_INIT_WAIT_SEC}s)")
+            if time.perf_counter() - tic > wait_sec:
+                self._fail(node, runs_dir, f"初始化超时 (>{wait_sec:g}s)")
             if time.perf_counter() - last_note >= 60:
                 last_note = time.perf_counter()
                 _log(f"[execute] 共享容器初始化中... (已等 "
-                     f"{int(time.perf_counter() - tic)}s, "
-                     f"最长 {_INIT_WAIT_SEC}s)")
+                     f"{int(time.perf_counter() - tic)}s, 最长 {wait_sec:g}s)")
+                # silent: 不打 [ssh] 连接诊断 (每分钟 2 行纯噪音), 输出流
+                # 本身非 quiet 仍上控制台 → 只多出进度行这一行
+                ssh_run(node, prog_cmd, silent=True)
             time.sleep(_INIT_POLL_SEC)
 
     def _report_pip_warns(self, node, runs_dir):
@@ -1657,14 +1678,6 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         for t in threads.values():
             t.join()
 
-        # 兜底清理本用例全部角色容器: 宿主机 timeout 只杀 docker 客户端,
-        # 容器本体不会自停; 上方 grace 强杀仅覆盖线程仍存活的角色, 客户端
-        # 先死的 (角色自身超时 rc=124) 不在其列, 留下即孤儿占卡。正常退出
-        # (--rm) 或已删的容器 rm -f 幂等无副作用; dry_run 不执行
-        if not dry_run:
-            for (r, i, n), k in zip(units, keys):
-                _kill_container(n, f"sgl-pipeline-{suite.name}-{k}")
-
         for key in keys:
             dur = durs.get(key, "?")
             if errs.get(key):
@@ -1715,6 +1728,15 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         result["error"] = f"{type(e).__name__}: {e}"
         _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
     finally:
+        # 兜底清理本用例全部角色容器: 放 finally 保证异常/中断 (KeyboardInterrupt
+        # 不走 except Exception) 路径同样清理——宿主机 timeout 只杀 docker 客户端,
+        # 容器本体不会自停; 上方 grace 强杀仅覆盖线程仍存活的角色, 客户端先死的
+        # (角色自身超时 rc=124) 不在其列, 留下即孤儿占卡占名。容器未启动时
+        # rm -f 幂等无副作用; dry_run 不执行; 先杀容器再停协调服务 (容器死亡
+        # 前的轮询请求仍可达)
+        if not dry_run:
+            for (r, i, n), k in zip(units, keys):
+                _kill_container(n, f"sgl-pipeline-{suite.name}-{k}")
         coord.stop()
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
     return result
@@ -1855,12 +1877,6 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
         for t in threads.values():
             t.join()
 
-        # 兜底清理本用例全部角色容器 (同 PD 分离: grace 强杀只覆盖线程仍
-        # 存活的角色, 客户端先死的不在其列); rm -f 幂等, dry_run 不执行
-        if not dry_run:
-            for (i, n), k in zip(units, keys):
-                _kill_container(n, f"sgl-pipeline-{suite.name}-{k}")
-
         for key in keys:
             dur = durs.get(key, "?")
             if errs.get(key):
@@ -1908,6 +1924,12 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
         result["error"] = f"{type(e).__name__}: {e}"
         _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
     finally:
+        # 兜底清理本用例全部角色容器 (同 PD 分离: 放 finally 保证异常/中断路径
+        # 同样清理, grace 强杀只覆盖线程仍存活的角色, 客户端先死的不在其列);
+        # rm -f 幂等无副作用, dry_run 不执行, 先杀容器再停协调服务
+        if not dry_run:
+            for (idx, node), k in zip(units, keys):
+                _kill_container(node, f"sgl-pipeline-{suite.name}-{k}")
         coord.stop()
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
     return result

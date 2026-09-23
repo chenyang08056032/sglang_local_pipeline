@@ -13,6 +13,7 @@
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -94,6 +95,9 @@ class RunConfig:
     # 固定路径零配置: 文件存在即生效, 不存在跳过; # 注释/空行剔除后逐条嵌入
     # 容器初始化脚本, 如 CI Install dependencies 步骤的 pip install ...)
     pip_cmds: List[str] = field(default_factory=list)
+    # 单机共享容器初始化 (vendor 环境/软链/数据集/pip 依赖安装) 的最长等待
+    # (分钟): 慢代理冷缓存时 pip 依赖安装可能很久, 60 分钟不够用可调大
+    init_timeout_minutes: float = 120
 
     @property
     def repo(self):
@@ -131,6 +135,23 @@ class PipelineConfig:
             if n.host == host:
                 return n
         return None
+
+
+def _positive_minutes(val):
+    """超时分钟数归一化 + 校验: 数字字符串转 float; 非正数/非数值 (含 YAML
+    bool, 是 int 子类, 不拦会算出 int(True)*60=60 秒的陷阱)/NaN/Infinity
+    (YAML .nan/.inf 解析为 float, 与 0 比较恒 False 绕过 <=0 拦截; NaN 会让
+    等待循环 elapsed > wait_sec 恒不成立, 初始化永不超时) 抛 ValueError;
+    调用方负责在报错信息里带上字段名。"""
+    if isinstance(val, str):
+        try:
+            val = float(val)
+        except ValueError:
+            pass
+    if (isinstance(val, bool) or not isinstance(val, (int, float))
+            or not math.isfinite(val) or val <= 0):
+        raise ValueError(f"须为正数 (分钟), 实际: {val!r}")
+    return val
 
 
 def load_config(path):
@@ -235,6 +256,13 @@ def load_config(path):
     if not workspace.startswith("/"):
         raise ValueError(
             f"run.workspace 须为绝对路径 (以 / 开头), 实际: {workspace!r}")
+    # 初始化最长等待 (分钟), 校验同用例 timeout_minutes (正数; 默认 120)
+    itmo = run_raw.get("init_timeout_minutes")
+    if itmo is not None:
+        try:
+            itmo = _positive_minutes(itmo)
+        except ValueError as e:
+            raise ValueError(f"run.init_timeout_minutes {e}")
     run = RunConfig(
         workspace=workspace,
         git_remote=git_remote,
@@ -245,19 +273,26 @@ def load_config(path):
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
         pip_cmds=pip_cmds,
+        init_timeout_minutes=120 if itmo is None else itmo,
     )
 
     nodes = []
     for n in raw.get("nodes") or []:
         if not isinstance(n, dict):
             raise ValueError(f"nodes 条目须为键值映射 (host/arch/...), 实际: {n!r}")
+        # host 须为非空字符串: YAML 裸数字 (如 host: 123) 解析为 int, 透传到
+        # ssh 阶段才报错且信息晦涩; 缺失同理 (n["host"] 裸 KeyError)
+        host = n.get("host")
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError(
+                f"节点 host 须为非空字符串 (SSH 主机名/IP), 实际: {host!r}")
         # arch 必填且须为已知架构 (挂卡数量与 A5 适配都依赖它, 拼错直接报错)
         arch = str(n.get("arch") or "").lower()
         if arch not in _ARCH_NPUS:
             raise ValueError(
-                f"节点 {n['host']}: arch 必填且须为 {'/'.join(_ARCH_NPUS)} 之一 "
+                f"节点 {host}: arch 必填且须为 {'/'.join(_ARCH_NPUS)} 之一 "
                 f"(a3=16 卡, a5=8 卡), 实际 {n.get('arch')!r}")
-        nodes.append(NodeConfig(host=n["host"], arch=arch,
+        nodes.append(NodeConfig(host=host, arch=arch,
                                 user=n.get("user") or "root",
                                 port=n.get("port") or 22))
 
@@ -327,6 +362,25 @@ def load_config(path):
                 elif not isinstance(val, list):
                     raise ValueError(
                         f"用例 {name}: roles.{r} 须为字符串或列表, 实际 {type(val).__name__}")
+                # 空列表拦截: router: [] 会在执行期 KeyError 'router-0',
+                # prefill: [] 则缺 pod 到运行期才暴露, 均提前为配置错误
+                if not val:
+                    raise ValueError(
+                        f"用例 {name}: roles.{r} 须至少配 1 个节点, 实际为空")
+                # 条目须为非空字符串 (与 nodes.host 同规则): 非字符串 (YAML 裸
+                # 数字等) 永远匹配不到节点定义, 嵌套结构还会让下方 set() 抛
+                # 晦涩 TypeError
+                if not all(isinstance(x, str) and x.strip() for x in val):
+                    raise ValueError(
+                        f"用例 {name}: roles.{r} 条目须为非空字符串 (节点 host), "
+                        f"实际: {val!r}")
+                # 同一角色内节点重复: 同节点起两个同角色容器 (host 网络 + 全量
+                # 挂卡) 必然端口/NPU 冲突; 跨角色复用节点是合法配置
+                # (如 router 复用 prefill 节点), 不在此拦
+                if len(set(val)) != len(val):
+                    raise ValueError(
+                        f"用例 {name}: roles.{r} 节点重复 {val!r} "
+                        f"(同角色多容器同节点必冲突; 跨角色复用节点是合法的)")
                 if r == "router" and len(val) > 1:
                     raise ValueError(
                         f"用例 {name}: router 角色只支持单个节点, "
@@ -338,21 +392,24 @@ def load_config(path):
                 raise ValueError(
                     f"用例 {name}: multinode 须为 ≥2 个节点的列表"
                     f" (单节点请用 node)")
-        # timeout_minutes 须为正数 (分钟): YAML 的 true 是 bool (int 子类),
-        # 不拦会算出 int(True)*60=60 秒的超时陷阱; 非数值/负数也在此报配置
-        # 错误, 而非执行期才炸 (用例记 error); 数字字符串 "120" 归一化兼容
+            # 条目须为非空字符串 (与 nodes.host 同规则, 理由同 roles 条目检查)
+            if not all(isinstance(x, str) and x.strip() for x in multinode):
+                raise ValueError(
+                    f"用例 {name}: multinode 条目须为非空字符串 (节点 host), "
+                    f"实际: {multinode!r}")
+            # 同 multinode 内节点重复: 同节点两个 TP 容器 (host 网络 + 全量
+            # 挂卡) 端口/NPU 必冲突, 提前为配置错误
+            if len(set(multinode)) != len(multinode):
+                raise ValueError(
+                    f"用例 {name}: multinode 节点重复 {multinode!r}")
+        # timeout_minutes 须为正数 (分钟), 非法值启动期报配置错误而非执行期
+        # 才炸 (用例记 error); 数字字符串 "120" 归一化兼容
         tmo_raw = s.get("timeout_minutes")
-        if isinstance(tmo_raw, str):
+        if tmo_raw is not None:
             try:
-                tmo_raw = float(tmo_raw)
-            except ValueError:
-                pass
-        if (tmo_raw is not None
-                and (isinstance(tmo_raw, bool)
-                     or not isinstance(tmo_raw, (int, float)) or tmo_raw <= 0)):
-            raise ValueError(
-                f"用例 {name}: timeout_minutes 须为正数 (分钟), "
-                f"实际: {s.get('timeout_minutes')!r}")
+                tmo_raw = _positive_minutes(tmo_raw)
+            except ValueError as e:
+                raise ValueError(f"用例 {name}: timeout_minutes {e}")
         suites.append(SuiteConfig(
             name=name, node=node, file=file_path,
             timeout_minutes=tmo_raw,

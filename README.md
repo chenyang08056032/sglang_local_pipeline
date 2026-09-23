@@ -112,6 +112,7 @@ sglang_local_pipeline/
 | `run.env` | 内置 7 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 数据集路径列表（节点本地**绝对路径**），容器启动后 cp 到 `/tmp/`，缺失则回退在线下载。详见下方说明 ① |
+| `run.init_timeout_minutes` | `120` | 否 | 单机共享容器初始化（vendor 环境/软链/数据集/pip 依赖安装）的最长等待（分钟）。慢代理冷缓存时依赖安装可能很久，不够可调大；等待期间控制台每分钟回显最新一条 `[pip_deps]` 进度行，超时失败并屏显 `.init.log` 尾部 |
 
 ① **datasets**：所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略、回退在线下载。单机用例需该 `node` 节点存在该路径；多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，路径不存在时 cp 静默忽略。示例：
 
@@ -126,7 +127,7 @@ run:
 
 ③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置）并逐条执行 `configs/pip_deps.txt` 里的安装命令，随后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
 
-依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源，慢时可配镜像源/代理（都是 `run.env` 加环境变量，`pip_deps.txt` 无需改动，用例内的 pip 调用同样生效）：`PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"`（pip 原生识别；清华等公网源仍需 `http_proxy` 出网），内网源（如华为 mirrors.huawei.com）直连更快但须把源域名加入 `run.env` 的 `no_proxy`（流水线会自动拼接节点/协调地址，显式配置的值保留在前）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
+依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**每条命令执行前后在 `.init.log` 打进度行**（`[pip_deps] [i/N] 开始执行: <命令原文>` / `[pip_deps] [i/N] 结束, 耗时 Xs`），装得慢时靠它定位卡在哪条，等待期间控制台每分钟自动回显最新一条（无需 ssh 上节点 tail）；**初始化最长等待 `run.init_timeout_minutes`（默认 120 分钟）**，超时失败并屏显 `.init.log` 尾部；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源，慢时可配镜像源/代理（都是 `run.env` 加环境变量，`pip_deps.txt` 无需改动，用例内的 pip 调用同样生效）：`PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"`（pip 原生识别；清华等公网源仍需 `http_proxy` 出网），内网源（如华为 mirrors.huawei.com）直连更快但须把源域名加入 `run.env` 的 `no_proxy`（流水线会自动拼接节点/协调地址，显式配置的值保留在前）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
 
 ```bash
 cd /root/sglang                    # 对齐 CI 的执行目录 (初始化建好的 repo 软链)
@@ -625,7 +626,7 @@ run:
 ```
 
 **Q: 为什么 `docker ps` 只看到一个 `sgl-pipeline-single` 容器？**
-同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。初始化完成时控制台会自动汇总被跳过的依赖命令（`[pip_deps] [WARN]` 行）；初始化报错则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。
+同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。等待初始化期间控制台每分钟回显最新一条 `[pip_deps]` 进度行（第几条命令/耗时）；初始化完成时控制台会自动汇总被跳过的依赖命令（`[pip_deps] [WARN]` 行）；初始化报错或超时（最长 `run.init_timeout_minutes`，默认 120 分钟）则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。
 
 **Q: 能在同一执行机同时跑两个 run.py 吗？**
 不建议。多机用例的协调服务固定用 9377 端口，第二个 run 启动协调服务时会**自动清理占用该端口的残留流水线进程**——会把第一个仍在运行的 run.py 主进程杀掉。多个 run 请串行执行（或用 `--at` 定时错开）。
