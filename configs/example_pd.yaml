@@ -1,15 +1,15 @@
 # 多机 PD 分离用例模板: prefill/decode 各自拉起服务, router 等 PD 就绪后执行基准测试 (roles 配角色节点)
 # 用法: python3 src/run.py --config configs/example_pd.yaml --dry-run
 # 前置: 节点间 8000/8995/24666 端口互通, 且各节点可达执行机 9377 协调端口 (见 README 7.3)
-# 完整字段与默认值见 README 第 3 节; run 段可选字段 (prepare/code/env) 见 example_single.yaml
+# run 段其余可选字段 (code/env 等) 见 example_single.yaml
 
 run:
-  workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录; sglang 仓固定 {workspace}/sglang, 结果固定 {workspace}/results
+  workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录 (sglang 仓固定 {workspace}/sglang)
   docker:
     image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
-  # extra_mounts:                          # 常用: 模型权重等额外 docker -v 挂载; prefill/decode 节点均需预置模型缓存或挂载
+  # extra_mounts:                          # 额外 docker -v 挂载; P/D 节点均需预置模型缓存或挂载
   #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
-  # datasets:                              # 常用: 预置到容器 /tmp/ 的数据集; 仅 router 节点需要存在 (PD 节点只起 server 不读数据集, 缺失自动忽略)
+  # datasets:                              # 预置数据集; 仅 router 节点需要 (PD 节点只起 server)
   #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
 
 nodes:
@@ -22,15 +22,15 @@ nodes:
 
 suites:
   # PD 分离用例: roles 配角色节点 (与 node/multinode 互斥)
-  # prefill/decode 支持多节点 (列表), router 只能单个 (框架限制); router 不占 NPU, 通常复用 P/D 节点
+  # prefill/decode 支持多节点 (列表), router 只能单个; router 不占 NPU, 通常复用 P/D 节点
   # name 可省略: 默认取 file basename; 此处文件名较长故显式配短名
   - name: dsv4-flash-w8a8-1p1d-16p
     roles:
       prefill: 192.168.10.1               # 字符串=单节点, 列表=多节点
       decode: 192.168.10.2
-      router: 192.168.10.1                # 等 PD 就绪后拉起 router 并执行测试
+      router: 192.168.10.1                 # PD 就绪后拉起 router 并执行测试
     file: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py   # [必填]
-    timeout_minutes: 120                  # 角色容器超时 (分钟), 默认 60; prefill/decode 实际再加 2 分钟余量
+    timeout_minutes: 120                   # 角色容器超时 (分钟), 默认 60
 
   # 2p2d: prefill/decode 各 2 节点 (列表写法)
   # - name: dsv4-flash-w8a8-2p2d-16p

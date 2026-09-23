@@ -1167,7 +1167,10 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     # 进程, 泄漏的 router 子进程一并清理); 退出码经 wait 透传 (与 pipefail 下
     # tee 等价)
     log_f = shlex.quote(f"/output/{_log_filename(suite)}")
-    parts.append(f"{cmd} > {log_f} 2>&1 & _case_pid=$!")
+    # 前台同步预建日志 + 后台追加 (同 _single_case_exec_cmd): 慢速挂载上
+    # 后台建文件可能晚于 tail -f 打开, 无 --retry 的 tail 报错退出, 角色被误判失败
+    parts.append(f": > {log_f}")
+    parts.append(f"{cmd} >> {log_f} 2>&1 & _case_pid=$!")
     parts.append(f"tail -f {log_f} --pid=$_case_pid")
     parts.append("wait $_case_pid")
 
@@ -1303,11 +1306,16 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
         " 2>/dev/null || true; done",
     ]
     parts += _vendor_env_parts()
+    # 前台同步预建日志, 用例后台改为追加: /output 落在 NFS 等慢速共享存储时,
+    # 后台子 shell 的建文件 (RPC 往返) 可能晚于 tail -f 的打开 —— tail 无
+    # --retry, 文件不存在即报错退出 rc=1, 整条用例被误判失败 (真实用例
+    # 进程还在后台继续跑并占卡); 先建后追, tail 必然能打开, 消除竞态
+    parts.append(f": > {log_f}")
     parts.append(
         f"cd {shlex.quote(cfg.run.repo)} && "
         # int(tmo * 60) 而非 int(tmo)*60: 亚分钟 (如 0.5) 不被截成 0 秒
         f"timeout -k 60 {int(tmo * 60)} python3 -u {py} -f "
-        f"> {log_f} 2>&1 & _case_pid=$!")
+        f">> {log_f} 2>&1 & _case_pid=$!")
     parts.append(f"tail -f {log_f} --pid=$_case_pid")
     # 退出码透传: wait 失败不经 set -e 提前退出 (|| 接住), 保证 plog 拷贝执行
     parts.append("_rc=0; wait $_case_pid || _rc=$?")
