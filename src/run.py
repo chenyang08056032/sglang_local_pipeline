@@ -136,9 +136,18 @@ class PipelineConfig:
 def load_config(path):
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-
+    # 结构校验: 空文件/顶层非映射 (纯列表等) 时报清晰错误 (退出码 2),
+    # 而非下方 .get/.items 的裸 AttributeError/TypeError traceback
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"配置文件顶层须为 run/nodes/suites 的键值映射, 实际: "
+            f"{'空文件' if raw is None else type(raw).__name__}")
     run_raw = raw.get("run") or {}
+    if not isinstance(run_raw, dict):
+        raise ValueError(f"run 段须为键值映射, 实际: {run_raw!r}")
     docker_raw = run_raw.get("docker") or {}
+    if not isinstance(docker_raw, dict):
+        raise ValueError(f"run.docker 段须为键值映射, 实际: {docker_raw!r}")
     # list(字符串) 会逐字符拆分, 单条挂载误写成字符串时报清晰错误而非 -v 单字符灾难
     extra_mounts = docker_raw.get("extra_mounts") or []
     if not isinstance(extra_mounts, list):
@@ -149,6 +158,15 @@ def load_config(path):
     # 显式空值 (devices: 等 null) 时 .get 的 default 不生效, 需 is None 判断兜底;
     # 不能用 or: devices 显式空列表 [] 是合法配置 (不挂卡)
     devices_raw = docker_raw.get("devices")
+    if devices_raw is not None and devices_raw != "auto":
+        # 须为卡号整数列表: 误写成字符串会逐字符迭代出垃圾 --device 参数
+        # (docker 报错难懂), 在此报清晰配置错误
+        if (not isinstance(devices_raw, list)
+                or not all(isinstance(i, int) and not isinstance(i, bool)
+                           for i in devices_raw)):
+            raise ValueError(
+                f"run.docker.devices 须为 'auto' 或卡号整数列表 (如 [0,1,2,3],"
+                f" 空列表=不挂卡), 实际: {devices_raw!r}")
     docker = DockerConfig(
         image=docker_raw["image"],
         devices="auto" if devices_raw is None else devices_raw,
@@ -201,6 +219,8 @@ def load_config(path):
             pip_cmds = [ln.strip() for ln in df
                         if ln.strip() and not ln.strip().startswith("#")]
     code_raw = run_raw.get("code") or {}
+    if not isinstance(code_raw, dict):
+        raise ValueError(f"run.code 段须为键值映射, 实际: {code_raw!r}")
     git_remote = code_raw.get("git_remote")
     # ref str 化: YAML 纯数字 ref (如分支 123) 解析为 int, 直接传 pipeline 的
     # shlex.quote 会抛 TypeError; 顺带提示含前导零的数字 ref (如 0915) 会被
@@ -229,6 +249,8 @@ def load_config(path):
 
     nodes = []
     for n in raw.get("nodes") or []:
+        if not isinstance(n, dict):
+            raise ValueError(f"nodes 条目须为键值映射 (host/arch/...), 实际: {n!r}")
         # arch 必填且须为已知架构 (挂卡数量与 A5 适配都依赖它, 拼错直接报错)
         arch = str(n.get("arch") or "").lower()
         if arch not in _ARCH_NPUS:
@@ -242,9 +264,13 @@ def load_config(path):
     suites = []
     seen_names = set()
     for s in raw.get("suites") or []:
+        if not isinstance(s, dict):
+            raise ValueError(f"suites 条目须为键值映射 (file/node/...), 实际: {s!r}")
         # name 可省略: 默认取 file basename 去 .py (如 .../test_npu_qwen3_32b.py
         # → test_npu_qwen3_32b), --suite 过滤与目录命名均自然匹配
         file_path = s["file"]
+        if not isinstance(file_path, str):
+            raise ValueError(f"用例 file 须为字符串路径, 实际: {file_path!r}")
         raw_name = s.get("name")
         # str() 化: YAML 写数字 (name: 123) 时避免后续 re.match/os.path.join 对 int 报错
         name = (str(raw_name) if raw_name
@@ -255,11 +281,12 @@ def load_config(path):
                 f"用例 name 重复: {name!r} (容器名/目录名/summary 均按 name 区分, "
                 f"重复会互相覆盖)")
         seen_names.add(name)
-        # name 用作 docker 容器名 (sgl-pipeline-{name}), 含空格/中文等特殊字符
-        # 会导致 docker 报错; 允许字母数字/下划线/连字符/点
-        if not re.match(r'^[A-Za-z0-9_.-]+$', name):
+        # name 用作 docker 容器名 (sgl-pipeline-{name}), docker 要求首字符为
+        # 字母数字 (./-/_ 开头或含空格/中文等都会报错), 后接字母数字/下划线/
+        # 连字符/点
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$', name):
             raise ValueError(
-                f"用例 name 只允许字母数字/下划线/连字符/点: {name!r}")
+                f"用例 name 须以字母数字开头, 后接字母数字/下划线/连字符/点: {name!r}")
         roles = s.get("roles")
         multinode = s.get("multinode")
         # node / roles / multinode 三选一
@@ -311,9 +338,24 @@ def load_config(path):
                 raise ValueError(
                     f"用例 {name}: multinode 须为 ≥2 个节点的列表"
                     f" (单节点请用 node)")
+        # timeout_minutes 须为正数 (分钟): YAML 的 true 是 bool (int 子类),
+        # 不拦会算出 int(True)*60=60 秒的超时陷阱; 非数值/负数也在此报配置
+        # 错误, 而非执行期才炸 (用例记 error); 数字字符串 "120" 归一化兼容
+        tmo_raw = s.get("timeout_minutes")
+        if isinstance(tmo_raw, str):
+            try:
+                tmo_raw = float(tmo_raw)
+            except ValueError:
+                pass
+        if (tmo_raw is not None
+                and (isinstance(tmo_raw, bool)
+                     or not isinstance(tmo_raw, (int, float)) or tmo_raw <= 0)):
+            raise ValueError(
+                f"用例 {name}: timeout_minutes 须为正数 (分钟), "
+                f"实际: {s.get('timeout_minutes')!r}")
         suites.append(SuiteConfig(
             name=name, node=node, file=file_path,
-            timeout_minutes=s.get("timeout_minutes"),
+            timeout_minutes=tmo_raw,
             roles=roles, multinode=multinode,
         ))
 
@@ -546,7 +588,10 @@ def main():
 
     try:
         cfg = load_config(args.config)
-    except (ValueError, KeyError, yaml.YAMLError, OSError) as e:
+    except (ValueError, KeyError, AttributeError, TypeError,
+            yaml.YAMLError, OSError) as e:
+        # AttributeError/TypeError 兜底: 结构校验未覆盖的形态仍按配置错误
+        # 退出 (rc=2), 不裸 traceback (rc=1)
         _log(f"[错误] 配置文件无效: {e}")
         return 2
     print_config(cfg, args.config)

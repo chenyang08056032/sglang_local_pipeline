@@ -155,12 +155,13 @@ def ssh_run(node, command, log_path=None, diag_path=None,
         diag_f = open(diag_path, "a", encoding="utf-8", errors="ignore")
 
     def _diag(msg, force=False):
-        # 诊断优先落 diag_f (独立文件, fetch 不覆盖);
-        # 无 diag_f 时回退落 log_f (会被 fetch 覆盖, 但好过完全不记录)
-        for f in (diag_f, log_f):
-            if f:
-                f.write(msg + "\n")
-                f.flush()
+        # 诊断只落 diag_f (独立文件, fetch 不覆盖); 无 diag_f 时回退落 log_f
+        # (会被 fetch 覆盖, 但好过完全不记录)。不双写: log_f 混入 [ssh] 行后,
+        # fetch 失败时留下的就是被污染的用例日志
+        f = diag_f or log_f
+        if f:
+            f.write(msg + "\n")
+            f.flush()
         if silent:  # 内部轮询命令: 连诊断都不出 (有专门的失败处理路径)
             return
         if not quiet or force:  # quiet 角色失败时 (force) 仍上控制台, 不静默失败
@@ -937,9 +938,9 @@ def prepare_node(cfg, node, dry_run=False):
         f"  fi",
         f"fi",
     ]
-    rc = ssh_run(node, "\n".join(lines), dry_run=dry_run)
-    # pull 失败不阻断 (rc 由 if/|| true 兜底为 0, 这里仅 ssh 自身失败才 != 0);
-    # 但 ssh 失败意味着节点不可达, sync_repo_to_node 也会失败, 让它去报错
+    # 返回值无需判: 脚本内 if 已把 pull 失败兜底为 0; ssh 自身失败 = 节点
+    # 不可达, 后续 sync_repo_to_node 同样失败并由它报错
+    ssh_run(node, "\n".join(lines), dry_run=dry_run)
     if not _is_local(node):
         # workspace 与执行机共享时 (NFS/共享卷), rm+push 会删执行机自己的仓;
         # 共享即节点与执行机同一物理目录, 代码天然一致, 跳过 sync
@@ -1247,9 +1248,13 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     parts = [
         "set -euo pipefail",
         # 上一条用例残留的 sglang 进程清理: 共享容器的进程不随用例退出,
-        # 崩溃/超时遗留的 server 会占卡, 不清则本条用例报 NPU 卡被占用
-        "pkill -9 -f 'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
-        " 2>/dev/null || true",
+        # 崩溃/超时遗留的 server 会占卡, 不清则本条用例报 NPU 卡被占用。
+        # 不用 pkill: 本 exec 的 bash cmdline 内嵌整个脚本 (含用例文件路径),
+        # 路径含 "sglang." 时 (如自定义用例 test_sglang.e2e.py) pkill 会杀掉
+        # 自身 (rc=137); 改 pgrep 枚举 + 跳过 $$ 逐个 kill, 语义不变
+        "for _pid in $(pgrep -f 'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
+        " || true); do [ \"$_pid\" != \"$$\" ] && kill -9 \"$_pid\""
+        " 2>/dev/null || true; done",
     ]
     parts += _vendor_env_parts()
     parts.append(
@@ -1368,15 +1373,24 @@ class SingleNodeContainers:
         有则列出全部 WARN 行 (含命令原文, 对应 .init.log 可查原始报错)。"""
         grep_cmd = (f"grep -F '[pip_deps] [WARN]' "
                     f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
-        # 非 quiet 的 ssh_run 会把 grep 结果实时回显到控制台; 先探有无
-        # (silent) 再决定打哪行提示, 避免"确认行"和"WARN 行"都出
-        if ssh_run(node, grep_cmd, quiet=True, silent=True) == 0:
+        # 探测命令 rc 语义: 0=有 WARN / 1=无 WARN / 3=.init.log 缺失 /
+        # 其他=ssh 失败; 区分 "无匹配" (rc=1) 与 "读不到日志", 避免后者被
+        # 误报成 "全部安装成功"
+        probe = (f"test -f {shlex.quote(runs_dir)}/.init.log || exit 3; "
+                 f"grep -Fq '[pip_deps] [WARN]' "
+                 f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+        prc = ssh_run(node, probe, quiet=True, silent=True)
+        if prc == 0:
             _log(f"[execute] 以下 pip 依赖命令装失败已跳过 (详见 .init.log):")
+            # 非 quiet 的 ssh_run 把 grep 结果实时回显到控制台
             ssh_run(node, grep_cmd)  # 回显全部 WARN 行
-        else:
+        elif prc == 1:
             n = len(self._cfg.run.pip_cmds)
             _log(f"[execute] pip 依赖全部安装成功 (共 {n} 条)"
                  if n else "[execute] 无 pip 依赖安装 (pip_deps.txt 为空)")
+        else:
+            _log(f"[execute] 无法读取 .init.log 核对 pip WARN (rc={prc}), "
+                 f"手动查看: {runs_dir}/.init.log")
 
     def _fail(self, node, runs_dir, reason):
         """初始化失败收尾: 删容器 + 打印 .init.log 尾部 + 抛错 (含 fast-fail 标记)。"""
@@ -1643,6 +1657,14 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
         for t in threads.values():
             t.join()
 
+        # 兜底清理本用例全部角色容器: 宿主机 timeout 只杀 docker 客户端,
+        # 容器本体不会自停; 上方 grace 强杀仅覆盖线程仍存活的角色, 客户端
+        # 先死的 (角色自身超时 rc=124) 不在其列, 留下即孤儿占卡。正常退出
+        # (--rm) 或已删的容器 rm -f 幂等无副作用; dry_run 不执行
+        if not dry_run:
+            for (r, i, n), k in zip(units, keys):
+                _kill_container(n, f"sgl-pipeline-{suite.name}-{k}")
+
         for key in keys:
             dur = durs.get(key, "?")
             if errs.get(key):
@@ -1832,6 +1854,12 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             time.sleep(5)
         for t in threads.values():
             t.join()
+
+        # 兜底清理本用例全部角色容器 (同 PD 分离: grace 强杀只覆盖线程仍
+        # 存活的角色, 客户端先死的不在其列); rm -f 幂等, dry_run 不执行
+        if not dry_run:
+            for (i, n), k in zip(units, keys):
+                _kill_container(n, f"sgl-pipeline-{suite.name}-{k}")
 
         for key in keys:
             dur = durs.get(key, "?")

@@ -126,7 +126,7 @@ run:
 
 ③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置）并逐条执行 `configs/pip_deps.txt` 里的安装命令，随后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
 
-依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源（可用 `run.env` 配 `http_proxy` 等代理）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
+依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源，慢时可配镜像源/代理（都是 `run.env` 加环境变量，`pip_deps.txt` 无需改动，用例内的 pip 调用同样生效）：`PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"`（pip 原生识别；清华等公网源仍需 `http_proxy` 出网），内网源（如华为 mirrors.huawei.com）直连更快但须把源域名加入 `run.env` 的 `no_proxy`（流水线会自动拼接节点/协调地址，显式配置的值保留在前）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
 
 ```bash
 cd /root/sglang                    # 对齐 CI 的执行目录 (初始化建好的 repo 软链)
@@ -306,8 +306,8 @@ python3 src/run.py
     │              模型缓存(~/.cache) + run.datasets 所在目录 (自动, 可选)
     │              + run.docker.extra_mounts (用户自定义, 可选)
     │       容器内初始化 (执行机轮询 .init-ok 标记确认完成):
-│         覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
-│         → 逐条执行 configs/pip_deps.txt 安装命令 (可选, 只装一次)
+    │         覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
+    │         → 逐条执行 configs/pip_deps.txt 安装命令 (可选, 只装一次)
     │       每条用例: docker exec 执行 (执行前清理上一条用例残留的 sglang
     │         进程防占卡; 超时由容器内 timeout 控制; A5 节点经
     │         /output/run_case.py 包装启动, --tp-size 自动减半)
@@ -469,7 +469,7 @@ suites:
 - `prefill`/`decode` 的值可以是字符串（单节点）或列表（多节点），两种写法等价。
 - `router` 的值只能对应单个节点（字符串或单元素列表均可，等价），配多个节点会报错。
 - 节点卡数在 `docker.devices: auto`（默认）时由 `arch` 决定（`a3`→16 卡、`a5`→8 卡），未知/缺失 arch 启动时报错；显式配 devices 列表时以列表为准。
-- router 不占 NPU（仅转发与压测），通常复用 P/D 节点（host 网络下端口不冲突：PD 服务 8000、router 6677），也可配独立节点。
+- router 进程不占 NPU（容器仍挂卡，仅转发与压测），通常复用 P/D 节点（host 网络下端口不冲突：PD 服务 8000、router 6677），也可配独立节点。
 - 各角色的启动参数、环境变量、断言阈值完全由用例文件自身定义（与 CI 一致），流水线只负责编排。
 
 ### 7.2 工作原理
@@ -483,7 +483,7 @@ suites:
    - `HOSTNAME=sglang-{role}-{idx}`：用例框架据此识别角色（含 role 名）和序号（末尾数字）；
    - `POD_IP=节点 IP`：服务绑定与互访地址（容器 host 网络）；
    - prefill/decode 拉起 PD 服务后轮询等待结束信号；router 等 PD 端口（8000）全部就绪后拉起 router 进程，`/health` 就绪后执行基准测试；
-5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时。结束信号写入 60s 后仍未退出的容器（如卡在端口等待不查 ConfigMap）会被强制 `docker rm -f`（等价 CI 外层 runner 删 job，避免拖到容器超时）；
+5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时。结束信号写入 60s 后仍未退出的容器（如卡在端口等待不查 ConfigMap）会被强制 `docker rm -f`（等价 CI 外层 runner 删 job，避免拖到容器超时）；用例收尾时另对全部角色容器做一次幂等 `docker rm -f` 兜底，清理角色自身超时（docker 客户端被杀、容器本体仍在跑）留下的孤儿容器。
 6. 用例判定对齐 CI（CI 只看 router pod 日志的 `OK`/`FAILED`，判定后直接删 job，PD pod 是被连带杀掉的）：router 退出码为 0 即通过；prefill/decode 收到结束信号以 0 退出、或超过宽限期被强杀（rc=137）均不判失败，其余非 0 退出码视为 PD 崩溃判失败（等价 CI 检测 pod 非 Running）。基准结果与断言都在 router 的日志里。
 
 ### 7.3 前置条件（多机用例额外要求）
