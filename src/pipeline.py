@@ -38,6 +38,12 @@ _NODE_MOUNTS = [
     "$HOME/.cache:/root/.cache",  # 模型缓存复用, 避免每次容器重复下载
 ]
 
+# extra_mounts 宿主机路径探测结果: {(user, host, port): set(确认不存在的路径)}。
+# prepare 阶段在节点上 test -e 探测一次, 构造 docker 命令时据此跳过不存在的项:
+# docker -v 遇宿主机缺失路径不报错, 会静默建同名空目录挂进容器 (文件挂载直接
+# 废掉, 错误延后到用例读路径时才爆发且难定位)。单次运行内文件状态视为不变
+_MOUNT_MISSING_CACHE = {}
+
 
 # 执行机 IP 集合缓存: 单次运行中不变, 避免 _is_local 每次都 fork hostname 子进程
 _LOCAL_IPS_CACHE = None
@@ -941,6 +947,20 @@ def prepare_node(cfg, node, dry_run=False):
     # 返回值无需判: 脚本内 if 已把 pull 失败兜底为 0; ssh 自身失败 = 节点
     # 不可达, 后续 sync_repo_to_node 同样失败并由它报错
     ssh_run(node, "\n".join(lines), dry_run=dry_run)
+    # extra_mounts 宿主机路径探测 (test -e): 不存在的项记录到 _MOUNT_MISSING_CACHE,
+    # 构造 docker 命令时跳过, 避免被 docker -v 静默挂成空目录。rc 语义: 0=存在,
+    # 1=不存在; 其他 rc (ssh 255 等) 视为未判定不跳过 —— 节点不可达由后续
+    # sync_repo_to_node 报错, 不在这里误报成路径不存在
+    for m in cfg.run.docker.extra_mounts:
+        host_part = m.split(":", 1)[0]
+        rc = ssh_run(node, f"test -e {shlex.quote(host_part)}",
+                     dry_run=dry_run, silent=True)
+        if rc == 1:
+            _MOUNT_MISSING_CACHE.setdefault(
+                (node.user, node.host, node.port), set()).add(host_part)
+            _log(f"[prepare] [WARN] {where} 跳过 extra_mounts {m}: 宿主机路径 "
+                 f"{host_part} 不存在 (docker -v 会静默挂成空目录); "
+                 f"需要挂载请先在节点就位后重跑")
     if not _is_local(node):
         # workspace 与执行机共享时 (NFS/共享卷), rm+push 会删执行机自己的仓;
         # 共享即节点与执行机同一物理目录, 代码天然一致, 跳过 sync
@@ -1064,10 +1084,12 @@ def _docker_device_args(node, d):
     return args
 
 
-def _docker_mount_args(cfg, output_dir):
+def _docker_mount_args(cfg, output_dir, node=None):
     """-v 挂载参数。output_dir: 挂到容器 /output 的宿主机目录 (tmp/plog 取其
     子目录)——单机共享容器=runs/{run_id} (各用例写 /output/{用例名}/),
-    多机角色容器=runs/{run_id}/{用例名}/{角色}。"""
+    多机角色容器=runs/{run_id}/{用例名}/{角色}。
+    node: 节点配置, 用于按节点跳过 extra_mounts 中宿主机不存在的项
+    (prepare 阶段探测结果, 见 _MOUNT_MISSING_CACHE; 未探测不跳过)。"""
     args = [
         # evalscope 源码 (与 repo 同模式: 同路径挂载; 节点缺目录时 docker 建空
         # 目录, 由初始化脚本的条件软链兜底回退在线安装)
@@ -1085,9 +1107,14 @@ def _docker_mount_args(cfg, output_dir):
     for m in dict.fromkeys(_auto_dirs):
         args += ["-v", shlex.quote(f"{m}:{m}")]
     # 用户自定义挂载 (追加在默认挂载之后), 路径含空格等特殊字符时整体 quote 防止拆断;
-    # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro")
+    # 格式同 docker -v, 支持只读等选项 (如 "/data:/data:ro");
+    # 宿主机路径经 prepare 探测确认不存在的项跳过 (见 _MOUNT_MISSING_CACHE,
+    # prepare 未覆盖的节点/路径不跳过, 保持原行为)
     if cfg.run.docker.extra_mounts:
+        missing = (_MOUNT_MISSING_CACHE.get((node.user, node.host, node.port))
+                   if node else None) or set()
         args += [x for m in cfg.run.docker.extra_mounts
+                 if m.split(":", 1)[0] not in missing
                  for x in ("-v", shlex.quote(m))]
     return args
 
@@ -1151,7 +1178,7 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
                     "--shm-size", d.shm_size,
                     "--name", container]
                    + _docker_device_args(node, d)
-                   + _docker_mount_args(cfg, node_run_dir)
+                   + _docker_mount_args(cfg, node_run_dir, node)
                    + _docker_env_args(cfg, extra_env)
                    + [shlex.quote(d.image), "bash", "-c", f"'{inner_escaped}'"])
 
@@ -1206,9 +1233,10 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
             "_pip_t0=$(date +%s)",
             "{ %s; } || echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'"
             % (c, i, n_pip, q),
-            # 结束行双引号: 让 $(( $(date +%s) - _pip_t0 )) 在容器内展开算耗时
-            'echo "[pip_deps] [%d/%d] 结束, 耗时 $(( $(date +%s) - _pip_t0 ))s"'
-            % (i, n_pip),
+            # 结束行双引号: 让 $(( $(date +%s) - _pip_t0 )) 在容器内展开算耗时;
+            # 必须 f-string: % 格式化会把 date +%s 的 %s 吃成格式占位符而炸
+            f'echo "[pip_deps] [{i}/{n_pip}] 结束, 耗时 '
+            f'$(( $(date +%s) - _pip_t0 ))s"',
         ]
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
@@ -1223,7 +1251,7 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
                     "--shm-size", d.shm_size,
                     "--name", _SHARED_CONTAINER]
                    + _docker_device_args(node, d)
-                   + _docker_mount_args(cfg, runs_dir)
+                   + _docker_mount_args(cfg, runs_dir, node)
                    + _docker_env_args(cfg)
                    + [shlex.quote(d.image), "bash", "-c", f"'{inner_escaped}'"])
     # 宿主机命令: 清理残留同名容器 (prepare 阶段已清过, 双保险) 后后台启动;

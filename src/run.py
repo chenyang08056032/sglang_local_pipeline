@@ -176,6 +176,13 @@ def load_config(path):
             f"run.docker.extra_mounts 须为列表 (格式同 docker -v), 如:\n"
             f"  extra_mounts:\n    - \"/data/models:/models\"\n"
             f"实际: {extra_mounts!r}")
+    # 条目须为非空字符串: pipeline 按首个 ':' 拆宿主机路径做存在性探测/过滤,
+    # 非字符串会在执行期以 TypeError 崩溃, 在配置期拦截报清晰错误
+    for m in extra_mounts:
+        if not isinstance(m, str) or not m.strip():
+            raise ValueError(
+                f"run.docker.extra_mounts 条目须为非空字符串 (格式同 docker -v, "
+                f"如 \"/data/models:/models\"), 实际: {m!r}")
     # 显式空值 (devices: 等 null) 时 .get 的 default 不生效, 需 is None 判断兜底;
     # 不能用 or: devices 显式空列表 [] 是合法配置 (不挂卡)
     devices_raw = docker_raw.get("devices")

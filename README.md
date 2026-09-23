@@ -108,7 +108,7 @@ sglang_local_pipeline/
 | `run.docker.devices` | `auto` | 否 | `auto`=按节点 arch 推导卡数映射 `/dev/davinci0..N-1`（a3=16、a5=8）+ 管理设备；或显式列表如 `[0,1,2,3]`，以列表为准 |
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
 | `run.docker.shm_size` | `16g` | 否 | 容器共享内存大小；固定附加 `--privileged --ipc=host` |
-| `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"` |
+| `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载项（追加到默认 driver/缓存等挂载之后），格式同 docker -v：`"host:container"` 或 `"/data:/data:ro"`。prepare 阶段在节点上探测宿主机路径，不存在的项自动跳过并 `[WARN]` 提示（docker -v 遇缺失路径会静默挂成空目录，错误延后且难定位） |
 | `run.env` | 内置 7 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 数据集路径列表（节点本地**绝对路径**），容器启动后 cp 到 `/tmp/`，缺失则回退在线下载。详见下方说明 ① |
