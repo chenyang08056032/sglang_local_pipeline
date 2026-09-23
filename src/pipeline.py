@@ -958,8 +958,8 @@ def prepare_node(cfg, node, dry_run=False):
         if rc == 1:
             _MOUNT_MISSING_CACHE.setdefault(
                 (node.user, node.host, node.port), set()).add(host_part)
-            _log(f"[prepare] [WARN] {where} 跳过 extra_mounts {m}: 宿主机路径 "
-                 f"{host_part} 不存在 (docker -v 会静默挂成空目录); "
+            _log(f"[prepare] [WARN] {where} 已跳过 extra_mounts {m} (本次容器"
+                 f"不会挂载该项): 宿主机路径 {host_part} 不存在; "
                  f"需要挂载请先在节点就位后重跑")
     if not _is_local(node):
         # workspace 与执行机共享时 (NFS/共享卷), rm+push 会删执行机自己的仓;
@@ -1220,24 +1220,33 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     # (用例同解释器), 每节点只装一次, 该节点全部单机用例复用; 命令行由 run.py
     # 加载配置时读入 (注释/空行已剔除), 此处无需再解析文件。
     # 每条命令打进度行进 .init.log (开始执行/结束+耗时): 装得慢时定位卡在
-    # 哪条全靠它 (等待期间控制台也每分钟回显最新一条, 见 _wait_init);
-    # 单条失败不终止初始化: "{ cmd; } || echo WARN" 逐条兜底 —— 花括号组在
-    # 当前 shell 执行 (cd/变量状态对后续行延续), || 接住非零返回码打 WARN 进
-    # .init.log 后继续下一条 (依赖缺失的影响留给用例自身暴露); 开始/WARN 行
-    # 内嵌命令原文, 单引号转义防变量在 echo 处被展开
+    # 哪条全靠它 (控制台不上屏, 等待期只打心跳行, 结束后由 _report_pip_warns
+    # 屏显末尾的汇总行);
+    # 单条失败不终止初始化: "{ cmd; } || { echo WARN; 计数; }" 逐条兜底 ——
+    # 花括号组在当前 shell 执行 (cd/变量状态对后续行延续), || 接住非零返回码
+    # 打 WARN 进 .init.log 并累加 _pip_fail 后继续下一条 (依赖缺失的影响留给
+    # 用例自身暴露); 开始/WARN 行内嵌命令原文, 单引号转义防变量在 echo 处被展开
     n_pip = len(cfg.run.pip_cmds)
+    if n_pip:
+        init.append("_pip_fail=0")
     for i, c in enumerate(cfg.run.pip_cmds, 1):
         q = c.replace("'", "'\\''")
         init += [
             f"echo '[pip_deps] [{i}/{n_pip}] 开始执行: {q}'",
             "_pip_t0=$(date +%s)",
-            "{ %s; } || echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'"
+            "{ %s; } || { echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'; _pip_fail=$((_pip_fail+1)); }"
             % (c, i, n_pip, q),
             # 结束行双引号: 让 $(( $(date +%s) - _pip_t0 )) 在容器内展开算耗时;
             # 必须 f-string: % 格式化会把 date +%s 的 %s 吃成格式占位符而炸
             f'echo "[pip_deps] [{i}/{n_pip}] 结束, 耗时 '
             f'$(( $(date +%s) - _pip_t0 ))s"',
         ]
+    # 末尾汇总行 (写进 .init.log, 初始化成功后由 _report_pip_warns 抓出屏显):
+    # 成功数由每条 WARN 的计数累加而来, 失败明细即上方各 WARN 行
+    if n_pip:
+        init.append(
+            f'echo "[pip_deps] 汇总: 共 {n_pip} 条, '
+            f'成功 $(( {n_pip} - _pip_fail )) 条, 失败 $_pip_fail 条"')
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
         " > /output/.init.log 2>&1\n"
@@ -1376,18 +1385,15 @@ class SingleNodeContainers:
 
     def _wait_init(self, node, runs_dir):
         """轮询初始化标记 (.init-ok/.init-fail 经 /output 挂载落在宿主机
-        runs/ 下, 直接查宿主机路径, 不经 docker exec)。等待期间每分钟回显
-        .init.log 最新一条 pip 进度行 (装得慢时无需 ssh 上节点 tail)。"""
+        runs/ 下, 直接查宿主机路径, 不经 docker exec)。等待期间控制台只打
+        每分钟一次的心跳行, pip 进度不上屏 (逐条进度看 .init.log, 结束后
+        _report_pip_warns 屏显汇总行与失败明细)。"""
         q_runs = shlex.quote(runs_dir)
         alive_cmd = (f"docker inspect -f '{{{{.State.Running}}}}' "
                      f"{_SHARED_CONTAINER} | grep -qx true")
         # 最长等待可配 (run.init_timeout_minutes, 默认 120 分钟): 慢代理
         # 冷缓存装依赖可能很久, 不够在 yaml 调大
         wait_sec = self._cfg.run.init_timeout_minutes * 60
-        # 最新 pip 进度行 (开始/结束/WARN 行都匹配); 早期阶段 (vendor 环境
-        # 等) 尚无 pip 行时无输出; 管道 rc 取 tail 恒为 0, 不触发失败回显
-        prog_cmd = (f"grep -F '[pip_deps] [' {q_runs}/.init.log 2>/dev/null"
-                    f" | tail -1")
         tic = time.perf_counter()
         last_note = 0.0
         while True:
@@ -1411,17 +1417,21 @@ class SingleNodeContainers:
                 last_note = time.perf_counter()
                 _log(f"[execute] 共享容器初始化中... (已等 "
                      f"{int(time.perf_counter() - tic)}s, 最长 {wait_sec:g}s)")
-                # silent: 不打 [ssh] 连接诊断 (每分钟 2 行纯噪音), 输出流
-                # 本身非 quiet 仍上控制台 → 只多出进度行这一行
-                ssh_run(node, prog_cmd, silent=True)
             time.sleep(_INIT_POLL_SEC)
 
     def _report_pip_warns(self, node, runs_dir):
-        """初始化成功后汇总屏显被跳过的依赖 (失败跳过语义下 pip 失败不终止
-        初始化, 控制台唯一可见线索就是这里的 WARN 行)。无跳过时打一行确认,
-        有则列出全部 WARN 行 (含命令原文, 对应 .init.log 可查原始报错)。"""
-        grep_cmd = (f"grep -F '[pip_deps] [WARN]' "
-                    f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+        """初始化成功后屏显 pip 依赖安装汇总: 汇总行由 init 子 shell 写在
+        .init.log 末尾 (共 N 条/成功/失败, 单一数据源), 此处抓出屏显;
+        有失败时再列出全部 WARN 行 (含命令原文, 原始报错查 .init.log)。"""
+        n = len(self._cfg.run.pip_cmds)
+        if not n:
+            _log("[execute] 无 pip 依赖安装 (pip_deps.txt 为空)")
+            return
+        # 汇总行: 非 quiet 的 ssh_run 把 grep 结果实时回显到控制台;
+        # || true 兜底 rc=1 (无匹配时 grep 报错退出, 正常不该发生)
+        ssh_run(node,
+                f"grep -F '[pip_deps] 汇总' "
+                f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null || true")
         # 探测命令 rc 语义: 0=有 WARN / 1=无 WARN / 3=.init.log 缺失 /
         # 其他=ssh 失败; 区分 "无匹配" (rc=1) 与 "读不到日志", 避免后者被
         # 误报成 "全部安装成功"
@@ -1430,15 +1440,12 @@ class SingleNodeContainers:
                  f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
         prc = ssh_run(node, probe, quiet=True, silent=True)
         if prc == 0:
-            _log(f"[execute] 以下 pip 依赖命令装失败已跳过 (详见 .init.log):")
-            # 非 quiet 的 ssh_run 把 grep 结果实时回显到控制台
-            ssh_run(node, grep_cmd)  # 回显全部 WARN 行
-        elif prc == 1:
-            n = len(self._cfg.run.pip_cmds)
-            _log(f"[execute] pip 依赖全部安装成功 (共 {n} 条)"
-                 if n else "[execute] 无 pip 依赖安装 (pip_deps.txt 为空)")
-        else:
-            _log(f"[execute] 无法读取 .init.log 核对 pip WARN (rc={prc}), "
+            _log("[execute] 失败明细 (原始报错见 .init.log 对应段落):")
+            ssh_run(node,
+                    f"grep -F '[pip_deps] [WARN]' "
+                    f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+        elif prc != 1:
+            _log(f"[execute] 无法核对 pip WARN (rc={prc}), "
                  f"手动查看: {runs_dir}/.init.log")
 
     def _fail(self, node, runs_dir, reason):
