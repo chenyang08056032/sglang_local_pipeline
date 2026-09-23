@@ -156,6 +156,14 @@ def load_config(path):
         shm_size=docker_raw.get("shm_size") or "16g",
         extra_mounts=list(extra_mounts),
     )
+    # env 须为键值映射 (与 a5_env 同规则): 误写成列表/标量时报清晰错误,
+    # 而非下方 .items() 的裸 AttributeError
+    env_raw = run_raw.get("env") or {}
+    if not isinstance(env_raw, dict):
+        raise ValueError(
+            f"run.env 须为键值映射, 如:\n"
+            f"  env:\n    http_proxy: \"http://proxy:port\"\n"
+            f"实际: {env_raw!r}")
     # a5_env 须为键值映射 (键值自动转字符串, YAML 写 1 即 "1");
     # 误写成列表/标量时报清晰错误
     a5_env_raw = run_raw.get("a5_env") or {}
@@ -194,6 +202,14 @@ def load_config(path):
                         if ln.strip() and not ln.strip().startswith("#")]
     code_raw = run_raw.get("code") or {}
     git_remote = code_raw.get("git_remote")
+    # ref str 化: YAML 纯数字 ref (如分支 123) 解析为 int, 直接传 pipeline 的
+    # shlex.quote 会抛 TypeError; 顺带提示含前导零的数字 ref (如 0915) 会被
+    # YAML 解析吞零 (0915→915), 须写成带引号字符串
+    ref = code_raw.get("ref")
+    if ref is not None and not isinstance(ref, str):
+        _log(f"[警告] run.code.ref 非字符串 ({ref!r}), 按 {str(ref)!r} 使用; "
+             f"若实际值含前导零请改带引号写法: ref: \"{ref}\"")
+        ref = str(ref)
 
     workspace = run_raw["workspace"]
     if not workspace.startswith("/"):
@@ -202,10 +218,10 @@ def load_config(path):
     run = RunConfig(
         workspace=workspace,
         git_remote=git_remote,
-        ref=code_raw.get("ref"),
+        ref=ref,
         docker=docker,
         env={**_DEFAULT_ENV,
-             **{str(k): str(v) for k, v in (run_raw.get("env") or {}).items()}},
+             **{str(k): str(v) for k, v in env_raw.items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
         pip_cmds=pip_cmds,
@@ -395,6 +411,28 @@ def _suite_master_host(suite):
     return suite.node
 
 
+# 精度用例特征: 用例文件 import test_npu_accuracy_utils (run_evalscope.sh 的
+# 唯一触发入口, evalscope 源码/软链只服务它)。accuracy 目录外也有此类用例
+# (如 basic_function/test_npu_swa_full_tokens_ratio.py), 故按文件内容判定
+# 而非路径前缀; run_evalscope 兜底直接调脚本的写法
+_ACCURACY_MARKERS = ("test_npu_accuracy_utils", "run_evalscope")
+
+
+def _is_accuracy_suite(cfg, suite):
+    """判定用例是否精度用例 (需要 evalscope 源码): 读执行机 repo 上的用例
+    文件找特征 import (repo 此刻必已就绪, prepare 顺序保证)。读不到 (绝对
+    路径文件不在执行机/文件缺失) 保守返回 True——宁可多 clone 一次, 不让
+    精度用例静默回退在线安装。"""
+    path = (suite.file if suite.file.startswith("/")
+            else f"{cfg.run.repo}/{suite.file}")
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            content = fh.read()
+    except OSError:
+        return True
+    return any(m in content for m in _ACCURACY_MARKERS)
+
+
 def prepare_nodes(cfg, dry_run):
     """先在执行机准备代码仓 (唯一 git 操作点), 再逐节点准备。
 
@@ -421,13 +459,18 @@ def prepare_nodes(cfg, dry_run):
             # 就绪后清理 sglang 残留 (宿主机进程 + 容器), 确保 NPU 卡无占用;
             # 失败不阻断 (用例报卡占用时按 [cleanup] 提示手动检查)
             cleanup_node_sglang(cfg, node, dry_run)
-    # evalscope 源码 (固定 {workspace}/evalscope): 执行机 clone 一次 + 仅分发
-    # 到跑测试的节点 (去重); 失败不阻断 (回退在线安装)
-    prepare_evalscope(
-        cfg,
-        [h for h in dict.fromkeys(_suite_master_host(s) for s in cfg.suites)
-         if prepared.get(h)],
-        dry_run)
+    # evalscope 源码 (固定 {workspace}/evalscope): 仅配置了精度用例才准备
+    # (按用例文件内容判定, 见 _is_accuracy_suite); 执行机 clone 一次 + 仅分发
+    # 到精度用例跑测试的节点 (去重); 失败不阻断 (回退在线安装)
+    acc_suites = [s for s in cfg.suites if _is_accuracy_suite(cfg, s)]
+    if acc_suites:
+        prepare_evalscope(
+            cfg,
+            [h for h in dict.fromkeys(_suite_master_host(s) for s in acc_suites)
+             if prepared.get(h)],
+            dry_run)
+    else:
+        _log("[prepare] 未配置精度用例, 跳过 evalscope 源码准备")
     return prepared
 
 
@@ -435,7 +478,8 @@ def run_suites(cfg, prepared, run_id, run_dir, dry_run):
     """逐个执行用例, 返回结果列表。
 
     单机用例经 SingleNodeContainers 复用节点长驻共享容器 (每节点一个,
-    configs/pip_deps.txt 依赖只装一次), run 结束 (含中途异常/中断) finally 统一清理。
+    configs/pip_deps.txt 依赖只装一次), run 结束 (含中途异常/中断) finally
+    统一删除容器 (runs/ 原件保留, 不清理)。
     """
     results = []
     shared = SingleNodeContainers(cfg, run_id, dry_run)

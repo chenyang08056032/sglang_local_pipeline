@@ -122,11 +122,11 @@ run:
     - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
 ```
 
-② **evalscope（精度框架，零配置）**：源码固定在 `{workspace}/evalscope`（与 sglang 仓同约定），prepare 阶段执行机自动浅克隆官方仓（目录非空则跳过，想用自定义版本直接放入该目录；代理取 `run.env` 的 `http_proxy`/`https_proxy`），再以 sglang 仓同款方式（清理旧目录 + 整目录复制）同步到跑测试的节点（单机=node，混布 TP=master，PD 分离=router；worker/PD 节点只起 server 不需要）。节点就绪后容器内软链到 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装；clone/分发失败或节点无源码时不软链，回退清华镜像在线安装（需外网）。（旧版 `run.evalscope_source` 字段已移除，无需配置）
+② **evalscope（精度框架，零配置）**：源码固定在 `{workspace}/evalscope`（与 sglang 仓同约定），**仅当配置了精度用例才准备**——prepare 阶段读执行机 repo 上的用例文件，含 `test_npu_accuracy_utils` import（或直接调 `run_evalscope`）即判定为精度用例，纯性能配置不 clone、不分发；用例文件读不到时保守视为精度用例（宁可多 clone）。判定通过后执行机自动浅克隆官方仓（目录非空则跳过，想用自定义版本直接放入该目录；代理取 `run.env` 的 `http_proxy`/`https_proxy`），再以 sglang 仓同款方式（清理旧目录 + 整目录复制）同步到精度用例跑测试的节点（单机=node，混布 TP=master，PD 分离=router；worker/PD 节点只起 server 不需要）。节点就绪后容器内软链到 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装；clone/分发失败或节点无源码时不软链，回退清华镜像在线安装（需外网）。（旧版 `run.evalscope_source` 字段已移除，无需配置）
 
 ③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置）并逐条执行 `configs/pip_deps.txt` 里的安装命令，随后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
 
-依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；任一条失败即初始化失败（该节点单机用例记 error，看 `.init.log` 定位）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源（可用 `run.env` 配 `http_proxy` 等代理）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
+依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源（可用 `run.env` 配 `http_proxy` 等代理）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
 
 ```bash
 cd /root/sglang                    # 对齐 CI 的执行目录 (初始化建好的 repo 软链)
@@ -136,7 +136,7 @@ pip install sentence_transformers zss "wandb>=0.16.0" ...   # 照抄 CI Install 
 . "${sglang_source_path}/scripts/ci/utils/sgl_eval_ref.sh"
 pip install "$SGL_EVAL_SPEC"
 # ---- lmms-eval (源码安装) ----
-git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
 ...
 # ---- sglang_router ----
 apt-get install -y libssl-dev
@@ -350,8 +350,7 @@ python3 src/run.py
 
 多机用例在 `用例名` 下再按角色/节点序号分一层子目录（`prefill-0/`、`decode-0/`、`router-0/` 或 `node-0/`、`node-1/`），每个子目录内有自己的 `tmp/`、`plog/` 挂载及注入的协调桥接 `sitecustomize.py`（及其编译缓存 `__pycache__/`，见第 7/8 节）——多机用例仍每角色一个独立容器。
 
-拉回后远程节点的 `runs/` **不删除**，多次执行会按 run_id 各占一个子目录，累积保留；
-本机节点（执行机=节点）在拷贝成功后自动清理用例目录，run 结束再清掉共享残留（见 6.3）。
+拉回后节点侧 `runs/` **不删除**（本机/远程节点行为一致），多次执行会按 run_id 各占一个子目录，累积保留作排查现场（含 `.init.log`、`tmp/` 等 fetch 不回传的内容）；磁盘紧张时手动 `rm -rf` 旧 run 目录即可。
 
 ### 6.2 执行机上的日志（拉回副本 + 实时回显）
 
@@ -366,7 +365,7 @@ python3 src/run.py
     └── plog/                          # 从节点拉回的 NPU 底层日志
 ```
 
-以下内容 **fetch 不回传**（远程节点的 `runs/` 原件始终保留，需要深度排查时可手动重拉）：
+以下内容 **fetch 不回传**（节点侧 `runs/` 原件始终保留——本机/远程一致，需要深度排查时直接查看）：
 
 - `tmp/`（容器内 /tmp：预置数据集、torch 编译缓存；单机共享容器在 `run_id/` 层、多机角色在各自子目录）——体积大且排查价值低；
 - 共享容器的 `plog/`（`run_id/` 层，全部单机用例混写；每条用例目录内已有隔离快照副本）；
@@ -400,8 +399,8 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
 ├── runs/                                    ← 节点（共享容器挂载写入）
 │   └── single-20260916-100000/              ← 共享容器 /output
 │       ├── sitecustomize.py / run_case.py / .init.log / tmp/ / plog/
-│       │                                      ← 共享文件（run 结束统一清理）
-│       └── qwen3-32b-gsm8k/                 ← 用例目录（fetch 成功后即清理）
+│       │                                      ← 共享文件（始终保留）
+│       └── qwen3-32b-gsm8k/                 ← 用例目录（始终保留）
 │           ├── test_npu_qwen3_32b.log       ← 容器重定向写
 │           └── plog/                        ← 用例结束从共享 plog 拷贝的快照
 │
@@ -414,7 +413,7 @@ summary.json **每跑完一条用例即全量重写一次**（非结束时统一
             └── plog/                        ← fetch 从节点拉回
 ```
 
-两个目录完全独立，无并发写入同一文件的问题。本机节点时清理分两步：每条用例 fetch 拷贝成功后**自动删除**节点侧 `runs/{run_id}/{用例名}/`（避免与 `results/` 重复占磁盘，拷贝失败则保留原件）；run 结束再清掉 `run_id/` 层的共享残留（tmp/plog/注入脚本/.init 标记），全部用例产物均已拉回时连同 `runs/{run_id}/` 一并删除。远程节点的 `runs/` 始终保留。
+两个目录完全独立，无并发写入同一文件的问题。节点侧 `runs/` 原件（本机/远程一致）**始终保留**作排查现场——含 `.init.log`、`tmp/` 等 fetch 不回传的内容；代价是与 `results/` 重复占一份磁盘，紧张时手动 `rm -rf` 旧 run 目录即可。run 结束统一删除的只有容器（`sgl-pipeline-single` / 多机角色容器），不删 `runs/` 下任何文件。
 
 跨节点执行时同理：节点上留在 `runs/`，执行机上落在 `results/`，fetch 把节点 `runs/{id}/{suite}/` 内容拉回到执行机 `results/{id}/{suite}/`。
 
@@ -626,7 +625,10 @@ run:
 ```
 
 **Q: 为什么 `docker ps` 只看到一个 `sgl-pipeline-single` 容器？**
-同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。初始化/依赖安装出问题时看节点上 `runs/{run_id}/.init.log`。
+同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。初始化完成时控制台会自动汇总被跳过的依赖命令（`[pip_deps] [WARN]` 行）；初始化报错则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。
+
+**Q: 能在同一执行机同时跑两个 run.py 吗？**
+不建议。多机用例的协调服务固定用 9377 端口，第二个 run 启动协调服务时会**自动清理占用该端口的残留流水线进程**——会把第一个仍在运行的 run.py 主进程杀掉。多个 run 请串行执行（或用 `--at` 定时错开）。
 
 ## <a id="sec-appendix-a"></a>附录 A: 配置 SSH 免密
 

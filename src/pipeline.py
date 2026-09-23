@@ -231,8 +231,8 @@ def _rm_fetch_excluded(local_dir):
 
 def ssh_fetch_dir(node, remote_dir, local_dir, dry_run=False):
     """拉回节点产物: 本机直接 cp, 远程走 tar 管道。
-    _FETCH_EXCLUDES 中的内容不回传; 远程节点的 runs/ 原件始终保留,
-    需要深度排查时可手动重拉。
+    _FETCH_EXCLUDES 中的内容不回传; 节点侧 runs/ 原件 (本机/远程一致)
+    始终保留, 需要深度排查时可手动查看/重拉。
     """
     local = _is_local(node)
     if dry_run:
@@ -850,9 +850,10 @@ def prepare_evalscope(cfg, master_hosts, dry_run=False):
     与 sglang 仓同模式 (执行机唯一 git 点 + 同路径内网分发): 各节点不 clone
     (慢且需外网); 分发与 sync_repo_to_node 一致——先清理节点旧目录再整目录
     复制, 节点内容与执行机严格一致。自定义版本直接放执行机 {workspace}/evalscope
-    (非空即跳过 clone, 同样被分发)。master_hosts 只含跑测试的节点 (单机=node,
-    PD 分离=router, 混布 TP=第一个节点); worker/PD 节点只起 server 不装精度
-    框架 (与 run.datasets 仅测试节点需要同理)。
+    (非空即跳过 clone, 同样被分发)。调用方 (run.prepare_nodes) 已按精度用例
+    过滤: 未配置精度用例时不调本函数; master_hosts 只含精度用例跑测试的节点
+    (单机=node, PD 分离=router, 混布 TP=第一个节点), worker/PD 节点只起
+    server 不装精度框架 (与 run.datasets 仅测试节点需要同理)。
     staging 幂等: 非空跳过 clone (跨 run 复用, rm -rf 后重跑可强制刷新)。
     clone 为原子式 (先 .cloning 后 rename), 中断不留半成品, 下次重跑自愈。
     clone 失败整体跳过分发 (离线执行机无外网时的预期降级; 节点无源码 →
@@ -996,7 +997,8 @@ _SHARED_CONTAINER = "sgl-pipeline-single"
 # 共享容器初始化 (vendor 环境/软链/数据集预置/pip 依赖安装) 的轮询间隔与最长等待;
 # 失败/超时会打印 .init.log 尾部辅助定位 (日志经 /output 挂载落在宿主机 runs/ 下)
 _INIT_POLL_SEC = 10
-_INIT_WAIT_SEC = 1800  # 30 分钟: 覆盖走代理安装较重的依赖
+_INIT_WAIT_SEC = 3600  # 60 分钟: 首次冷缓存时 lmms-eval 源码安装 + MMMU 数据集
+                        # 下载 (走代理) 可能超 30 分钟; 二次运行有 ~/.cache 缓存会快很多
 
 
 def _vendor_env_parts():
@@ -1185,10 +1187,19 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     d = cfg.run.docker
     init = _container_init_parts(cfg)
     # 自定义 python 依赖 (流水线 configs/pip_deps.txt, 固定路径零配置, 内容
-    # 对齐 CI Install dependencies 步骤): 每行一条命令原样执行, 装进容器系统
-    # python (用例同解释器), 每节点只装一次, 该节点全部单机用例复用; 命令行
-    # 由 run.py 加载配置时读入 (注释/空行已剔除), 此处无需再解析文件
-    init += cfg.run.pip_cmds
+    # 对齐 CI Install dependencies 步骤): 每行一条命令, 装进容器系统 python
+    # (用例同解释器), 每节点只装一次, 该节点全部单机用例复用; 命令行由 run.py
+    # 加载配置时读入 (注释/空行已剔除), 此处无需再解析文件。
+    # 单条失败不终止初始化: "{ cmd; } || echo WARN" 逐条兜底 —— 花括号组在
+    # 当前 shell 执行 (cd/变量状态对后续行延续), || 接住非零返回码打 WARN 进
+    # .init.log 后继续下一条 (依赖缺失的影响留给用例自身暴露); WARN 内嵌命令
+    # 原文, 单引号转义防变量在 echo 处被展开
+    n_pip = len(cfg.run.pip_cmds)
+    init += [
+        "{ %s; } || echo '[pip_deps] [WARN] 第 %d/%d 条命令失败, 已跳过: %s'"
+        % (c, i, n_pip, c.replace("'", "'\\''"))
+        for i, c in enumerate(cfg.run.pip_cmds, 1)
+    ]
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
         " > /output/.init.log 2>&1\n"
@@ -1331,11 +1342,13 @@ class SingleNodeContainers:
                        quiet=True, silent=True) == 0:
                 _log(f"[execute] 共享容器初始化完成 (耗时 "
                      f"{round(time.perf_counter() - tic, 1)}s)")
+                self._report_pip_warns(node, runs_dir)
                 return
-            # 初始化子 shell 失败 (依赖安装出错等): 打印 .init.log 尾部定位
+            # 初始化子 shell 失败 (依赖装失败只跳过不失败, 到这的都是 vendor
+            # 环境/软链/数据集等阶段出错): 打印 .init.log 尾部定位
             if ssh_run(node, f"test -f {q_runs}/.init-fail",
                        quiet=True, silent=True) == 0:
-                self._fail(node, runs_dir, "初始化失败 (依赖安装出错?)")
+                self._fail(node, runs_dir, "初始化失败 (非依赖阶段出错)")
             # 容器本身退出 (镜像缺 bash/OOM 等): 轮询会一直落空, 主动检出
             if ssh_run(node, alive_cmd, quiet=True, silent=True) != 0:
                 self._fail(node, runs_dir, "容器意外退出")
@@ -1349,6 +1362,22 @@ class SingleNodeContainers:
                      f"最长 {_INIT_WAIT_SEC}s)")
             time.sleep(_INIT_POLL_SEC)
 
+    def _report_pip_warns(self, node, runs_dir):
+        """初始化成功后汇总屏显被跳过的依赖 (失败跳过语义下 pip 失败不终止
+        初始化, 控制台唯一可见线索就是这里的 WARN 行)。无跳过时打一行确认,
+        有则列出全部 WARN 行 (含命令原文, 对应 .init.log 可查原始报错)。"""
+        grep_cmd = (f"grep -F '[pip_deps] [WARN]' "
+                    f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+        # 非 quiet 的 ssh_run 会把 grep 结果实时回显到控制台; 先探有无
+        # (silent) 再决定打哪行提示, 避免"确认行"和"WARN 行"都出
+        if ssh_run(node, grep_cmd, quiet=True, silent=True) == 0:
+            _log(f"[execute] 以下 pip 依赖命令装失败已跳过 (详见 .init.log):")
+            ssh_run(node, grep_cmd)  # 回显全部 WARN 行
+        else:
+            n = len(self._cfg.run.pip_cmds)
+            _log(f"[execute] pip 依赖全部安装成功 (共 {n} 条)"
+                 if n else "[execute] 无 pip 依赖安装 (pip_deps.txt 为空)")
+
     def _fail(self, node, runs_dir, reason):
         """初始化失败收尾: 删容器 + 打印 .init.log 尾部 + 抛错 (含 fast-fail 标记)。"""
         self._failed.add(node.host)
@@ -1360,34 +1389,21 @@ class SingleNodeContainers:
         raise RuntimeError(f"节点 {node.host} 共享容器{reason}, 详见上方 .init.log 尾部")
 
     def cleanup(self):
-        """run 结束统一清理: docker rm -f (容器内残留进程随 cgroup 整体回收)。"""
+        """run 结束统一清理: docker rm -f (容器内残留进程随 cgroup 整体回收)。
+        runs/ 原件 (含 tmp/plog/.init.log 等) 本机与远程节点一致, 始终保留
+        作排查现场, 磁盘紧张手动清理旧 run 目录即可。"""
         for host, node in self._started.items():
             _log(f"[cleanup] {host} 删除单机共享容器 {_SHARED_CONTAINER}")
             ssh_run(node,
                     f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
                     quiet=True, dry_run=self._dry_run)
-            # 本机节点: 清理仅剩的 run 级残留 (共享 tmp/plog/标记/注入脚本,
-            # 用例目录已随 fetch 删除); rmdir 仅在全部用例产物均已拉回时成功
-            # (有 fetch 失败的残留则整目录保留), 与旧"每用例独立目录"的清理
-            # 语义对齐; 远程节点 runs/ 原件始终保留 (可手动重拉), 不清理
-            if _is_local(node) and not self._dry_run:
-                q = shlex.quote(
-                    f"{self._cfg.run.workspace}/runs/{self._run_id}")
-                ssh_run(node,
-                        f"rm -rf {q}/tmp {q}/plog {q}/sitecustomize.py "
-                        f"{q}/run_case.py {q}/__pycache__ {q}/.init-ok "
-                        f"{q}/.init-fail {q}/.init.log; "
-                        f"rmdir {q} 2>/dev/null || true", quiet=True)
         self._started.clear()
 
 
-def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
+def _fetch_artifacts(node, node_run_dir, local_dir, label):
     """拉回一个执行单元的产物 (用例名.log + ssh.log + plog/, 排除项见
-    _FETCH_EXCLUDES)。
-
-    本机节点: 拷贝成功后清理 runs/ 侧副本省磁盘 (results/ 已有一份), 并逐级
-    清掉因此变空的上层目录直到 runs/ 根 (含; 之上的 workspace 不动);
-    远程节点: runs/ 是节点侧唯一原始数据, 始终保留。
+    _FETCH_EXCLUDES)。节点侧 runs/ 原件 (本机/远程一致) 始终保留作排查
+    现场, results/ 为归档副本, 磁盘紧张手动清理旧 run 目录即可。
     """
     frc = ssh_fetch_dir(node, node_run_dir, local_dir)
     # label 为空时 (单机用例, 段落上下文已明确) 不占位
@@ -1396,28 +1412,7 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label, runs_root):
         # 失败保留完整路径便于手动重拉
         _log(f"[fetch] {who}拉回失败 (rc={frc}), 保留节点侧原件: {node_run_dir}")
         return
-    note = "日志 + plog"
-    if _is_local(node):
-        try:
-            shutil.rmtree(node_run_dir)
-        except OSError as e:
-            _log(f"[fetch] {who}拉回完成 ({note}); 清理本机 runs/ 副本失败 "
-                 f"({e}), 保留: {node_run_dir}")
-            return
-        note += ", 本机 runs/ 副本已清理"
-        # 逐级向上清掉变空的目录直到 runs/ 根 (含); rmdir 只删空目录, 其他用例/
-        # 角色还在用时自然失败即止 (下级非空时上级必非空, 无需再往上试)
-        root = runs_root.rstrip("/")
-        d = os.path.dirname(node_run_dir)
-        while d == root or d.startswith(root + "/"):
-            try:
-                os.rmdir(d)
-            except OSError:
-                break
-            if d == root:
-                break
-            d = os.path.dirname(d)
-    _log(f"[fetch] {who}拉回完成 ({note})")
+    _log(f"[fetch] {who}拉回完成 (日志 + plog)")
 
 
 def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False):
@@ -1467,8 +1462,7 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False
             _log(f"[execute] 用例异常结束 (rc={rc}, 耗时 {dur}s), "
                  f"日志: {os.path.join(local_suite_dir, _log_filename(suite))}")
         if not dry_run:
-            _fetch_artifacts(node, node_run_dir, local_suite_dir, "",
-                             f"{cfg.run.workspace}/runs")
+            _fetch_artifacts(node, node_run_dir, local_suite_dir, "")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -1693,8 +1687,7 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
             for (role, idx, node), key in zip(units, keys):
                 node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}/{key}"
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, key,
-                                 f"{cfg.run.workspace}/runs")
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, key)
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
@@ -1881,8 +1874,7 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
             for (idx, node), key in zip(units, keys):
                 node_run_dir = f"{cfg.run.workspace}/runs/{run_id}/{suite.name}/{key}"
                 local_unit_dir = os.path.join(local_run_dir, suite.name, key)
-                _fetch_artifacts(node, node_run_dir, local_unit_dir, key,
-                                 f"{cfg.run.workspace}/runs")
+                _fetch_artifacts(node, node_run_dir, local_unit_dir, key)
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"

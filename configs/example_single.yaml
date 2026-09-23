@@ -23,7 +23,7 @@ run:
   #   ASCEND_USE_FIA: "1"                  # A5 灵衢互联 (FIA) 开启
   # 依赖安装: 无需配置, 固定读流水线 configs/pip_deps.txt (已按 CI Install dependencies 步骤
   #           预置, 按需增删/清空即关闭), 见 README 3.1 说明 ③
-  # evalscope 无需配置: 精度用例 (如 gpqa/gsm8k) 的源码自动准备到 {workspace}/evalscope 并同步到测试节点
+  # evalscope 无需配置: 仅配置了精度用例 (如 gpqa/gsm8k) 时, 源码自动准备到 {workspace}/evalscope 并同步到测试节点; 纯性能配置不 clone
 
 nodes:
   - host: 192.168.10.1   # [必填] 节点 IP; 指向执行机本身时自动本地执行 (不走 SSH)

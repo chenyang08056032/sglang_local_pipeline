@@ -11,7 +11,7 @@ run:
   #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
   # datasets:                              # 常用: 预置到容器 /tmp/ 的数据集; 仅 master (列表第一个) 节点需要存在
   #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
-  # evalscope 无需配置: 精度用例源码自动准备到 {workspace}/evalscope 并同步到 master 节点
+  # evalscope 无需配置: 仅配置了精度用例时, 源码自动准备到 {workspace}/evalscope 并同步到 master 节点; 纯性能配置不 clone
 
 nodes:
   - host: 192.168.10.1   # [必填] master (A3, 16 卡)
