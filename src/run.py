@@ -8,6 +8,7 @@
     python3 src/run.py --config configs/example_single.yaml --dry-run
     python3 src/run.py --config configs/example_single.yaml --at "2026-09-17 18:00:00"
     python3 src/run.py --config configs/example_single.yaml --at "18:00:00"   # 今天已过则取明天
+    python3 src/run.py --config configs/example_single.yaml -d   # 后台执行 (detach), 断链不影响 (日志: results/{run_id}/console.log)
 """
 
 import argparse
@@ -16,6 +17,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -463,6 +465,60 @@ def wait_until(target_dt):
     _log(f"[定时] 到达指定时间, 开始执行")
 
 
+def _sighup_to_interrupt(signum, frame):
+    """SIGHUP 转为 KeyboardInterrupt: 前台执行时 SSH 断链/关窗不再立即死亡
+    (默认行为不走任何 finally, 节点上的共享容器/角色容器残留占卡), 而是复用
+    Ctrl+C 的完整清理链路 (run_suites finally 删共享容器, 多机用例 finally
+    删角色容器)。终端已消失, fd 1/2 再写会 EIO/EPIPE 中断清理循环里的
+    print, 先转到 /dev/null 保住清理动作本身 (清理不依赖输出)。"""
+    try:
+        _dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_dn, 1)
+        os.dup2(_dn, 2)
+        os.close(_dn)
+    except OSError:
+        pass
+    raise KeyboardInterrupt
+
+
+def daemonize(log_path):
+    """fork 转入后台执行: 父进程立即返回, 子进程 setsid 脱离终端后继续流水线。
+
+    SSH 窗口断链/关闭 (SIGHUP) 不再波及 run.py; 全部输出改写 log_path。
+    重定向在 fd 级做 (dup2 到 1/2) 而非替换 sys.stdout 对象: 输出统一走
+    print (fd 1), 子进程 (ssh 等) 继承的也是 fd, 只换 Python 对象会漏。
+    stdin 关到 /dev/null, 防后台进程偶发读到终端 EOF。
+    返回: 父进程返回子 pid (>0, 调用方打印提示后退出); 子进程返回 0 继续。
+    """
+    # fork 前冲刷缓冲, 避免同一份内容在父子各写一次
+    sys.stdout.flush()
+    sys.stderr.flush()
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        pid = os.fork()
+    except OSError as e:
+        os.close(log_fd)
+        raise RuntimeError(f"fork 失败: {e}")
+    if pid > 0:
+        os.close(log_fd)
+        return pid
+    # ---- 子进程: 新会话脱离控制终端 (断链不再收 SIGHUP) ----
+    os.setsid()
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    # print 落文件默认整块缓冲, 改行缓冲让 tail -f 实时可见
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, OSError):
+            pass
+    return 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="sglang 本地测试流水线")
     parser.add_argument("--config", "-c", required=True, help="配置文件 (YAML)")
@@ -471,6 +527,9 @@ def parse_args():
     parser.add_argument("--at", metavar="TIME",
                         help="定时执行: 指定开始时间, 支持 'YYYY-MM-DD HH:MM:SS' 或 'HH:MM:SS' "
                              "(今天已过则取明天)")
+    parser.add_argument("--detach", "-d", action="store_true",
+                        help="后台执行: 进程脱离终端, SSH 断链/关窗不影响; "
+                             "输出写入 {workspace}/results/{run_id}/console.log")
     return parser.parse_args()
 
 
@@ -644,11 +703,35 @@ def print_summary(results, passed, failed, run_dir):
 
 
 def main():
+    # SIGHUP (前台断链/关窗) 转中断异常, 保住 finally 容器清理; 后台模式已
+    # setsid 脱离终端正常收不到 SIGHUP, 装了也无害; 无 SIGHUP 的平台跳过
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _sighup_to_interrupt)
     args = parse_args()
 
+    # --detach 平台预检 (需 os.fork): 提前到建 run_dir 之前, 无 fork 平台
+    # (如 Windows) 直接报错退出, 不残留空的 results/{run_id}/ 目录;
+    # --dry-run 下 --detach 本就被忽略, 不拦
+    if args.detach and not args.dry_run and not hasattr(os, "fork"):
+        # 补全 --suite/--at: 提示命令可直接复制执行, 漏参会跑错用例范围
+        hint = (f"nohup python3 src/run.py --config {args.config}"
+                + "".join(f" --suite {s}" for s in args.suite or [])
+                + (f' --at "{args.at}"' if args.at else "") + " &")
+        _log(f"[错误] 当前平台不支持 --detach (需 os.fork, 执行机 Linux "
+             f"可用); 可手动后台执行: {hint}")
+        return 2
+
+    # --at 前台先解析校验 (格式错误按参数错误报 rc=2, 不裸 traceback),
+    # 实际等待挪到 --detach 转后台之后: 定时等待本身就该在后台进行,
+    # 断链才不会中断等待
     if args.at:
-        target = parse_at(args.at)
-        wait_until(target)
+        try:
+            target = parse_at(args.at)
+        except ValueError as e:
+            _log(f"[错误] {e}")
+            return 2
+    else:
+        target = None
 
     try:
         cfg = load_config(args.config)
@@ -658,7 +741,6 @@ def main():
         # 退出 (rc=2), 不裸 traceback (rc=1)
         _log(f"[错误] 配置文件无效: {e}")
         return 2
-    print_config(cfg, args.config)
 
     if not filter_suites(cfg, args.suite):
         return 2
@@ -667,8 +749,41 @@ def main():
     yaml_stem = re.sub(r"\.(ya?ml)$", "", os.path.basename(args.config), flags=re.I)
     run_id = f"{yaml_stem}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     run_dir = os.path.join(cfg.output_dir, run_id)
-    os.makedirs(run_dir, exist_ok=True)
+    try:
+        os.makedirs(run_dir, exist_ok=True)
+    except OSError as e:
+        _log(f"[错误] 创建结果目录失败: {run_dir} ({e}); 请检查 workspace "
+             f"路径与权限")
+        return 2
+
+    # --detach: 转入后台执行 (配置校验已完成, 错误仍报在前台终端);
+    # 配置回显/执行横幅挪到转后台之后, 保证 console.log 里有完整上下文
+    if args.detach:
+        if args.dry_run:
+            _log("[后台] --dry-run 下忽略 --detach (命令在前台打印)")
+        else:
+            # 平台预检已提前到建 run_dir 之前, 无 fork 平台不会走到这里
+            bg_log = os.path.join(run_dir, "console.log")
+            try:
+                pid = daemonize(bg_log)
+            except (RuntimeError, OSError) as e:
+                # fork/日志文件打开失败: 尚在前台原进程, 干净报错退出 (rc=2)
+                _log(f"[错误] 转入后台失败: {e}")
+                return 2
+            if pid > 0:  # 父进程: 打印后台信息后退出, 子进程继续跑流水线
+                _log(f"[后台] 已转入后台执行: PID={pid}")
+                _log(f"[后台] 跟踪日志: tail -f {bg_log}")
+                _log(f"[后台] 结果汇总: {run_dir}/summary.json")
+                # 停止须用 -INT (同 Ctrl+C): SIGTERM 默认直接杀进程不走 finally,
+                # 节点上的共享容器会残留占卡; SIGINT 转 KeyboardInterrupt, 清理逻辑照常执行
+                _log(f"[后台] 停止执行: kill -INT {pid}")
+                return 0
+
+    print_config(cfg, args.config)
     print(f"===== 流水线 run_id={run_id}  用例={len(cfg.suites)} =====")
+
+    if target:
+        wait_until(target)
 
     prepared = prepare_nodes(cfg, args.dry_run)
     if prepared is None:
@@ -681,4 +796,13 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl+C (前台) / kill -INT (后台, 见 --detach 横幅) / 终端断链
+        # (SIGHUP, 已转为中断): 容器清理已由各层 finally 完成 (run_suites
+        # finally 删共享容器, 多机用例 finally 删角色容器), 此处只干净收尾,
+        # 不打整段 traceback
+        _log("[中断] 收到中断信号, 流水线已停止; 如需确认节点无残留: "
+             "docker ps --filter name=sgl-pipeline-")
+        sys.exit(130)

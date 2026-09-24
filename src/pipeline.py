@@ -202,6 +202,18 @@ def ssh_run(node, command, log_path=None, diag_path=None,
             if log_f:
                 log_f.write(line)
                 log_f.flush()
+    except BaseException:
+        # 中断 (kill -INT / Ctrl+C) 时立即杀子进程, 不等它自然结束:
+        # 后台进程无控制终端, 信号只发给 run.py 自身, ssh/子进程不会随之退出,
+        # 下方 finally 的 proc.wait() 会一直阻塞到远端命令跑完 (可能数小时),
+        # 横幅承诺的 "kill -INT PID 停止" 即失效。杀掉客户端后远端命令随会话
+        # 退出, 容器内残留进程由 run_suites 的 finally cleanup() 统一回收。
+        # KeyboardInterrupt 是 BaseException 子类, 用 Exception 接不住
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        raise
     finally:
         proc.wait()
         # [连接诊断] rc + 耗时: SSH 失败 (rc=255)、BatchMode 拒绝、命令超时等在此一目了然;
@@ -474,45 +486,62 @@ if "test_env_evalscope" in sys.prefix:
 
 
 # 注入容器的 run_case.py 包装器: A5 节点单机用例适配。
-# 用例脚本的 --tp-size 按 A3 节点卡数配置, A5 上需减半; 单机用例的
-# --tp-size 均经 other_args 传入 sglang.test.test_utils.popen_launch_server,
+# 用例脚本的 tp 并行度参数 (--tp-size / --tensor-parallel-size / --tp,
+# 同一参数的三种写法) 按 A3 节点卡数配置, A5 上需减半; 单机用例的该参数
+# 均经 other_args 传入 sglang.test.test_utils.popen_launch_server,
 # 在此替换该函数实现减半, 不修改 sglang 代码 (与 sitecustomize 同思路,
 # 但仅作用于主测试进程, 不影响 server/基准测试子进程)。
 # 减半仅针对 >2 的值: 未配/配 1/配 2 均视为已按 A5 卡数适配, 保持不变。
 _RUN_CASE_WRAPPER = '''\
+import logging
 import os
 import runpy
 import sys
 
 import sglang.test.test_utils as _tu
 
+# 专用 logger: 自带 handler + propagate=False, 完全不动 root logger
+# (用例稍后会自己做 logging.basicConfig, 这里先配会顶掉用例的日志格式);
+# 输出走 stderr, 与用例输出一并落入 case.log
+_a5_log = logging.getLogger("sgl_pipeline.a5")
+_a5_log.setLevel(logging.INFO)
+_a5_handler = logging.StreamHandler()
+_a5_handler.setFormatter(
+    logging.Formatter("%(asctime)s - [a5-适配] %(message)s"))
+_a5_log.addHandler(_a5_handler)
+_a5_log.propagate = False
+
 _orig_popen_launch_server = _tu.popen_launch_server
 
 
 def _halve_tp_size(other_args):
-    """把 other_args 里的 --tp-size 值除以 2 (针对 A3 卡数配置的脚本)。
+    """把 other_args 里的 tp 并行度值除以 2 (针对 A3 卡数配置的脚本)。
 
-    未配置 --tp-size 或值 <= 2 (1/2 已适配 A5 卡数) 时保持不变。
+    --tp-size / --tensor-parallel-size / --tp 是同一参数的三种写法。
+    未配置或值 <= 2 (1/2 已适配 A5 卡数) 时保持不变。
     """
+    # 单一来源: 等号写法由 f + "=" 派生, 以后加别名只改这一处
+    tp_flags = ("--tp", "--tp-size", "--tensor-parallel-size")
     args = list(other_args or [])
     for i, a in enumerate(args):
-        # 支持 --tp-size 8 和 --tp-size=8 两种写法
-        if a == "--tp-size" and i + 1 < len(args):
+        # 支持空格 (--tp 8) 和等号 (--tp=8) 两种写法
+        if a in tp_flags and i + 1 < len(args):
             try:
                 tp = int(args[i + 1])
             except (TypeError, ValueError):
                 continue
             if tp > 2:
-                print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
+                _a5_log.info(f"{a} {tp} -> {tp // 2}")
                 args[i + 1] = str(tp // 2)
-        elif a.startswith("--tp-size="):
+        elif isinstance(a, str) and a.startswith(tuple(f + "=" for f in tp_flags)):
+            flag, _, val = a.partition("=")
             try:
-                tp = int(a.split("=", 1)[1])
+                tp = int(val)
             except (TypeError, ValueError):
                 continue
             if tp > 2:
-                print(f"[a5-适配] --tp-size {tp} -> {tp // 2}")
-                args[i] = f"--tp-size={tp // 2}"
+                _a5_log.info(f"{flag}={val} -> {flag}={tp // 2}")
+                args[i] = f"{flag}={tp // 2}"
     return args
 
 
@@ -739,7 +768,7 @@ def _stage_run_wrapper(node, run_dir, dry_run=False):
     """把 A5 适配包装器写到节点 run 目录 (容器内 /output/run_case.py)。"""
     path = f"{run_dir}/run_case.py"
     if dry_run:
-        print(f"[dry-run] 写入 {path}: A5 --tp-size 减半包装器 "
+        print(f"[dry-run] 写入 {path}: A5 tp 并行度减半包装器 "
               f"({len(_RUN_CASE_WRAPPER.splitlines())} 行, 内容见 pipeline.py)")
         return 0
     cmd = (f"mkdir -p {shlex.quote(run_dir)} && "
@@ -1276,6 +1305,20 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     ])
 
 
+# 单机共享容器内的 sglang 残留进程清理段 (pgrep 枚举 + 跳过 $$ 逐个 kill -9):
+# 不用 pkill——本 exec 的 bash cmdline 内嵌整个脚本 (含用例文件路径), 路径含
+# "sglang." 时 (如自定义用例 test_sglang.e2e.py) pkill 会杀掉自身 (rc=137)。
+# 每条用例开头/结尾各执行一次: 开头清上一条用例的残留; 结尾清本条泄漏的
+# server 子进程——共享容器长驻且进程不随用例退出, 结尾不清则泄漏进程占卡
+# 到 run 结束, 同节点的下一条多机角色容器起 server 即报 NPU 卡被占用
+# (开头的清理只保护下一条单机用例, 保护不到多机用例)
+_RESIDUAL_KILL_SH = (
+    "for _pid in $(pgrep -f 'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
+    " || true); do [ \"$_pid\" != \"$$\" ] && kill -9 \"$_pid\""
+    " 2>/dev/null || true; done"
+)
+
+
 def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
                           extra_env, tmo):
     """构造单机用例在共享容器内的执行命令 (宿主机侧): mkdir 输出目录 + docker exec。
@@ -1283,7 +1326,8 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     容器内脚本: 清理上一条用例残留 → vendor 环境 (exec 不继承 init 的 source,
     每条重新加载) → timeout 包裹用例 (超时杀得干净, 退出码 124 透传) →
     日志落 /output/{用例名}/ (挂载回宿主机 runs/) + tail 跟踪屏显 →
-    plog 快照到用例目录 (共享 /root/ascend/log 全用例混写, 拷贝实现按用例隔离)。
+    plog 快照到用例目录 (共享 /root/ascend/log 全用例混写, 拷贝实现按用例隔离)
+    → 结尾清理本条泄漏的 server 子进程 (防占卡影响同节点后续多机用例)。
     外层 timeout (tmo+300s) 仅兜底 docker exec 客户端本身 hang 的极端情况。
     """
     if tp_halving:
@@ -1296,14 +1340,9 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     plog_dst = shlex.quote(f"/output/{suite.name}/plog")
     parts = [
         "set -euo pipefail",
-        # 上一条用例残留的 sglang 进程清理: 共享容器的进程不随用例退出,
-        # 崩溃/超时遗留的 server 会占卡, 不清则本条用例报 NPU 卡被占用。
-        # 不用 pkill: 本 exec 的 bash cmdline 内嵌整个脚本 (含用例文件路径),
-        # 路径含 "sglang." 时 (如自定义用例 test_sglang.e2e.py) pkill 会杀掉
-        # 自身 (rc=137); 改 pgrep 枚举 + 跳过 $$ 逐个 kill, 语义不变
-        "for _pid in $(pgrep -f 'sglang[.:]|sglang[ ]serve|sglang[_-]router'"
-        " || true); do [ \"$_pid\" != \"$$\" ] && kill -9 \"$_pid\""
-        " 2>/dev/null || true; done",
+        # 上一条用例残留的 sglang 进程清理 (段本体与注释见 _RESIDUAL_KILL_SH):
+        # 崩溃/超时遗留的 server 会占卡, 不清则本条用例报 NPU 卡被占用
+        _RESIDUAL_KILL_SH,
     ]
     parts += _vendor_env_parts()
     # 前台同步预建日志, 用例后台改为追加: /output 落在 NFS 等慢速共享存储时,
@@ -1320,6 +1359,10 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     # 退出码透传: wait 失败不经 set -e 提前退出 (|| 接住), 保证 plog 拷贝执行
     parts.append("_rc=0; wait $_case_pid || _rc=$?")
     parts.append(f"cp -r /root/ascend/log {plog_dst} 2>/dev/null || true")
+    # 结尾清理本条用例泄漏的 server 子进程 (开头清的是上一条的): 共享容器
+    # 长驻, 泄漏进程不清会占卡到 run 结束——混合配置下同节点先单机后多机时,
+    # 多机角色容器起 server 即报 NPU 卡被占用
+    parts.append(_RESIDUAL_KILL_SH)
     parts.append("exit $_rc")
 
     inner = "\n".join(parts)
@@ -1359,11 +1402,14 @@ class SingleNodeContainers:
 
     def get(self, node):
         """返回节点共享容器名; 未启动则启动并等初始化完成 (失败抛 RuntimeError)。"""
-        if node.host in self._started:
-            return _SHARED_CONTAINER
+        # _failed 先于 _started 检查: 容器启动登记提前到等待初始化之前 (见下),
+        # 初始化失败的节点 (_fail 已删容器) 两处都命中时须快速失败, 而非返回
+        # 已不存在的容器名
         if node.host in self._failed:
             raise RuntimeError(
                 f"节点 {node.host} 共享容器初始化已失败, 该节点单机用例全部跳过")
+        if node.host in self._started:
+            return _SHARED_CONTAINER
         runs_dir = f"{self._cfg.run.workspace}/runs/{self._run_id}"
         where = ("本机" if _is_local(node)
                  else f"{node.user}@{node.host}:{node.port}")
@@ -1376,7 +1422,7 @@ class SingleNodeContainers:
         if _stage_sitecustomize(node, runs_dir, self._dry_run) != 0:
             self._failed.add(node.host)
             raise RuntimeError(f"节点 {node.host} 写入 sitecustomize.py 失败")
-        # A5 节点注入 --tp-size 减半包装器 (单机用例专属适配, 启动时装一次)
+        # A5 节点注入 tp 并行度减半包装器 (单机用例专属适配, 启动时装一次)
         if (node.arch == "a5"
                 and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
             self._failed.add(node.host)
@@ -1386,9 +1432,13 @@ class SingleNodeContainers:
         if rc != 0:
             self._failed.add(node.host)
             raise RuntimeError(f"节点 {node.host} 共享容器启动失败 (rc={rc})")
+        # 容器启动成功即登记 (不等初始化完成): 初始化等待期 (可长达
+        # init_timeout_minutes) 被 Ctrl+C/断链中断时, run_suites 的 finally
+        # cleanup() 才能删掉仍在初始化的容器; 初始化失败路径 _fail 会自删
+        # 容器, 提前登记只让 cleanup 多做一次幂等 rm -f, 无害
+        self._started[node.host] = node
         if not self._dry_run:
             self._wait_init(node, runs_dir)  # 失败抛 RuntimeError
-        self._started[node.host] = node
         return _SHARED_CONTAINER
 
     def _wait_init(self, node, runs_dir):

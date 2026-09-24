@@ -250,6 +250,9 @@ python3 src/run.py --config configs/example_single.yaml --suite test_npu_qwen3_3
 # 4. 定时执行（等到指定时间再开始，便于夜间无人值守跑用例）
 python3 src/run.py --config configs/example_single.yaml --at "2026-09-17 18:00:00"   # 已过则立即执行并警告
 python3 src/run.py --config configs/example_single.yaml --at "18:00:00"   # 今天已过则取明天
+
+# 5. 后台执行（脱离终端，SSH 断链/关窗不影响；启动后回显 PID/日志/停止命令即返回）
+python3 src/run.py --config configs/example_single.yaml -d
 ```
 
 `--at` 按**执行机本地时间**计算（不是节点时间）。执行机与节点跨时区时尤其要注意。
@@ -269,10 +272,11 @@ date +"%H:%M:%S"            # 输出形如 18:00:00
 | `--suite NAME` | 只执行指定用例，可多次传，按 name 匹配 |
 | `--dry-run` | 只打印命令不执行，用于校验配置和 docker 命令 |
 | `--at TIME` | 定时执行：阻塞到指定时间再开始。支持 `YYYY-MM-DD HH:MM:SS`（已过则立即执行并警告）或 `HH:MM:SS`（今天已过则取明天）。等待期间每分钟打印剩余秒数 |
+| `--detach` / `-d` | 后台执行：配置校验通过后 fork 出子进程并 `setsid` 脱离终端，SSH 断链/关窗不再中断流水线。父进程回显 PID、日志路径与停止命令后立即退出，全部输出写入 `{workspace}/results/{run_id}/console.log`（`tail -f` 跟踪）。可与 `--at` 搭配（等待也在后台）；`--dry-run` 下忽略。停止须用 `kill -INT PID`（同 Ctrl+C，会执行容器清理；裸 `kill` 发 SIGTERM 不走清理逻辑，容器会残留占卡） |
 
 ### 退出码
 
-- `0`：全部通过（或 dry-run）
+- `0`：全部通过（或 dry-run，或 `--detach` 成功转入后台）
 - `1`：有用例失败
 - `2`：配置错误（配置文件解析/校验失败、用例引用的节点未定义、无匹配用例等）
 
@@ -309,8 +313,9 @@ python3 src/run.py
     │       容器内初始化 (执行机轮询 .init-ok 标记确认完成):
     │         覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
     │         → 逐条执行 configs/pip_deps.txt 安装命令 (可选, 只装一次)
-    │       每条用例: docker exec 执行 (执行前清理上一条用例残留的 sglang
-    │         进程防占卡; 超时由容器内 timeout 控制; A5 节点经
+    │       每条用例: docker exec 执行 (执行前后各清理一次共享容器内残留的
+    │         sglang 进程防占卡——结尾一次保证同节点后续多机角色容器不被
+    │         本条泄漏的 server 占卡; 超时由容器内 timeout 控制; A5 节点经
     │         /output/run_case.py 包装启动, --tp-size 自动减半)
     │     多机用例 (roles): router 容器先启动 (等其写入 active-test-class),
     │       再启动 PD 容器; 各节点 docker run 同一用例文件, 以
@@ -360,6 +365,7 @@ python3 src/run.py
 ```
 /root/sglang_local_pipeline/results/single-20260916-100000/
 ├── summary.json                       # run.py 写入的汇总 (每跑完一条用例即更新)
+├── console.log                        # --detach 时的完整控制台输出 (前台执行无此文件)
 └── qwen3-32b-gsm8k/
     ├── test_npu_qwen3_32b.log         # ssh_run 实时回显 → fetch 覆盖为容器内落盘版本
     ├── ssh.log                        # SSH 连接诊断（本地直写，fetch 不覆盖）
@@ -626,10 +632,13 @@ run:
 ```
 
 **Q: 为什么 `docker ps` 只看到一个 `sgl-pipeline-single` 容器？**
-同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。等待初始化期间控制台每分钟回显最新一条 `[pip_deps]` 进度行（第几条命令/耗时）；初始化完成时控制台会自动汇总被跳过的依赖命令（`[pip_deps] [WARN]` 行）；初始化报错或超时（最长 `run.init_timeout_minutes`，默认 120 分钟）则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。
+同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。等待初始化期间控制台每分钟只打一次心跳行（pip 逐条进度不上屏，看节点 `.init.log`）；初始化完成时控制台自动屏显依赖安装汇总行（有失败时附全部 `[pip_deps] [WARN]` 明细）；初始化报错或超时（最长 `run.init_timeout_minutes`，默认 120 分钟）则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。
 
 **Q: 能在同一执行机同时跑两个 run.py 吗？**
-不建议。多机用例的协调服务固定用 9377 端口，第二个 run 启动协调服务时会**自动清理占用该端口的残留流水线进程**——会把第一个仍在运行的 run.py 主进程杀掉。多个 run 请串行执行（或用 `--at` 定时错开）。
+不建议。任一 run 含多机用例时，协调服务固定用 9377 端口，第二个 run 启动协调服务时会**自动清理占用该端口的残留流水线进程**——会把第一个仍在运行的 run.py 主进程杀掉；两个纯单机 run 共享节点时同样冲突——共享容器固定名 `sgl-pipeline-single`，且每轮 run 的 prepare 阶段会清理节点上的 `sgl-pipeline-*` 容器，第二个 run 会删掉第一个正在使用的容器（第一个结束时的清理又会反过来删掉第二个的），两边互相破坏。多个 run 请串行执行（或用 `--at` 定时错开）。
+
+**Q: 前台执行（不加 `-d`）时 SSH 断链/关窗会怎样？**
+进程收到 SIGHUP 后会走与 Ctrl+C 相同的清理逻辑（删除节点上的共享容器/角色容器）再退出（退出码 130），不会残留容器占卡；但流水线本身不会再继续跑——需要断链后继续执行的请用 `-d` 后台模式。注意裸 `kill PID`（SIGTERM）仍不走清理（与 `kill -INT` 不同），这是信号语义差异。
 
 ## <a id="sec-appendix-a"></a>附录 A: 配置 SSH 免密
 
