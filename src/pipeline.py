@@ -491,7 +491,7 @@ if "test_env_evalscope" in sys.prefix:
 # 均经 other_args 传入 sglang.test.test_utils.popen_launch_server,
 # 在此替换该函数实现减半, 不修改 sglang 代码 (与 sitecustomize 同思路,
 # 但仅作用于主测试进程, 不影响 server/基准测试子进程)。
-# 减半仅针对 >2 的值: 未配/配 1/配 2 均视为已按 A5 卡数适配, 保持不变。
+# 减半仅针对配置为 16 的值: 其余值视为已按 A5 卡数适配, 保持不变。
 _RUN_CASE_WRAPPER = '''\
 import logging
 import os
@@ -515,22 +515,22 @@ _orig_popen_launch_server = _tu.popen_launch_server
 
 
 def _halve_tp_size(other_args):
-    """把 other_args 里的 tp 并行度值除以 2 (针对 A3 卡数配置的脚本)。
+    """把 other_args 里配置为 16 的 tp 并行度值除以 2 (针对 A3 卡数配置的脚本)。
 
     --tp-size / --tensor-parallel-size / --tp 是同一参数的三种写法。
-    未配置或值 <= 2 (1/2 已适配 A5 卡数) 时保持不变。
+    其余值保持不变 (视为已按 A5 卡数适配)。
     """
     # 单一来源: 等号写法由 f + "=" 派生, 以后加别名只改这一处
     tp_flags = ("--tp", "--tp-size", "--tensor-parallel-size")
     args = list(other_args or [])
     for i, a in enumerate(args):
-        # 支持空格 (--tp 8) 和等号 (--tp=8) 两种写法
+        # 支持空格 (--tp 16) 和等号 (--tp=16) 两种写法
         if a in tp_flags and i + 1 < len(args):
             try:
                 tp = int(args[i + 1])
             except (TypeError, ValueError):
                 continue
-            if tp > 2:
+            if tp == 16:
                 _a5_log.info(f"{a} {tp} -> {tp // 2}")
                 args[i + 1] = str(tp // 2)
         elif isinstance(a, str) and a.startswith(tuple(f + "=" for f in tp_flags)):
@@ -539,7 +539,7 @@ def _halve_tp_size(other_args):
                 tp = int(val)
             except (TypeError, ValueError):
                 continue
-            if tp > 2:
+            if tp == 16:
                 _a5_log.info(f"{flag}={val} -> {flag}={tp // 2}")
                 args[i] = f"{flag}={tp // 2}"
     return args
@@ -1332,7 +1332,7 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
     """
     if tp_halving:
         # A5 适配: 经包装器启动 (容器 /output = runs/{run_id}), 自动把 other_args
-        # 里的 --tp-size 减半 (仅值 >2 时; 未配/配 1/2 不动)
+        # 里的 --tp-size 减半 (仅配置为 16 时; 其余值不动)
         py = f"/output/run_case.py {shlex.quote(suite.file)}"
     else:
         py = shlex.quote(suite.file)
@@ -1560,8 +1560,8 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False
     tic = time.perf_counter()
     try:
         container = shared.get(node)
-        # A5 节点: 脚本 --tp-size 按 A3 卡数配置, 经包装器减半 (仅单机用例,
-        # 包装器已在容器启动时注入 /output/run_case.py)
+        # A5 节点: 脚本 --tp-size 按 A3 卡数配置, 经包装器减半 (仅单机用例且
+        # 值为 16 时, 包装器已在容器启动时注入 /output/run_case.py)
         tp_halving = node.arch == "a5"
         # A5 单机用例专属环境变量 (run.a5_env, 如灵衢 FIA 互联 ASCEND_USE_FIA);
         # 未配置时为空, 不注入; 多机用例不注入
