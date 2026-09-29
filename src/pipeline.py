@@ -1052,11 +1052,14 @@ _INIT_POLL_SEC = 10
 
 
 def _vendor_env_parts():
-    """自定义算子包环境 (DeepSeek-V4-Flash 等用例需要; 镜像未装时忽略, 与 CI 一致)。
-    vendor 脚本可能引用未定义变量 (如 ZSH_VERSION), source 前临时关 -u。
+    """Ascend 运行环境 source 段 (toolkit/atb/vendor 算子包; 镜像未装时忽略, 与 CI 一致)。
+    顺序同 run_npu_testcase.sh: 先基础环境 (toolkit/atb), 后 vendor (依赖前者变量)。
+    这些脚本可能引用未定义变量 (如 ZSH_VERSION), source 前临时关 -u。
     单机用例 docker exec 不继承容器 init 进程 source 的环境, 每条都要重新 source。"""
     return [
         "set +u",
+        "source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh || true",
+        "source /usr/local/Ascend/nnal/atb/set_env.sh || true",
         "source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/"
         "customize/bin/set_env.bash || true",
         "source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/"
@@ -1066,7 +1069,7 @@ def _vendor_env_parts():
 
 
 def _container_init_parts(cfg):
-    """容器初始化命令段 (单机共享容器与多机角色容器共用): vendor 环境 →
+    """容器初始化命令段 (单机共享容器与多机角色容器共用): Ascend 环境 (toolkit/atb/vendor) →
     覆盖 ascend 测试工具 → /root/sglang 与 evalscope 软链 → 预置数据集到 /tmp。
     单机共享容器在此基础上追加 configs/pip_deps.txt 依赖安装 (见 _build_shared_container_cmd)。"""
     repo = cfg.run.repo
@@ -1323,8 +1326,8 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
                           extra_env, tmo):
     """构造单机用例在共享容器内的执行命令 (宿主机侧): mkdir 输出目录 + docker exec。
 
-    容器内脚本: 清理上一条用例残留 → vendor 环境 (exec 不继承 init 的 source,
-    每条重新加载) → timeout 包裹用例 (超时杀得干净, 退出码 124 透传) →
+    容器内脚本: 清理上一条用例残留 → Ascend 环境 toolkit/atb/vendor (exec 不继承
+    init 的 source, 每条重新加载) → timeout 包裹用例 (超时杀得干净, 退出码 124 透传) →
     日志落 /output/{用例名}/ (挂载回宿主机 runs/) + tail 跟踪屏显 →
     plog 快照到用例目录 (共享 /root/ascend/log 全用例混写, 拷贝实现按用例隔离)
     → 结尾清理本条泄漏的 server 子进程 (防占卡影响同节点后续多机用例)。
