@@ -5,7 +5,7 @@
 run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录 (sglang 仓固定 {workspace}/sglang)
   docker:
-    image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
 
   # ---- 可选字段, 按需取消注释 (说明见 README 3.1) ----
   # extra_mounts:                          # 额外 docker -v 挂载 (如模型权重)
@@ -31,7 +31,9 @@ nodes:
 
 suites:
   # 单机用例: node 指定执行节点 (与 roles/multinode 互斥)
-  # name 可省略 (默认取 file basename); nodes 仅定义 1 个节点时 node 也可省略
+  # name 可省略 (默认取 file basename); node 也可省略:
+  #   - nodes 仅定义 1 个节点: 默认用该节点
+  #   - 多节点: 用例按负载均分到各节点并行执行 (node 显式指定则固定不动)
   - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例路径, 相对 repo
     timeout_minutes: 60     # 用例超时 (分钟), 默认 60
-    node: 192.168.10.1      # 执行节点
+    node: 192.168.10.1      # 执行节点 (多节点配置时可省略以均分)

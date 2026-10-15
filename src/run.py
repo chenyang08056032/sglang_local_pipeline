@@ -19,6 +19,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -110,6 +111,8 @@ class RunConfig:
 @dataclass
 class SuiteConfig:
     name: str
+    # 单机用例: 执行节点 host; 多节点配置时可省略——由 distribute_single_suites
+    # 按各节点负载均分 (多节点并行执行的前提), 显式指定则固定不动
     node: str = None
     file: str = None
     timeout_minutes: int = None
@@ -343,13 +346,14 @@ def load_config(path):
         node = s.get("node")
         if not specified:
             # 三者均未配: 恰好只定义 1 个节点时默认该节点 (单机配置可省略 node);
-            # 多节点时无法推断, 显式报错
-            if len(nodes) != 1:
+            # 多节点时保持 None, 由 distribute_single_suites 按负载均分到
+            # 各节点 (多节点并行执行), 均分须在 prepare_nodes 之前完成;
+            # 未定义任何节点时无从均分/推断, 保持配置期报错
+            if len(nodes) == 1:
+                node = nodes[0].host
+            elif not nodes:
                 raise ValueError(
-                    f"用例 {name}: 须配 node/roles/multinode 之一 "
-                    f"(仅当 nodes 恰好定义 1 个节点时 node 才可省略, "
-                    f"当前定义了 {len(nodes)} 个)")
-            node = nodes[0].host
+                    f"用例 {name}: nodes 未定义任何节点, 无法确定执行节点")
         if roles:
             missing = set(_MULTI_ROLES) - set(roles)
             if missing:
@@ -554,6 +558,37 @@ def filter_suites(cfg, names):
     return True
 
 
+def distribute_single_suites(cfg):
+    """多节点配置时, 把未指定 node 的单机用例均分到各节点 (并行执行前提)。
+
+    负载均衡: 显式指定 node 的单机用例固定不动并计入各节点负载基线,
+    未指定的逐条分给当前已分得用例最少的节点 (平局取 nodes 定义顺序
+    靠前者, 多条用例时呈轮询效果); 分完后各节点的单机用例数差 ≤1。
+    单节点配置无需分配 (load_config 已填默认节点)。须在 prepare_nodes
+    之前调用 (节点准备/执行均按 suite.node 展开并去重)。
+    """
+    if len(cfg.nodes) <= 1:
+        return
+    hosts = [n.host for n in cfg.nodes]
+    load = {h: 0 for h in hosts}
+    # 显式指定的用例计入负载基线 (host 不在 nodes 中时由 prepare_nodes 报错)
+    for s in cfg.suites:
+        if not s.roles and not s.multinode and s.node:
+            load[s.node] = load.get(s.node, 0) + 1
+    n_auto = 0
+    for s in cfg.suites:
+        if s.roles or s.multinode or s.node:
+            continue
+        host = min(hosts, key=lambda h: load[h])
+        s.node = host
+        load[host] += 1
+        n_auto += 1
+    if n_auto:
+        detail = ", ".join(f"{h}={load[h]}" for h in hosts)
+        _log(f"[并行] {n_auto} 个未指定节点的单机用例已按负载均分, "
+             f"各节点单机用例数: {detail}")
+
+
 def _suite_hosts(suite):
     """用例涉及的所有节点 host (单机=1 个; 多机 PD=各角色节点; 多机 TP=所有节点)。"""
     if suite.roles:
@@ -640,51 +675,145 @@ def prepare_nodes(cfg, dry_run):
 
 
 def run_suites(cfg, prepared, run_id, run_dir, dry_run):
-    """逐个执行用例, 返回结果列表。
+    """执行用例, 返回结果列表 (按配置顺序, 未开始/被中断的不含)。
 
+    并行调度 (按配置顺序切段, 不改变用例先后语义):
+      - 连续的单机用例为一段: 按执行节点分组, 每节点一个线程串行执行分到的
+        用例 (同节点共享 NPU 卡必须串行), 节点间并行——共享容器也随各节点
+        首条用例并行启动/初始化 (pip 依赖并行装)。单节点/dry-run 保持串行。
+      - 多机用例 (roles/multinode) 独占其涉及的全部节点, 单独执行且与
+        其他用例串行 (不与单机段并行抢卡)。
     单机用例经 SingleNodeContainers 复用节点长驻共享容器 (每节点一个,
     configs/pip_deps.txt 依赖只装一次), run 结束 (含中途异常/中断) finally
     统一删除容器 (runs/ 原件保留, 不清理)。
     """
-    results = []
+    total = len(cfg.suites)
+    results = [None] * total  # 预分配槽位: 线程只写各自下标, 结果天然保序
+    summary_lock = threading.Lock()
     shared = SingleNodeContainers(cfg, run_id, dry_run)
-    try:
-        for i, suite in enumerate(cfg.suites):
-            print(f"\n----- [{i+1}/{len(cfg.suites)}] {suite.name} -----")
-            hosts = _suite_hosts(suite)
-            if not all(prepared.get(h) for h in hosts):
-                missing = [h for h in hosts if not prepared.get(h)]
-                _log(f"[错误] 节点 {', '.join(missing)} 未就绪, {suite.name} 记为 error 不执行")
-                res = {"name": suite.name, "node": ",".join(hosts),
-                       "status": "error", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+
+    def _record(idx, res):
+        """结果写回槽位 + 加锁重写 summary.json (每完成一条即写, 中途被杀
+        也能看到已完成用例的结果; 并行线程同时写同一文件会交错损坏)。"""
+        results[idx] = res
+        with summary_lock:
+            write_summary([r for r in results if r], run_id, run_dir)
+
+    def _finish(idx, suite, res, prefix=""):
+        res["file"] = suite.file
+        if dry_run:
+            res["status"] = "dryrun"
+        _record(idx, res)
+        _log(f"{prefix}[结果] {suite.name}: {res['status']}")
+
+    def _run_single(idx, suite, prefix=""):
+        """执行一条单机用例 (节点共享容器内 docker exec), 记录结果。"""
+        print(f"\n----- [{idx+1}/{total}] {suite.name}"
+              + (f" @ {suite.node}" if prefix else "") + " -----")
+        try:
+            if not prepared.get(suite.node):
+                _log(f"{prefix}[错误] 节点 {suite.node} 未就绪, "
+                     f"{suite.name} 记为 error 不执行")
+                res = {"name": suite.name, "node": suite.node,
+                       "status": "error",
+                       "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "duration_sec": 0, "error": "节点准备失败, 未执行"}
-            elif suite.roles:
-                res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
-            elif suite.multinode:
-                res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir, dry_run)
             else:
                 node = cfg.find_node(suite.node)
                 res = execute_suite(cfg, suite, node, run_id, run_dir, shared,
-                                    dry_run)
-            res["file"] = suite.file
-            if dry_run:
-                res["status"] = "dryrun"
-            results.append(res)
-            _log(f"[结果] {suite.name}: {res['status']}")
-            # 每跑完一条即写 summary.json, 中途被杀也能看到已完成用例的结果
-            write_summary(results, run_id, run_dir)
+                                    dry_run, prefix=prefix)
+        except Exception as e:
+            # 线程内兜底: execute_suite 已自带 except, 此处接住调度层异常
+            # (如节点未定义), 记 error 而非让线程静默死亡丢结果
+            res = {"name": suite.name, "node": suite.node,
+                   "status": "error",
+                   "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "duration_sec": 0, "error": f"{type(e).__name__}: {e}"}
+        _finish(idx, suite, res, prefix)
+
+    def _run_multi(idx, suite):
+        """执行一条多机用例 (PD 分离/混布 TP), 记录结果。"""
+        print(f"\n----- [{idx+1}/{total}] {suite.name} -----")
+        hosts = _suite_hosts(suite)
+        try:
+            if not all(prepared.get(h) for h in hosts):
+                missing = [h for h in hosts if not prepared.get(h)]
+                _log(f"[错误] 节点 {', '.join(missing)} 未就绪, "
+                     f"{suite.name} 记为 error 不执行")
+                res = {"name": suite.name, "node": ",".join(hosts),
+                       "status": "error",
+                       "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "duration_sec": 0, "error": "节点准备失败, 未执行"}
+            elif suite.roles:
+                res = execute_multinode_suite(cfg, suite, run_id, run_dir, dry_run)
+            else:
+                res = execute_multinode_tp_suite(cfg, suite, run_id, run_dir,
+                                                 dry_run)
+        except Exception as e:
+            res = {"name": suite.name, "node": ",".join(hosts),
+                   "status": "error",
+                   "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "duration_sec": 0, "error": f"{type(e).__name__}: {e}"}
+        _finish(idx, suite, res)
+
+    def _run_single_block(i, j):
+        """执行一段连续的单机用例 [i, j): 按节点分组, 每节点一个线程串行执行
+        分到的用例 (同节点共享 NPU 卡), 节点间并行; 单节点或 dry-run 时直接
+        串行 (输出不加节点前缀, 与单线程执行一致)。并行时各节点控制台输出
+        加 [host] 前缀区分交错日志 (日志文件始终是原始输出)。"""
+        groups = {}
+        for k in range(i, j):
+            groups.setdefault(cfg.suites[k].node, []).append(k)
+        if dry_run or len(groups) <= 1:
+            for k in range(i, j):
+                _run_single(k, cfg.suites[k])
+            return
+        threads = []
+        for host, idxs in groups.items():
+            def _worker(idxs=idxs, prefix=f"[{host}] "):
+                for k in idxs:
+                    _run_single(k, cfg.suites[k], prefix)
+            t = threading.Thread(target=_worker, daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+
+    try:
+        i = 0
+        while i < total:
+            suite = cfg.suites[i]
+            if suite.roles or suite.multinode:
+                # 多机用例独占其涉及的全部节点: 单独串行执行, 不与任何
+                # 用例并行 (NPU 抢占), 段间先后仍按配置顺序
+                _run_multi(i, suite)
+                i += 1
+                continue
+            # 连续的单机用例构成一段, 整段按节点分组并行
+            j = i
+            while (j < total and not cfg.suites[j].roles
+                   and not cfg.suites[j].multinode):
+                j += 1
+            _run_single_block(i, j)
+            i = j
     finally:
         shared.cleanup()
-    return results
+    return [r for r in results if r]
 
 
 def write_summary(results, run_id, run_dir):
     """写 summary.json: 成功/失败条数 + 脚本路径 (详细过程看各用例的日志)。
-    每条用例完成即全量重写一次 (内容始终为当前已完成用例的汇总)。"""
+    每条用例完成即全量重写一次 (内容始终为当前已完成用例的汇总)。
+    cases 含每条用例的执行节点/状态/耗时: 多节点并行时从汇总即可看出
+    哪个用例在哪个节点上通过/失败 (无需翻 console.log 找 [IP] 前缀)。"""
     passed = [r for r in results if r["status"] == "pass"]
     failed = [r for r in results if r["status"] in ("fail", "error")]
     summary = {"run_id": run_id, "total": len(results),
                "passed": len(passed), "failed": len(failed),
+               "cases": [{"file": r["file"], "node": r.get("node"),
+                          "status": r["status"],
+                          "duration_sec": r.get("duration_sec", 0)}
+                         for r in results],
                "passed_scripts": [r["file"] for r in passed],
                "failed_scripts": [r["file"] for r in failed]}
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -744,6 +873,10 @@ def main():
 
     if not filter_suites(cfg, args.suite):
         return 2
+
+    # 多节点时把未指定 node 的单机用例均分到各节点 (prepare/执行都按
+    # suite.node 展开, 均分必须在 prepare_nodes 之前完成)
+    distribute_single_suites(cfg)
 
     # run_id = {yaml_stem}-{timestamp}: 文件名表职责 (summary.json), 目录名表来源 (哪个 yaml + 什么时间)
     yaml_stem = re.sub(r"\.(ya?ml)$", "", os.path.basename(args.config), flags=re.I)

@@ -149,7 +149,7 @@ pip install sglang_router
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
 | `nodes[].host` | 无 | 是 | 节点 IP。指向执行机本身时自动本地执行（不走 SSH、无需免密） |
-| `nodes[].arch` | 无 | 是 | 节点架构：`a3`=16 卡、`a5`=8 卡。决定挂卡数量（devices=auto 时）及 A5 单机用例 `--tp-size` 减半适配；缺失或拼错启动时报错 |
+| `nodes[].arch` | 无 | 是 | 节点架构：`a3`=16 卡、`a5`=8 卡。决定挂卡数量（devices=auto 时）及 A5 单机用例 `--tp-size` 16→8 减半适配；缺失或拼错启动时报错 |
 | `nodes[].user` | `root` | 否 | SSH 用户名 |
 | `nodes[].port` | `22` | 否 | SSH 端口 |
 
@@ -158,7 +158,7 @@ pip install sglang_router
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
 | `suites[].name` | 取 `file` basename 去 `.py` | 否 | 用例名称（`--suite` 过滤用）。未配置时默认取 `file` 的 basename 去掉 `.py`（如 `.../test_npu_qwen3_32b.py` → `test_npu_qwen3_32b`） |
-| `suites[].node` | 无 | 三选一 | 单机用例：执行的节点 host。**nodes 仅定义 1 个节点时可省略**，默认用该节点；多节点时必须显式指定 |
+| `suites[].node` | 无 | 三选一 | 单机用例：执行的节点 host。可省略——nodes 仅定义 1 个节点时默认用该节点；**多节点时按负载均分到各节点并行执行**（显式指定则固定不动，计入该节点负载） |
 | `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 7 节）：prefill/decode/router → 节点 |
 | `suites[].multinode` | 无 | 三选一 | 多机混布 TP 用例（第 8 节）：节点列表，第一个 = master |
 | `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo 或 `~/.cache`） |
@@ -202,7 +202,7 @@ run:
 nodes:
   - host: 192.168.10.1                  # A3; user/port 取默认时可只写 host + arch
     arch: a3
-  - host: 192.168.10.2                  # A5 (8 卡, 单机用例 --tp-size 自动减半)
+  - host: 192.168.10.2                  # A5 (8 卡, 单机用例 --tp-size 16→8)
     arch: a5
 
 suites:
@@ -233,7 +233,30 @@ suites:
     # name/node 均可省略: name 默认取 file basename, node 默认取唯一节点
 ```
 
-注意：该默认仅在**恰好 1 个节点**时生效。多节点配置下用例漏配 `node`/`roles`/`multinode` 会在启动时直接报错（不会静默选择某个节点）。
+多节点配置下用例的 `node` 同样可省略：未指定 `node` 的单机用例会**按负载均分到各节点并行执行**（显式指定 `node` 的用例固定不动并计入该节点负载，分完后各节点的单机用例数差 ≤1；多机用例 `roles`/`multinode` 不参与均分）：
+
+```yaml
+nodes:
+  - host: 192.168.10.1
+    arch: a3
+  - host: 192.168.10.2
+    arch: a5
+
+suites:
+  - file: test/registered/npu/llm_models/test_a.py   # 自动均分 (如分到 10.1)
+  - file: test/registered/npu/llm_models/test_b.py   # 自动均分 (如分到 10.2)
+  - file: test/registered/npu/llm_models/test_c.py
+    node: 192.168.10.2                               # 固定在 10.2 执行
+```
+
+并行执行规则（保持配置顺序语义）：
+
+- **连续的单机用例**为一段：按执行节点分组，每节点一个线程串行执行分到的用例（同节点共享 NPU 卡必须串行），节点间并行——共享容器的初始化/依赖安装也随各节点并行进行；
+- **多机用例**（`roles`/`multinode`）独占其涉及的全部节点，单独串行执行，不与其他用例并行（避免 NPU 抢占）；多机用例前后的单机段仍各自并行；
+- 单节点配置或 `--dry-run` 时保持串行执行，输出与旧版一致；并行时控制台各节点输出加 `[IP]` 前缀区分（用例日志文件本身仍是原始输出）；
+- `summary.json` 仍按用例完成顺序增量更新（并发写入已串行化），最终结果按配置顺序排列。
+
+各节点的共享容器初始化标记/日志/tmp 目录（`.init-ok.{host}`、`tmp.{host}` 等）按节点隔离，共享存储（NFS 同一物理目录）下多节点并行也不会互相干扰。
 
 ## <a id="sec-4"></a>4. 快速开始
 
@@ -302,9 +325,13 @@ python3 src/run.py
     │       删 sgl-pipeline-* 残留容器（docker rm -f; 同镜像他人容器不删）
     │       → 确保没有进程占用 NPU 卡
     │
-    ├─ [execute] 逐用例串行执行（SSH 到节点）:
-    │     单机用例: 每节点一个长驻共享容器 (sgl-pipeline-single, 首个单机
-    │       用例时启动, 初始化/依赖只做一次, run 结束统一删除):
+    ├─ [execute] 按配置顺序执行用例 (SSH 到节点):
+    │     单机用例: 连续的单机用例为一段, 按节点分组并行执行——每节点
+    │       一个线程串行跑分到的用例 (同节点共享 NPU 卡), 节点间并行;
+    │       多机用例独占节点单独串行执行 (不与单机段并行抢卡)。
+    │       每节点一个长驻共享容器 (sgl-pipeline-single, 该节点首个单机
+    │       用例时启动, 初始化/依赖只做一次, run 结束统一删除;
+    │       标记/日志/tmp 按节点隔离: .init-ok.{host} / tmp.{host}):
     │       docker run -d --privileged --ipc=host
     │         --device /dev/davinci0..N-1 + 管理设备
     │         挂载: repo / workspace 输出目录(runs/{run_id}) / driver /
@@ -620,7 +647,7 @@ run:
 用 `--dry-run`，输出节点上将要执行的完整 docker 命令，不消耗 NPU 资源。
 
 **Q: A5 节点上跑单机用例，脚本里的 `--tp-size` 是按 A3 卡数配置的，怎么办？**
-该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` **大于 2 时**自动除以 2 再执行用例（`{脚本名}.log` 里有 `[a5-适配] --tp-size 8 -> 4` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size`、配了 1/2（视为已按 A5 卡数适配）或不经 server 启动的用例均不受影响。多机用例（`roles`/`multinode`）不做此适配。
+该节点配置 `arch: a5`。流水线会在其单机用例容器启动前注入包装器（`/output/run_case.py`），把传给 server 的 `--tp-size` **值为 16 时**自动减半为 8 再执行用例（`{脚本名}.log` 里有 `[a5-适配] --tp-size 16 -> 8` 记录可核对），不修改 sglang 仓库代码；脚本里没配 `--tp-size`、配了其他值（1/2/4/8 等，视为已按 A5 卡数适配）或不经 server 启动的用例均不受影响。多机用例（`roles`/`multinode`）不做此适配。
 
 **Q: A5 单机用例需要开灵衢互联（FIA）怎么办？**
 配置 `run.a5_env`（仅对 a5 节点单机用例容器生效，其他容器不受影响）：

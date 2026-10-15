@@ -1116,12 +1116,16 @@ def _docker_device_args(node, d):
     return args
 
 
-def _docker_mount_args(cfg, output_dir, node=None):
+def _docker_mount_args(cfg, output_dir, node=None, suffix=""):
     """-v 挂载参数。output_dir: 挂到容器 /output 的宿主机目录 (tmp/plog 取其
     子目录)——单机共享容器=runs/{run_id} (各用例写 /output/{用例名}/),
     多机角色容器=runs/{run_id}/{用例名}/{角色}。
     node: 节点配置, 用于按节点跳过 extra_mounts 中宿主机不存在的项
-    (prepare 阶段探测结果, 见 _MOUNT_MISSING_CACHE; 未探测不跳过)。"""
+    (prepare 阶段探测结果, 见 _MOUNT_MISSING_CACHE; 未探测不跳过)。
+    suffix: tmp/plog 子目录后缀——单机共享容器传 ".{host}" 按节点隔离:
+    多节点并行执行时各节点容器并发写同一物理 /tmp (torch 编译缓存/数据集
+    预置) 会互相损坏, workspace 为共享存储时更是同一物理目录; 多机角色
+    容器的 output_dir 已按角色隔离, 不传。"""
     args = [
         # evalscope 源码 (与 repo 同模式: 同路径挂载; 节点缺目录时 docker 建空
         # 目录, 由初始化脚本的条件软链兜底回退在线安装)
@@ -1129,8 +1133,8 @@ def _docker_mount_args(cfg, output_dir, node=None):
         "-v", shlex.quote(f"{cfg.run.workspace}/evalscope:"
                           f"{cfg.run.workspace}/evalscope"),
         "-v", shlex.quote(f"{output_dir}:/output"),
-        "-v", shlex.quote(f"{output_dir}/tmp:/tmp"),
-        "-v", shlex.quote(f"{output_dir}/plog:/root/ascend/log"),
+        "-v", shlex.quote(f"{output_dir}/tmp{suffix}:/tmp"),
+        "-v", shlex.quote(f"{output_dir}/plog{suffix}:/root/ascend/log"),
     ] + [x for m in _NODE_MOUNTS for x in ("-v", m)]
     # datasets 所在目录自动挂载 (同路径映射, 去重), 容器内路径与配置一致,
     # cp 命令直接使用原路径; 与默认挂载重叠时 (如 ~/.cache 下) docker 后挂载
@@ -1247,8 +1251,12 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     "{ ... } && ... || ..." 的 AND-OR 链里, 避免链内 errexit 被抑制、
     中途失败被末条命令的返回码掩盖)。输出重定向到挂载目录的 .init.log,
     成功/失败各写一个标记文件, 执行机经宿主机路径轮询 (挂载双向可见)。
+    标记/日志/tmp/plog 均带 .{host} 后缀按节点隔离: 多节点并行时互不
+    干扰, 共享存储 (多节点同一物理目录) 下也不会看到别的节点的 .init-ok
+    而误判就绪 (串行执行同样受益)。
     """
     d = cfg.run.docker
+    tag = f".{node.host}"
     init = _container_init_parts(cfg)
     # 自定义 python 依赖 (流水线 configs/pip_deps.txt, 固定路径零配置, 内容
     # 对齐 CI Install dependencies 步骤): 每行一条命令, 装进容器系统 python
@@ -1284,9 +1292,9 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
             f'成功 $(( {n_pip} - _pip_fail )) 条, 失败 $_pip_fail 条"')
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
-        " > /output/.init.log 2>&1\n"
-        "if [ $? -eq 0 ]; then touch /output/.init-ok; "
-        "else touch /output/.init-fail; fi\n"
+        f" > /output/.init.log{tag} 2>&1\n"
+        f"if [ $? -eq 0 ]; then touch /output/.init-ok{tag}; "
+        f"else touch /output/.init-fail{tag}; fi\n"
         "exec tail -f /dev/null"
     )
     inner_escaped = inner.replace("'", "'\"'\"'")
@@ -1295,14 +1303,14 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
                     "--shm-size", d.shm_size,
                     "--name", _SHARED_CONTAINER]
                    + _docker_device_args(node, d)
-                   + _docker_mount_args(cfg, runs_dir, node)
+                   + _docker_mount_args(cfg, runs_dir, node, suffix=tag)
                    + _docker_env_args(cfg)
                    + [shlex.quote(d.image), "bash", "-c", f"'{inner_escaped}'"])
     # 宿主机命令: 清理残留同名容器 (prepare 阶段已清过, 双保险) 后后台启动;
     # -d 长驻, 用例经 docker exec 执行, run 结束由 cleanup() 统一删除
     return "\n".join([
         "set -e",
-        f"mkdir -p {shlex.quote(f'{runs_dir}/tmp')} {shlex.quote(f'{runs_dir}/plog')}",
+        f"mkdir -p {shlex.quote(f'{runs_dir}/tmp{tag}')} {shlex.quote(f'{runs_dir}/plog{tag}')}",
         f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
         " ".join(docker_args),
     ])
@@ -1394,6 +1402,13 @@ class SingleNodeContainers:
         就绪后返回容器名; 初始化失败抛 RuntimeError (调用方记 error, 该节点
         后续单机用例快速失败)
       - cleanup(): run 结束统一 docker rm -f (容器内残留进程随 cgroup 整体回收)
+    线程安全: run_suites 多节点并行时每节点一个线程, 各线程只 get 自己
+    节点的容器——_started/_failed 按 host 键读写, 不同线程不同键 (CPython
+    字典/集合操作原子), 同一 host 只有一个线程, 状态本身无并发竞争; 但
+    staging 写入与容器启动经 _launch_lock 串行化 (见 __init__, 共享存储
+    下防半截文件竞态), 初始化等待不持锁。标记/日志/tmp 目录均带 .{host}
+    后缀 (见 _build_shared_container_cmd), 共享存储下多节点并行也不会
+    互相干扰/误判。
     """
 
     def __init__(self, cfg, run_id, dry_run=False):
@@ -1402,6 +1417,12 @@ class SingleNodeContainers:
         self._dry_run = dry_run
         self._started = {}   # host -> node (已启动共享容器的节点)
         self._failed = set()  # 初始化失败的 host (后续单机用例快速失败)
+        # staging + 容器启动串行锁: 多节点并行时各线程的 sitecustomize/
+        # run_case.py 写入与容器启动互斥——共享存储下它们指向同一物理文件,
+        # 并发写虽内容相同, 但 O_TRUNC 写入中可能被另一节点刚启动的容器
+        # 读到半截文件 (import SyntaxError); 初始化等待 (_wait_init, 可长达
+        # init_timeout_minutes) 在锁外, 不阻塞其他节点并行初始化
+        self._launch_lock = threading.Lock()
 
     def get(self, node):
         """返回节点共享容器名; 未启动则启动并等初始化完成 (失败抛 RuntimeError)。"""
@@ -1413,43 +1434,56 @@ class SingleNodeContainers:
                 f"节点 {node.host} 共享容器初始化已失败, 该节点单机用例全部跳过")
         if node.host in self._started:
             return _SHARED_CONTAINER
-        runs_dir = f"{self._cfg.run.workspace}/runs/{self._run_id}"
-        where = ("本机" if _is_local(node)
-                 else f"{node.user}@{node.host}:{node.port}")
-        deps = (f"configs/pip_deps.txt 共 {len(self._cfg.run.pip_cmds)} 条命令"
-                if self._cfg.run.pip_cmds else "无 (pip_deps.txt 缺失或为空)")
-        _log(f"[execute] {where} 启动单机共享容器 {_SHARED_CONTAINER} "
-             f"(pip 依赖: {deps})")
-        # 注入 sitecustomize (容器 /output = runs/{run_id}, 经 PYTHONPATH 生效;
-        # 单机用例只需 evalscope SSL 补丁, fake k8s 桥接不激活)
-        if _stage_sitecustomize(node, runs_dir, self._dry_run) != 0:
-            self._failed.add(node.host)
-            raise RuntimeError(f"节点 {node.host} 写入 sitecustomize.py 失败")
-        # A5 节点注入 tp 并行度减半包装器 (单机用例专属适配, 启动时装一次)
-        if (node.arch == "a5"
-                and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
-            self._failed.add(node.host)
-            raise RuntimeError(f"节点 {node.host} 写入 run_case.py 失败")
-        rc = ssh_run(node, _build_shared_container_cmd(self._cfg, node, runs_dir),
-                     dry_run=self._dry_run)
-        if rc != 0:
-            self._failed.add(node.host)
-            raise RuntimeError(f"节点 {node.host} 共享容器启动失败 (rc={rc})")
-        # 容器启动成功即登记 (不等初始化完成): 初始化等待期 (可长达
-        # init_timeout_minutes) 被 Ctrl+C/断链中断时, run_suites 的 finally
-        # cleanup() 才能删掉仍在初始化的容器; 初始化失败路径 _fail 会自删
-        # 容器, 提前登记只让 cleanup 多做一次幂等 rm -f, 无害
-        self._started[node.host] = node
+        with self._launch_lock:
+            # 双重检查: 等锁期间其他线程可能已启动同节点容器 (同 host 只会
+            # 有一个线程, 此为防御性检查)
+            if node.host in self._failed:
+                raise RuntimeError(
+                    f"节点 {node.host} 共享容器初始化已失败, "
+                    f"该节点单机用例全部跳过")
+            if node.host in self._started:
+                return _SHARED_CONTAINER
+            runs_dir = f"{self._cfg.run.workspace}/runs/{self._run_id}"
+            where = ("本机" if _is_local(node)
+                     else f"{node.user}@{node.host}:{node.port}")
+            deps = (f"configs/pip_deps.txt 共 {len(self._cfg.run.pip_cmds)} 条命令"
+                    if self._cfg.run.pip_cmds else "无 (pip_deps.txt 缺失或为空)")
+            _log(f"[execute] {where} 启动单机共享容器 {_SHARED_CONTAINER} "
+                 f"(pip 依赖: {deps})")
+            # 注入 sitecustomize (容器 /output = runs/{run_id}, 经 PYTHONPATH 生效;
+            # 单机用例只需 evalscope SSL 补丁, fake k8s 桥接不激活)
+            if _stage_sitecustomize(node, runs_dir, self._dry_run) != 0:
+                self._failed.add(node.host)
+                raise RuntimeError(f"节点 {node.host} 写入 sitecustomize.py 失败")
+            # A5 节点注入 tp 并行度减半包装器 (单机用例专属适配, 启动时装一次)
+            if (node.arch == "a5"
+                    and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
+                self._failed.add(node.host)
+                raise RuntimeError(f"节点 {node.host} 写入 run_case.py 失败")
+            rc = ssh_run(node,
+                         _build_shared_container_cmd(self._cfg, node, runs_dir),
+                         dry_run=self._dry_run)
+            if rc != 0:
+                self._failed.add(node.host)
+                raise RuntimeError(f"节点 {node.host} 共享容器启动失败 (rc={rc})")
+            # 容器启动成功即登记 (不等初始化完成): 初始化等待期 (可长达
+            # init_timeout_minutes) 被 Ctrl+C/断链中断时, run_suites 的 finally
+            # cleanup() 才能删掉仍在初始化的容器; 初始化失败路径 _fail 会自删
+            # 容器, 提前登记只让 cleanup 多做一次幂等 rm -f, 无害
+            self._started[node.host] = node
         if not self._dry_run:
             self._wait_init(node, runs_dir)  # 失败抛 RuntimeError
         return _SHARED_CONTAINER
 
     def _wait_init(self, node, runs_dir):
         """轮询初始化标记 (.init-ok/.init-fail 经 /output 挂载落在宿主机
-        runs/ 下, 直接查宿主机路径, 不经 docker exec)。等待期间控制台只打
-        每分钟一次的心跳行, pip 进度不上屏 (逐条进度看 .init.log, 结束后
+        runs/ 下, 直接查宿主机路径, 不经 docker exec; 文件带 .{host} 后缀
+        按节点隔离, 多节点并行时互不误判)。等待期间控制台只打每分钟一次的
+        心跳行, pip 进度不上屏 (逐条进度看 .init.log, 结束后
         _report_pip_warns 屏显汇总行与失败明细)。"""
-        q_runs = shlex.quote(runs_dir)
+        tag = f".{node.host}"
+        ok_probe = f"test -f {shlex.quote(f'{runs_dir}/.init-ok{tag}')}"
+        fail_probe = f"test -f {shlex.quote(f'{runs_dir}/.init-fail{tag}')}"
         alive_cmd = (f"docker inspect -f '{{{{.State.Running}}}}' "
                      f"{_SHARED_CONTAINER} | grep -qx true")
         # 最长等待可配 (run.init_timeout_minutes, 默认 120 分钟): 慢代理
@@ -1458,16 +1492,14 @@ class SingleNodeContainers:
         tic = time.perf_counter()
         last_note = 0.0
         while True:
-            if ssh_run(node, f"test -f {q_runs}/.init-ok",
-                       quiet=True, silent=True) == 0:
-                _log(f"[execute] 共享容器初始化完成 (耗时 "
+            if ssh_run(node, ok_probe, quiet=True, silent=True) == 0:
+                _log(f"[execute] {node.host} 共享容器初始化完成 (耗时 "
                      f"{round(time.perf_counter() - tic, 1)}s)")
                 self._report_pip_warns(node, runs_dir)
                 return
             # 初始化子 shell 失败 (依赖装失败只跳过不失败, 到这的都是 vendor
             # 环境/软链/数据集等阶段出错): 打印 .init.log 尾部定位
-            if ssh_run(node, f"test -f {q_runs}/.init-fail",
-                       quiet=True, silent=True) == 0:
+            if ssh_run(node, fail_probe, quiet=True, silent=True) == 0:
                 self._fail(node, runs_dir, "初始化失败 (非依赖阶段出错)")
             # 容器本身退出 (镜像缺 bash/OOM 等): 轮询会一直落空, 主动检出
             if ssh_run(node, alive_cmd, quiet=True, silent=True) != 0:
@@ -1476,38 +1508,42 @@ class SingleNodeContainers:
                 self._fail(node, runs_dir, f"初始化超时 (>{wait_sec:g}s)")
             if time.perf_counter() - last_note >= 60:
                 last_note = time.perf_counter()
-                _log(f"[execute] 共享容器初始化中... (已等 "
+                _log(f"[execute] {node.host} 共享容器初始化中... (已等 "
                      f"{int(time.perf_counter() - tic)}s, 最长 {wait_sec:g}s)")
             time.sleep(_INIT_POLL_SEC)
 
     def _report_pip_warns(self, node, runs_dir):
         """初始化成功后屏显 pip 依赖安装汇总: 汇总行由 init 子 shell 写在
         .init.log 末尾 (共 N 条/成功/失败, 单一数据源), 此处抓出屏显;
-        有失败时再列出全部 WARN 行 (含命令原文, 原始报错查 .init.log)。"""
+        有失败时再列出全部 WARN 行 (含命令原文, 原始报错查 .init.log)。
+        日志文件带 .{host} 后缀 (节点隔离), 控制台行同样带 host 区分
+        (多节点并行时的心跳/汇总才可归属)。"""
+        init_log = shlex.quote(f"{runs_dir}/.init.log.{node.host}")
         n = len(self._cfg.run.pip_cmds)
         if not n:
-            _log("[execute] 无 pip 依赖安装 (pip_deps.txt 为空)")
+            _log(f"[execute] {node.host} 无 pip 依赖安装 (pip_deps.txt 为空)")
             return
         # 汇总行: 非 quiet 的 ssh_run 把 grep 结果实时回显到控制台;
         # || true 兜底 rc=1 (无匹配时 grep 报错退出, 正常不该发生)
         ssh_run(node,
                 f"grep -F '[pip_deps] 汇总' "
-                f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null || true")
+                f"{init_log} 2>/dev/null || true")
         # 探测命令 rc 语义: 0=有 WARN / 1=无 WARN / 3=.init.log 缺失 /
         # 其他=ssh 失败; 区分 "无匹配" (rc=1) 与 "读不到日志", 避免后者被
         # 误报成 "全部安装成功"
-        probe = (f"test -f {shlex.quote(runs_dir)}/.init.log || exit 3; "
+        probe = (f"test -f {init_log} || exit 3; "
                  f"grep -Fq '[pip_deps] [WARN]' "
-                 f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+                 f"{init_log} 2>/dev/null")
         prc = ssh_run(node, probe, quiet=True, silent=True)
         if prc == 0:
-            _log("[execute] 失败明细 (原始报错见 .init.log 对应段落):")
+            _log(f"[execute] {node.host} 失败明细 "
+                 f"(原始报错见 .init.log 对应段落):")
             ssh_run(node,
                     f"grep -F '[pip_deps] [WARN]' "
-                    f"{shlex.quote(runs_dir)}/.init.log 2>/dev/null")
+                    f"{init_log} 2>/dev/null")
         elif prc != 1:
-            _log(f"[execute] 无法核对 pip WARN (rc={prc}), "
-                 f"手动查看: {runs_dir}/.init.log")
+            _log(f"[execute] {node.host} 无法核对 pip WARN (rc={prc}), "
+                 f"手动查看: {runs_dir}/.init.log.{node.host}")
 
     def _fail(self, node, runs_dir, reason):
         """初始化失败收尾: 删容器 + 打印 .init.log 尾部 + 抛错 (含 fast-fail 标记)。"""
@@ -1515,9 +1551,13 @@ class SingleNodeContainers:
         ssh_run(node, f"docker rm -f {_SHARED_CONTAINER} >/dev/null 2>&1 || true",
                 quiet=True, silent=True)
         # init 日志经 /output 挂载落在宿主机 runs/ 下, 直接 tail 到控制台
+        # (带 .{host} 后缀, 同 runs/ 下多节点并行时各取各的)
         ssh_run(node,
-                f"tail -n 100 {shlex.quote(runs_dir)}/.init.log 2>/dev/null || true")
-        raise RuntimeError(f"节点 {node.host} 共享容器{reason}, 详见上方 .init.log 尾部")
+                f"tail -n 100 "
+                f"{shlex.quote(f'{runs_dir}/.init.log.{node.host}')} "
+                f"2>/dev/null || true")
+        raise RuntimeError(f"节点 {node.host} 共享容器{reason}, "
+                            f"详见上方 .init.log 尾部")
 
     def cleanup(self):
         """run 结束统一清理: docker rm -f (容器内残留进程随 cgroup 整体回收)。
@@ -1546,12 +1586,15 @@ def _fetch_artifacts(node, node_run_dir, local_dir, label):
     _log(f"[fetch] {who}拉回完成 (日志 + plog)")
 
 
-def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False):
+def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False,
+                  prefix=""):
     """执行一个单机用例 (节点共享容器内 docker exec), 返回结果 dict。
 
     shared: SingleNodeContainers, 该节点首个单机用例时启动共享容器 (含
     configs/pip_deps.txt 依赖安装, 只装一次), 后续用例复用; sitecustomize/run_case
     包装器也随容器启动注入一次 (容器 /output = runs/{run_id})。
+    prefix: 多节点并行执行时给控制台每行加节点前缀 (如 "[192.168.10.5] "),
+    便于区分交错输出; 日志文件始终是原始输出 (与 ssh_run 的 prefix 一致)。
     """
     result = {"name": suite.name, "node": node.host,
               "status": "fail", "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1573,31 +1616,31 @@ def execute_suite(cfg, suite, node, run_id, local_run_dir, shared, dry_run=False
         extra_env["PYTHONPATH"] = "/output"
         tmo = suite.timeout_minutes or _DEFAULT_TIMEOUT_MINUTES
         if not suite.timeout_minutes:
-            _log(f"[execute] {suite.name} 未配 timeout, 使用默认 {tmo} 分钟")
+            _log(f"{prefix}[execute] {suite.name} 未配 timeout, 使用默认 {tmo} 分钟")
         cmd = _single_case_exec_cmd(cfg, suite, container, node_run_dir,
                                     tp_halving, extra_env, tmo)
-        _log(f"[execute] @ {where} 共享容器执行 (超时={tmo}分钟)")
+        _log(f"{prefix}[execute] @ {where} 共享容器执行 (超时={tmo}分钟)")
         rc = ssh_run(node, cmd,
                      log_path=os.path.join(local_suite_dir, _log_filename(suite)),
                      diag_path=os.path.join(local_suite_dir, "ssh.log"),
-                     dry_run=dry_run)
+                     dry_run=dry_run, prefix=prefix)
         result["status"] = "pass" if rc == 0 else "fail"
         result["error"] = None if rc == 0 else f"exit code {rc}"
         dur = round(time.perf_counter() - tic, 1)
         if rc == 0:
-            _log(f"[execute] 用例正常结束 (rc=0, 耗时 {dur}s)")
+            _log(f"{prefix}[execute] 用例正常结束 (rc=0, 耗时 {dur}s)")
         elif dry_run:
-            _log(f"[execute] dry-run 完成命令打印")
+            _log(f"{prefix}[execute] dry-run 完成命令打印")
         else:
             # 失败保留完整日志路径便于排查
-            _log(f"[execute] 用例异常结束 (rc={rc}, 耗时 {dur}s), "
+            _log(f"{prefix}[execute] 用例异常结束 (rc={rc}, 耗时 {dur}s), "
                  f"日志: {os.path.join(local_suite_dir, _log_filename(suite))}")
         if not dry_run:
             _fetch_artifacts(node, node_run_dir, local_suite_dir, "")
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"{type(e).__name__}: {e}"
-        _log(f"[execute] 流水线异常: {type(e).__name__}: {e}")
+        _log(f"{prefix}[execute] 流水线异常: {type(e).__name__}: {e}")
     result["duration_sec"] = round(time.perf_counter() - tic, 1)
     return result
 

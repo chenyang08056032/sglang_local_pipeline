@@ -1,0 +1,211 @@
+# A5 全量流水线: 3 节点均分 175 个单机用例并行执行
+# 用法: python3 src/run.py --config configs/full_a5.yaml
+run:
+  workspace: /mnt/share/dzc/sglang
+  docker:
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B072
+    extra_mounts:
+      - "/mnt/share:/mnt/share"
+      - "/mnt/share/dzc/hub:/mnt/share/dzc/hub"
+      - "/mnt/share/dzc/data/modelscope:/root/.cache/modelscope"
+      - "/mnt/share/dzc/data/huggingface:/root/.cache/huggingface"
+      - "/mnt/share/dzc/data/sgl_eval:/root/.cache/sgl_eval"
+      - "/mnt/share/dzc/data/sglang:/root/.cache/sglang"
+      - "/etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json"
+  a5_env:
+    ASCEND_USE_FIA: "1"
+  datasets:
+    - /mnt/share/dzc/data/modelscope/hub/datasets/test.jsonl
+    - /mnt/share/dzc/data/modelscope/hub/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  env:
+    http_proxy: "http://141.3.245.240:30066"
+    https_proxy: "http://141.3.245.240:30066"
+    GIT_SSL_NO_VERIFY: "true"
+    PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"
+    PIP_RETRIES: "5"
+    PIP_TIMEOUT: "120"
+  init_timeout_minutes: 120
+nodes:
+  - host: 141.61.45.113
+    arch: a5
+  - host: 141.61.45.118
+    arch: a5
+  - host: 141.61.45.119
+    arch: a5
+suites:
+  # 单机用例: node 省略——多节点时按负载均分到各节点并行执行; name 默认取 file basename
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_expert_distribution_recorder_mode.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hierarchical_cache_mutually_exclusive.py
+  - file: test/registered/npu/basic_function/offloading/test_npu_cpu_offload_gb.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_disable_cuda_graph_padding.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_enable_profile_cuda_graph.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_torch_compile_moe.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_piecewise.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_delete_ckpt_after_loading.py
+  - file: test/registered/npu/basic_function/rl/test_npu_moe_rl_routing_capture.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_embedding_interpolation.py
+  - file: test/registered/npu/basic_function/msprobe/test_npu_msprobe_dump_config.py
+  - file: test/registered/npu/basic_function/Custom_weight_loader/test_npu_remote_instance_weight_loader.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_deepep_low_latency_qwen3_30b_a3b_w8a8.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_eplb_min_rebalancing_utilization_threshold.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hierarchical_cache_ttft_mha.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache_io_backend.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_cuda_graph_config.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_disable_cuda_graph.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_pre_warm_nccl.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_numa_node.py
+  - file: test/registered/npu/basic_function/EPD/test_npu_disaggregated_vlm.py
+  - file: test/registered/npu/basic_function/EPD/test_npu_adaptive_dispatch_to_encoder.py
+  - file: test/registered/npu/basic_function/Multi-Modal/test_npu_mm_limit.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_prefill_delayer.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_prefill_delayer_max_delay.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_ssl.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_schedule_low_priority_values_first.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_priority_scheduling_preemption_threshold.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_request_queue_validation.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_prefill_max_requests.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_radix_attention.py
+  - file: test/registered/npu/basic_function/logging/test_npu_metrics_priority.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_abort_on_priority_when_disabled.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_batch_notify_size.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_stream_interval.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_incremental_streaming_output.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_stream_response_include_usage.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_enable_session_radix_cache.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_random_seed.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_constrained_json_whitespace_pattern.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_constrained_json_disable_any_whitespace.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_watchdog.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_soft_watchdog.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_gpu_id.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_custom_sigquit_handler.py
+  - file: test/registered/npu/basic_function/logging/test_npu_crash_dump.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_ep_dispatch_algorithm.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_schedule_conservativeness.py
+  - file: test/registered/npu/llm_models/test_npu_qwen3_30b_attn_cp.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_download_dir.py
+  - file: test/registered/npu/basic_function/rl/test_npu_weight_checker_e2e.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_speculative_attention_mode.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_speculative_draft_attention_backend.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_eagle3.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_moe_runner_backend.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_init-expert-location.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_moe_dense_tp_size.py
+  - file: test/registered/npu/basic_function/parallel_strategy/expert_parallelism/test_npu_enable_waterfill.py
+  - file: test/registered/npu/basic_function/mambacache/test_npu_mamba_cache.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache_mha.py
+  - file: test/registered/npu/llm_models/test_npu_qwen3_30b.py
+  - file: test/registered/npu/llm_models/test_npu_trinity_mini.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_openai_embedding.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_model_tokenizer_multimodal.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_model_config_parser.py
+  - file: test/registered/npu/basic_function/logging/test_npu_scheduler_status_logger.py
+  - file: test/registered/npu/basic_function/HTTP/test_npu_nccl_port.py
+  - file: test/registered/npu/basic_function/quantization_and_data_type/test_npu_enable_fp32_lm_head.py
+  - file: test/registered/npu/test_npu_memory_consumption.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_mixed_chunked_prefill.py
+  - file: test/registered/npu/basic_function/pp/test_npu_pp_single_node_extra.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_sleep_on_idle.py
+  - file: test/registered/npu/basic_function/logging/test_npu_request_logger.py
+  - file: test/registered/npu/basic_function/logging/test_npu_metrics.py
+  - file: test/registered/npu/basic_function/logging/test_npu_enable_metrics_for_all_scheduler.py
+  - file: test/registered/npu/basic_function/logging/test_npu_enable_forward_pass_metrics.py
+  - file: test/registered/npu/basic_function/logging/test_npu_tracing.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_sampling_default.py
+  - file: test/registered/npu/interface/test_npu_enable_thinking.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_strip_thinking.py
+  - file: test/registered/npu/basic_function/lora/test_npu_max_loaded_loras.py
+  - file: test/registered/npu/basic_function/kernel_backends/test_npu_hybrid_attention_backend.py
+  - file: test/registered/npu/basic_function/rl/test_npu_rl_pause_resume_multi_tokenizer.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_model_tokenizer.py
+  - file: test/registered/npu/basic_function/quantization_and_data_type/test_npu_dtype.py
+  - file: test/registered/npu/basic_function/quantization_and_data_type/test_npu_kv_cache_dtype.py
+  - file: test/registered/npu/basic_function/rl/test_npu_moe_rl_weight_updates_from_disk_and_tensor.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache_page.py
+  - file: test/registered/npu/basic_function/EPD/test_npu_epd_dynamic_register.py
+  - file: test/registered/npu/basic_function/sessions/test_npu_streaming_session_swa.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_load_snapshot_publish_interval.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_api_related.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_api_related_asr_max.py
+  - file: test/registered/npu/basic_function/lora/test_npu_lora_openai_compatible_supplement.py
+  - file: test/registered/npu/basic_function/lora/test_npu_lora_memory_eviction.py
+  - file: test/registered/npu/basic_function/Custom_weight_loader/test_npu_weight_loader_drop_cache.py
+  - file: test/registered/npu/basic_function/Custom_weight_loader/test_npu_weight_loader_prefetch.py
+  - file: test/registered/npu/basic_function/config/test_npu_config.py
+  - file: test/registered/npu/vlm_models/test_npu_encoder_dp.py
+  - file: test/registered/npu/basic_function/prefix_mm_cache/test_npu_prefix_mm_cache.py
+  - file: test/registered/npu/basic_function/checkpoint_decryption/test_npu_decrypted_draft_config_file.py
+  - file: test/registered/npu/basic_function/forward/test_npu_enable_quant_communications.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_tokenizer_backend.py
+  - file: test/registered/npu/basic_function/model_tokenizer/test_npu_multi_detokenizer.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_skip_tokenizer_init.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_prefill_delayer_buckets.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_warmups.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache_storage_file_backend.py
+  - file: test/registered/npu/basic_function/dllm/test_npu_llada2_mini.py
+  - file: test/registered/npu/basic_function/offloading/test_npu_offload_group_size.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_no_extra_forked_npu_context.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_cuda_graph_bs.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_enable_cudagraph_gc.py
+  - file: test/registered/npu/basic_function/dp_attn/test_npu_dp_attention.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_eagle_dp_attention.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_torch_compile_debug.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_basic_sanity_eagle3.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_openai_server_hidden_states.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_attn_tp_gather_fuseep.py
+  - file: test/registered/npu/basic_function/debug_tensor/test_npu_debug_tensor_dump_output_folder.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_enable_offload_kvcache_cached_tokens.py
+  - file: test/registered/npu/basic_function/pd_disaggregation/test_npu_pd_disaggregation_optimistic.py
+  - file: test/registered/npu/basic_function/Custom_weight_loader/test_npu_update_weights_from_tensor.py
+  - file: test/registered/npu/basic_function/Multi-Modal/test_npu_multimodal_parallelism.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_disaggregation_pp.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_e2e_constrained_reasoning.py
+  - file: test/registered/npu/basic_function/model_override/test_npu_model_override_args.py
+  - file: test/registered/npu/basic_function/lora/test_npu_lora_update.py
+  - file: test/registered/npu/basic_function/logging/test_npu_metrics_tokenizer_label.py
+  - file: test/registered/npu/basic_function/logging/test_npu_gc_warning_threshold.py
+  - file: test/registered/npu/basic_function/logging/test_npu_decode_log_interval.py
+  - file: test/registered/npu/basic_function/logging/test_npu_log_exclude_prefixes.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_default_chat_template_kwargs.py
+  - file: test/registered/npu/basic_function/parallel_strategy/data_parallelism/test_npu_load_balance_method_pd_disaggregation.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_disable_tokenizer_batch_decode.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_allow_auto_truncate.py
+  - file: test/registered/npu/basic_function/logging/test_npu_metrics_bucket_boundary.py
+  - file: test/registered/npu/basic_function/logging/test_npu_enable_request_time_stats_logging.py
+  - file: test/registered/npu/basic_function/api_related/test_npu_api_related_tool_call.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_fim_completion.py
+  - file: test/registered/npu/interface/test_npu_openai_function_calling.py
+  - file: test/registered/npu/basic_function/HiCache/test_npu_hicache_storage_runtime_attach_detach.py
+  - file: test/registered/npu/basic_function/logging/test_npu_tracing_disaggregation.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_enable_tokenizer_batch_encode.py
+  - file: test/registered/npu/basic_function/core/test_npu_srt_endpoint.py
+  - file: test/registered/npu/basic_function/openai_server/test_npu_openai_server.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_enable_custom_logit_processor.py
+  - file: test/registered/npu/vlm_models/test_npu_qwen3_omni_30b_a3b_instruct.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_keep_mm_feature_on_device.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_scheduler_recv_interval.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_dynamic_batch_tokenizer_params.py
+  - file: test/registered/npu/basic_function/debug_tensor/test_npu_debug_tensor_input_file.py
+  - file: test/registered/npu/basic_function/pd_disaggregation/test_npu_pd_disaggregation.py
+  - file: test/registered/npu/basic_function/forward/test_npu_forward_hooks.py
+  - file: test/registered/npu/basic_function/lora/test_npu_lora_backend.py
+  - file: test/registered/npu/basic_function/lora/test_npu_experts_shared_outer_lora.py
+  - file: test/registered/npu/basic_function/lora/test_npu_wait_threshold.py
+  - file: test/registered/npu/basic_function/kernel_backends/test_npu_json_mode.py
+  - file: test/registered/npu/basic_function/kernel_backends/test_npu_mm_attention_backend.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_skip_dp_mlp_sync.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_dflash_speculative.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_speculative_multi_npu.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_adaptive_speculative.py
+  - file: test/registered/npu/basic_function/speculative_inference/test_npu_speculative_token_map.py
+  - file: test/registered/npu/basic_function/parameter/test_npu_http2_server.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_priority_scheduling.py
+  - file: test/registered/npu/basic_function/logging/test_npu_log_level.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_dynamic_chunking.py
+  - file: test/registered/npu/basic_function/optimization_debug_options/test_npu_image_processor_backend.py
+  - file: test/manual/ascend/basic_function/test_npu_rl_on_policy_target_gsm8k.py
+  - file: test/registered/npu/basic_function/For_Multi-Modal/test_npu_mm_process.py
+  - file: test/registered/npu/basic_function/memory_and_scheduling/test_npu_swa_full_tokens_ratio.py
+  - file: test/manual/ascend/basic_function/deterministic/test_npu_train_infer_consistency.py
+  - file: test/manual/ascend/basic_function/deterministic/test_npu_batch_invariance.py

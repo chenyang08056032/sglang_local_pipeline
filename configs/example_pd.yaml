@@ -6,7 +6,7 @@
 run:
   workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录 (sglang 仓固定 {workspace}/sglang)
   docker:
-    image: swr.cn-south-west-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
   # extra_mounts:                          # 额外 docker -v 挂载; P/D 节点均需预置模型缓存或挂载
   #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
   # datasets:                              # 预置数据集; 仅 router 节点需要 (PD 节点只起 server)
