@@ -112,7 +112,7 @@ sglang_local_pipeline/
 | `run.env` | 内置 7 项（见 3.4） | 否 | 注入容器的环境变量，按 key 合并覆盖内置默认，可追加新键 |
 | `run.a5_env` | `{}`（不注入） | 否 | 仅注入 **a5 节点单机用例**容器的环境变量（多机用例及其他 arch 节点不注入），覆盖 `run.env` 同名键；如 A5 灵衢互联 `ASCEND_USE_FIA: "1"` |
 | `run.datasets` | `[]`（不预置） | 否 | 数据集路径列表（节点本地**绝对路径**），容器启动后 cp 到 `/tmp/`，缺失则回退在线下载。详见下方说明 ① |
-| `run.init_timeout_minutes` | `120` | 否 | 单机共享容器初始化（vendor 环境/软链/数据集/pip 依赖安装）的最长等待（分钟）。慢代理冷缓存时依赖安装可能很久，不够可调大；等待期间控制台每分钟只打一次心跳行（pip 逐条进度不上屏，看 `.init.log`），初始化完成后屏显依赖安装汇总行（有失败附明细），超时失败并屏显 `.init.log` 尾部 |
+| `run.init_timeout_minutes` | `120` | 否 | 单机共享容器初始化（vendor 环境/软链/数据集/pip 依赖安装/requests SSL 补丁）的最长等待（分钟）。慢代理冷缓存时依赖安装可能很久，不够可调大；等待期间控制台每分钟只打一次心跳行（pip 逐条进度不上屏，看 `.init.log`），初始化完成后屏显依赖安装汇总行（有失败附明细），超时失败并屏显 `.init.log` 尾部 |
 
 ① **datasets**：所在目录自动挂载进容器（同路径映射；不支持根目录直属文件——所在目录为 `/` 会整盘挂载）。文件/目录缺失则忽略、回退在线下载。单机用例需该 `node` 节点存在该路径；多机用例仅需 `router`（PD 分离）/ `master`（混布 TP）节点存在——PD/worker 节点只起 server 不读数据集，路径不存在时 cp 静默忽略。示例：
 
@@ -125,7 +125,7 @@ run:
 
 ② **evalscope（精度框架，零配置）**：源码固定在 `{workspace}/evalscope`（与 sglang 仓同约定），**仅当配置了精度用例才准备**——prepare 阶段读执行机 repo 上的用例文件，含 `test_npu_accuracy_utils` import（或直接调 `run_evalscope`）即判定为精度用例，纯性能配置不 clone、不分发；用例文件读不到时保守视为精度用例（宁可多 clone）。判定通过后执行机自动浅克隆官方仓（目录非空则跳过，想用自定义版本直接放入该目录；代理取 `run.env` 的 `http_proxy`/`https_proxy`），再以 sglang 仓同款方式（清理旧目录 + 整目录复制）同步到精度用例跑测试的节点（单机=node，混布 TP=master，PD 分离=router；worker/PD 节点只起 server 不需要）。节点就绪后容器内软链到 `/root/.cache/.cache/evalscope`（`run_evalscope.sh` 硬编码的本地源检查路径），实现本地 `pip install -e` 安装；clone/分发失败或节点无源码时不软链，回退清华镜像在线安装（需外网）。（旧版 `run.evalscope_source` 字段已移除，无需配置）
 
-③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置）并逐条执行 `configs/pip_deps.txt` 里的安装命令，随后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
+③ **pip_deps.txt（单机共享容器依赖，零配置）**：同节点的全部单机用例复用一个**长驻共享容器**（`sgl-pipeline-single`，首个单机用例时启动，run 结束统一删除）：容器启动时执行一次初始化（覆盖 ascend 工具、软链、数据集预置），随后逐条执行 `configs/pip_deps.txt` 里的安装命令，最后关闭容器系统 python 的 requests SSL 校验（临时规避，见 3.4）；之后每条用例经 `docker exec` 在容器内执行（用例超时由容器内 `timeout` 控制，执行前自动清理上一条用例残留的 sglang 进程防占卡）。
 
 依赖安装命令**固定读流水线的 `configs/pip_deps.txt`，无需在 yaml 配置**：文件存在即生效（已预置 CI `_npu-pr-test-stage.yml` Install dependencies 步骤的内容，CI 更新后直接把对应行抄过来）；**每行一条命令按序执行**（同一 shell，`cd`/变量状态延续；首行 `cd /root/sglang` 对齐 CI 的 repo 根执行目录），`#` 注释/空行忽略；**单条失败只记 WARN 跳过、不终止初始化**（缺依赖的影响留给用例自身暴露，事后看 `.init.log` 里的 `[pip_deps] [WARN]` 行定位是哪条；文件内不要写 `exit`，会终止整个初始化）；**每条命令执行前后在 `.init.log` 打进度行**（`[pip_deps] [i/N] 开始执行: <命令原文>` / `[pip_deps] [i/N] 结束, 耗时 Xs`，逐条进度不上屏），装得慢时靠它定位卡在哪条；**初始化完成后在 `.init.log` 末尾写一行汇总并屏显**（`[pip_deps] 汇总: 共 N 条, 成功 X 条, 失败 Y 条`），有失败时控制台附列全部 WARN 行明细；**初始化最长等待 `run.init_timeout_minutes`（默认 120 分钟）**，超时失败并屏显 `.init.log` 尾部；**清空或删除该文件 = 不装任何依赖**。安装走容器默认 pip 源，慢时可配镜像源/代理（都是 `run.env` 加环境变量，`pip_deps.txt` 无需改动，用例内的 pip 调用同样生效）：`PIP_INDEX_URL: "https://pypi.tuna.tsinghua.edu.cn/simple"`（pip 原生识别；清华等公网源仍需 `http_proxy` 出网），内网源（如华为 mirrors.huawei.com）直连更快但须把源域名加入 `run.env` 的 `no_proxy`（流水线会自动拼接节点/协调地址，显式配置的值保留在前）。多机用例容器不执行（依赖需打进镜像）。文件结构（完整内容看文件本身）：
 
@@ -186,7 +186,8 @@ pip install sglang_router
 
 - `TZ=Asia/Shanghai`：容器默认 UTC，与流水线日志时区混排会造成时序误判，统一对齐（需其他时区在 `run.env` 覆盖 `TZ`）；
 - `no_proxy`/`NO_PROXY`（含全部节点 IP + 协调服务地址 + localhost，且优先于节点 docker 的代理配置注入）：协调服务、健康检查等内网请求直连，不受节点 `/root/.docker/config.json` 代理影响；外网下载仍走代理。
-- `PYTHONPATH=/output`：注入 sitecustomize.py（单机/多机用例一致）——多机用例的 fake kubernetes 协调桥接（见第 7/8 节）+ 关闭 evalscope venv 内 requests 的 SSL 校验（规避企业代理自签证书导致 modelscope 数据集下载报 `CERTIFICATE_VERIFY_FAILED`；仅 venv 进程生效，其余 python 进程无副作用）。
+- `PYTHONPATH=/output`：注入 sitecustomize.py（单机/多机用例一致）——多机用例的 fake kubernetes 协调桥接（见第 7/8 节）+ 关闭 evalscope venv 内 requests 的 SSL 校验（规避企业代理自签证书导致 modelscope 数据集下载报 `CERTIFICATE_VERIFY_FAILED`；仅 venv 进程生效，系统 python 见下一条）。
+- 容器系统 python 的 requests 同样关闭 SSL 校验（临时规避，仅测试用）：单机共享容器初始化末尾 / 多机角色容器启动用例前，把 `requests/sessions.py` 中 `Session.__init__` 的 `self.verify = True` 改为 `False`，对未显式传 `verify=True` 的 requests 调用生效（改的是会话默认值）；路径经 `requests.sessions.__file__` 自动定位（不绑定 python 版本，镜像升级自动跟随），且在 `pip_deps.txt` 依赖安装之后执行，避免重装 requests 覆盖。单机/多机容器均生效，日志出现 `[requests-patch] OK <sessions.py 路径>` 即为最终状态成功；出现 `[WARN]` 表示未匹配到该行、requests 缺失或 sessions.py 不可写，不阻断用例。问题消失后删除 `pipeline.py` 中的 `_REQUESTS_NO_VERIFY_SH` 常量及两处引用即可（单机共享容器、多机角色容器各一处）。
 
 ### 3.5 配置示例（仓缺失时由流水线 clone）
 
@@ -340,6 +341,8 @@ python3 src/run.py
     │       容器内初始化 (执行机轮询 .init-ok 标记确认完成):
     │         覆盖 ascend 工具 → 按 run.datasets 预置数据集到 /tmp (可选)
     │         → 逐条执行 configs/pip_deps.txt 安装命令 (可选, 只装一次)
+    │         → 关闭容器系统 python 的 requests SSL 校验 (临时规避,
+    │           日志 [requests-patch] OK 可核对, 见 3.4)
     │       每条用例: docker exec 执行 (执行前后各清理一次共享容器内残留的
     │         sglang 进程防占卡——结尾一次保证同节点后续多机角色容器不被
     │         本条泄漏的 server 占卡; 超时由容器内 timeout 控制; A5 节点经
@@ -373,7 +376,7 @@ python3 src/run.py
 /root/sglang_local_pipeline/runs/single-20260916-100000/   ← 共享容器 /output
 ├── sitecustomize.py         # 流水线注入（evalscope SSL 补丁，经 PYTHONPATH 生效）
 ├── run_case.py              # 仅 A5 节点：--tp-size 减半包装器（流水线注入）
-├── .init.log                # 共享容器初始化日志（含 pip 依赖安装输出）
+├── .init.log                # 共享容器初始化日志（含 pip 依赖安装输出与 [requests-patch] 记录）
 ├── tmp/                     # 共享容器 /tmp 挂载（全部单机用例共用，fetch 不回传）
 ├── plog/                    # 共享容器 /root/ascend/log 挂载（全部单机用例混写，fetch 不回传）
 └── qwen3-32b-gsm8k/         # 每条单机用例一个子目录
@@ -520,6 +523,8 @@ suites:
 5. router 结束（无论成败）后，流水线向协调服务写结束信号，所有 prefill/decode 收到后正常退出；任一 PD 服务提前崩溃时同样广播信号，避免其他节点空等超时。结束信号写入 60s 后仍未退出的容器（如卡在端口等待不查 ConfigMap）会被强制 `docker rm -f`（等价 CI 外层 runner 删 job，避免拖到容器超时）；用例收尾时另对全部角色容器做一次幂等 `docker rm -f` 兜底，清理角色自身超时（docker 客户端被杀、容器本体仍在跑）留下的孤儿容器。
 6. 用例判定对齐 CI（CI 只看 router pod 日志的 `OK`/`FAILED`，判定后直接删 job，PD pod 是被连带杀掉的）：router 退出码为 0 即通过；prefill/decode 收到结束信号以 0 退出、或超过宽限期被强杀（rc=137）均不判失败，其余非 0 退出码视为 PD 崩溃判失败（等价 CI 检测 pod 非 Running）。基准结果与断言都在 router 的日志里。
 
+除上述协调机制外，多机角色容器在启动用例前还会执行一次系统 python 的 requests SSL 校验关闭（`requests/sessions.py` 中 `Session.__init__` 的 `self.verify = True` → `False`，临时规避，与协调机制无关）；执行时机、日志特征与核对方式见 3.4。
+
 ### 7.3 前置条件（多机用例额外要求）
 
 | 项目 | 要求 |
@@ -596,6 +601,8 @@ suites:
 
 用例的 `launch_pd_mix_node` 从 ConfigMap 查 `sglang-node-0` 的 IP，拼接 `--dist-init-addr={master_ip}:5000 --node-rank={pod_index}` 启动 sglang server。
 
+与第 7 节相同，master/worker 容器在启动用例前也会执行一次系统 python 的 requests SSL 校验关闭（临时规避，见 3.4），与本节的协调机制相互独立。
+
 ### 8.3 前置条件
 
 与第 7 节相同（节点间互通、可达执行机协调端口），但无 router 端口需求。所有节点均需预置模型缓存。
@@ -657,6 +664,18 @@ run:
   a5_env:
     ASCEND_USE_FIA: "1"
 ```
+
+**Q: 容器里 requests 报 `CERTIFICATE_VERIFY_FAILED`，流水线怎么处理的？**
+流水线已内置临时规避（见 3.4）：单机共享容器初始化末尾、多机角色容器执行用例前，直接改容器系统 python 的 `requests/sessions.py`（`Session.__init__` 的 `self.verify = True` → `False`），路径按 `requests.sessions.__file__` 自动定位，python 版本变化不用改配置。注意改的是会话默认值，用例里显式传 `verify=True` 的请求仍会校验。核对方式：
+
+```bash
+# 单机: 初始化日志里应有 OK + sessions.py 路径
+grep -F "[requests-patch]" {workspace}/runs/{run_id}/.init.log.{host}
+# 运行期间直接查 (应为 False)
+docker exec sgl-pipeline-single python3 -c "import requests; print(requests.Session().verify)"
+```
+
+多机角色容器带 `--rm`，用例结束即删，且该行只出现在执行期间的容器输出里（fetch 回的用例日志是容器内版本，不含初始化输出）：`router` 角色会实时回显到控制台（`-d` 后台模式的 `{workspace}/results/{run_id}/console.log` 同样保留），PD/worker 角色不回显；需要现场确认时在容器仍在运行期间 `docker exec sgl-pipeline-{用例名}-{角色} python3 -c "import requests; print(requests.Session().verify)"`。该补丁只改系统 python；evalscope venv 由 sitecustomize 单独处理（见 3.4）。
 
 **Q: 为什么 `docker ps` 只看到一个 `sgl-pipeline-single` 容器？**
 同节点的全部单机用例复用一个长驻共享容器（见 3.1 说明 ③）：首个单机用例时启动（初始化 + `configs/pip_deps.txt` 依赖只装一次），每条用例经 `docker exec` 在其中执行，run 结束统一删除。等待初始化期间控制台每分钟只打一次心跳行（pip 逐条进度不上屏，看节点 `.init.log`）；初始化完成时控制台自动屏显依赖安装汇总行（有失败时附全部 `[pip_deps] [WARN]` 明细）；初始化报错或超时（最长 `run.init_timeout_minutes`，默认 120 分钟）则屏显 `.init.log` 尾部；完整安装过程看节点上 `runs/{run_id}/.init.log`。

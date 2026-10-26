@@ -1068,6 +1068,28 @@ def _vendor_env_parts():
     ]
 
 
+# 临时规避 (仅测试用): 关闭容器系统 python 的 requests SSL 校验。
+# 企业代理以自签证书劫持外网 HTTPS, 用例内 requests 请求/下载报
+# CERTIFICATE_VERIFY_FAILED (sitecustomize 里的补丁仅覆盖 evalscope venv);
+# 直接改容器内 requests/sessions.py 的 Session.__init__:
+# self.verify = True → False, 对该 python 的所有 requests 会话生效。
+# 用 requests.sessions.__file__ 定位 (requests.__file__ 是包内 __init__.py,
+# 里面没有 self.verify, 会静默改错文件); 不写死 python 版本目录, 镜像升级
+# python 后自动跟随。执行点放在依赖安装之后 (见 _build_cmd /
+# _build_shared_container_cmd), 避免 pip 重装 requests 把补丁覆盖掉。
+# 结果打一行 [requests-patch] 便于核对 (单机落 .init.log, 多机落角色容器输出):
+# OK=文件中已是 False, WARN=未匹配到 self.verify = True / requests 缺失 /
+# 文件不可写; 只记日志不终止容器初始化。
+_REQUESTS_NO_VERIFY_SH = (
+    "python3 -c \"import requests.sessions as rs; p = rs.__file__; "
+    "s = open(p).read(); n = s.replace('self.verify = True', "
+    "'self.verify = False'); open(p, 'w').write(n); "
+    "print('[requests-patch]', 'OK' if 'self.verify = False' in n else "
+    "'[WARN] sessions.py 未匹配 self.verify = True', p)\" 2>/dev/null "
+    "|| echo '[requests-patch] [WARN] 未生效 (requests 缺失或文件不可写)'"
+)
+
+
 def _container_init_parts(cfg):
     """容器初始化命令段 (单机共享容器与多机角色容器共用): Ascend 环境 (toolkit/atb/vendor) →
     覆盖 ascend 测试工具 → /root/sglang 与 evalscope 软链 → 预置数据集到 /tmp。
@@ -1192,8 +1214,10 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     d = cfg.run.docker
     container = f"sgl-pipeline-{suite.name}" + (f"-{role}" if role else "")
 
-    # 容器内命令
-    parts = ["set -euo pipefail"] + _container_init_parts(cfg)
+    # 容器内命令; requests 补丁放在初始化之后、用例之前 (多机容器无 pip 依赖安装,
+    # 仍放最后与单机共享容器保持同一语义: 用例启动前最终状态已打补丁)
+    parts = (["set -euo pipefail"] + _container_init_parts(cfg)
+             + [_REQUESTS_NO_VERIFY_SH])
     cmd = (f"cd {shlex.quote(cfg.run.repo)} && "
            f"python3 -u {shlex.quote(suite.file)} -f")
     # 不用 "| tee": 用例泄漏的子进程 (如 PD 分离 router 的 sglang_router) 会继承
@@ -1290,6 +1314,9 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
         init.append(
             f'echo "[pip_deps] 汇总: 共 {n_pip} 条, '
             f'成功 $(( {n_pip} - _pip_fail )) 条, 失败 $_pip_fail 条"')
+    # requests 补丁必须放在全部 pip 依赖安装之后 (依赖可能重装/降级 requests
+    # 覆盖 sessions.py, 放前面会被静默还原), 且在任何单机用例 docker exec 之前
+    init.append(_REQUESTS_NO_VERIFY_SH)
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
         f" > /output/.init.log{tag} 2>&1\n"
