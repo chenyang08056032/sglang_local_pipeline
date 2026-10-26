@@ -28,6 +28,15 @@ _MGMT_DEVICES = ["/dev/davinci_manager", "/dev/hisi_hdc"]
 # evalscope 官方源码仓 (精度框架; prepare 阶段浅克隆到执行机 {workspace}/evalscope)
 _EVALSCOPE_REPO = "https://github.com/modelscope/evalscope.git"
 
+# 流水线自带资产目录 (按本文件定位, 不依赖流水线被放在 sglang 仓内): 流水线是
+# 独立仓, 节点上只有 sglang 仓副本, 所以资产由执行机读取后随 run 分发到节点
+# tmp 目录 (容器内即 /tmp/sglang_pipeline_assets), pip_deps.txt 经
+# $SGLANG_PIPELINE_ASSETS 引用 (如 numactl 二进制)
+_PIPELINE_ASSETS = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "assets")
+_PIPELINE_ASSETS_DIRNAME = "sglang_pipeline_assets"
+_PIPELINE_ASSETS_CONTAINER = f"/tmp/{_PIPELINE_ASSETS_DIRNAME}"
+
 # A3 节点标准挂载 (宿主机:容器), 与运维手册的 docker run 命令保持一致
 _NODE_MOUNTS = [
     "/usr/local/sbin:/usr/local/sbin",
@@ -778,6 +787,36 @@ def _stage_run_wrapper(node, run_dir, dry_run=False):
     return ssh_run(node, cmd)
 
 
+def _stage_pipeline_assets(node, host_dir, dry_run=False):
+    """把流水线自带资产 (流水线仓 assets/) 分发到节点 tmp 目录。
+
+    host_dir = runs/{run_id}/tmp.{host}/sglang_pipeline_assets, 容器内即
+    /tmp/sglang_pipeline_assets (pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用)。
+    流水线是独立仓、节点上只有 sglang 仓副本, 资产只能由执行机读取后随 run
+    分发: 本地节点直接复制, 远程节点 tar 经 ssh 推送。资产目录缺失 (裁剪过的
+    拷贝) 时跳过分发, 由 pip_deps 各条命令自行报 WARN, 不中断初始化。
+    """
+    if not os.path.isdir(_PIPELINE_ASSETS):
+        _log(f"[execute] [WARN] 流水线资产目录不存在, 跳过分发: {_PIPELINE_ASSETS}")
+        return 0
+    if dry_run:
+        print(f"[dry-run] 分发流水线资产 {_PIPELINE_ASSETS} -> "
+              f"{node.host}:{host_dir}")
+        return 0
+    if _is_local(node):
+        shutil.rmtree(host_dir, ignore_errors=True)
+        try:
+            shutil.copytree(_PIPELINE_ASSETS, host_dir)
+        except OSError as e:
+            _log(f"[execute] [WARN] 本机复制流水线资产失败: {e}")
+            return 1
+        return 0
+    # 远程: 先清旧目录 (跨 run 复用同一 tmp 目录时防残留), 再 tar 推送
+    if ssh_run(node, f"rm -rf {shlex.quote(host_dir)}", silent=True) != 0:
+        return 1
+    return ssh_push_dir(node, _PIPELINE_ASSETS, host_dir)
+
+
 class _ExecMachine:
     """执行机自身的伪节点: host=localhost 恒在 _local_ips() 集合内,
     ssh_run 对其走本地 subprocess 分支——供执行机本地命令 (git 等) 复用
@@ -1296,6 +1335,11 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     n_pip = len(cfg.run.pip_cmds)
     if n_pip:
         init.append("_pip_fail=0")
+        # 流水线自带资产 (assets/, 如 numactl 二进制) 已由 SingleNodeContainers
+        # 预分发到 /tmp 下 (见 _stage_pipeline_assets); 这里只暴露容器内路径,
+        # pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用, 不再依赖 sglang 仓路径
+        init.append(
+            f"export SGLANG_PIPELINE_ASSETS={shlex.quote(_PIPELINE_ASSETS_CONTAINER)}")
     for i, c in enumerate(cfg.run.pip_cmds, 1):
         q = c.replace("'", "'\\''")
         init += [
@@ -1487,6 +1531,16 @@ class SingleNodeContainers:
                     and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
                 self._failed.add(node.host)
                 raise RuntimeError(f"节点 {node.host} 写入 run_case.py 失败")
+            # 流水线自带资产 (pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用时才有
+            # 必要): 分发到容器 /tmp 挂载目录下 (宿主机 = runs/{run_id}/tmp.{host})
+            if any("SGLANG_PIPELINE_ASSETS" in c
+                   for c in self._cfg.run.pip_cmds):
+                assets_dir = (f"{runs_dir}/tmp.{node.host}/"
+                              f"{_PIPELINE_ASSETS_DIRNAME}")
+                if _stage_pipeline_assets(node, assets_dir,
+                                          self._dry_run) != 0:
+                    self._failed.add(node.host)
+                    raise RuntimeError(f"节点 {node.host} 分发流水线资产失败")
             rc = ssh_run(node,
                          _build_shared_container_cmd(self._cfg, node, runs_dir),
                          dry_run=self._dry_run)

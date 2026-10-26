@@ -41,13 +41,16 @@ pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp open
 apt-get install -y libssl-dev
 pip install sglang_router
 
-# ---- numactl (仓库自带 aarch64 二进制: sglang_local_pipeline/assets/numactl/) ----
+# ---- numactl (流水线自带 aarch64 二进制: 本流水线仓 assets/numactl/) ----
 # 镜像缺 numactl/libnuma 时手动装 (apt 源不可用场景); 装到 /usr/local/bin 与
 # /usr/local/lib 而非 ~/numactl + export: 用例走独立 docker exec, 不继承初始化
 # shell 的 PATH/LD_LIBRARY_PATH, 只有系统默认路径才对后续用例生效
+# assets 由流水线启动容器前从本流水线仓分发到节点 tmp 目录 (容器内
+# /tmp/sglang_pipeline_assets), 故用 $SGLANG_PIPELINE_ASSETS 引用:
+# 流水线是独立仓, 节点上只有 sglang 仓副本, 不能写成 sglang 仓内路径
 mkdir -p /usr/local/bin /usr/local/lib
-install -m 755 "$sglang_source_path/sglang_local_pipeline/assets/numactl/numactl" /usr/local/bin/
-install -m 644 "$sglang_source_path/sglang_local_pipeline/assets/numactl/libnuma.so.1" /usr/local/lib/
+install -m 755 "$SGLANG_PIPELINE_ASSETS/numactl/numactl" /usr/local/bin/
+install -m 644 "$SGLANG_PIPELINE_ASSETS/numactl/libnuma.so.1" /usr/local/lib/
 ldconfig
 
 # ---- pyarrow/numpy 兼容 ----
