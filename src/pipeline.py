@@ -1157,10 +1157,15 @@ def _container_init_parts(cfg):
         f"mkdir -p /root/.cache/.cache && "
         f"ln -sfn {q_ev} /root/.cache/.cache/evalscope; fi")
     # 预置数据集到 /tmp (与 CI 一致): 不预置则会重复下载 (gsm8k) 或 perf 套件
-    # 找不到数据; datasets 为节点本地绝对路径, 所在目录已自动挂载进容器;
-    # cp -r 兼容文件/目录, 缓存缺失时忽略, 回退在线下载
+    # 找不到数据; datasets 为节点本地绝对路径, 所在目录已自动挂载进容器, 容器内
+    # 可直接引用原路径——优先软链 (ln -s) 避免 NFS→NFS 搬运大文件 (如 1GB 的
+    # ShareGPT 会长时间卡住初始化), 软链失败 (跨挂载点/不可写) 回退 cp -r,
+    # 文件/目录均兼容, 缓存缺失时忽略, 回退在线下载
     for f in cfg.run.datasets:
-        parts.append(f"cp -r {shlex.quote(f)} /tmp/ 2>/dev/null || true")
+        parts.append(
+            f"[ -e {shlex.quote(f)} ] && "
+            f"ln -sfn {shlex.quote(f)} /tmp/ 2>/dev/null "
+            f"|| cp -r {shlex.quote(f)} /tmp/ 2>/dev/null || true")
     return parts
 
 
