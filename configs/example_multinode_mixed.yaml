@@ -1,0 +1,35 @@
+# 多机混布模板（用法见 README 快速上手，判定见 3.3）
+
+run:
+  workspace: /root/sglang_local_pipeline   # [必填] 节点上的工作目录
+
+  docker:
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试镜像
+
+    # extra_mounts:                     # 额外挂载宿主机目录，如模型权重（所有节点都要有）
+    #   - "/data/weights:/root/.cache/modelscope/hub/models"
+
+  # datasets:                           # 预置数据集，自动软链到 /tmp（只需 master 节点有）
+  #   - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  #   - /data/datasets/test.jsonl
+
+
+nodes:
+  - host: 192.168.10.1                  # master
+    arch: a3
+  - host: 192.168.10.2                  # worker
+    arch: a3
+  - host: 192.168.10.3                  # worker
+    arch: a3
+  - host: 192.168.10.4                  # worker
+    arch: a3
+
+
+suites:
+  - multinode: [192.168.10.1, 192.168.10.2]   # [必填] 节点列表（≥2 个），第一个是 master
+    file: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py   # [必填] 用例路径
+    timeout_minutes: 240                # 大卡数用例建议给足（默认 60）
+
+  - multinode: [192.168.10.1, 192.168.10.2, 192.168.10.3, 192.168.10.4]   # 4 机
+    file: test/registered/npu/basic_function/pd_disaggregation/test_npu_pd_disaggregation.py
+    timeout_minutes: 240

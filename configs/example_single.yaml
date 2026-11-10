@@ -1,39 +1,25 @@
-# 单机用例模板: 一个用例在一个节点上执行 (node 指定节点)
-# 用法: python3 src/run.py --config configs/example_single.yaml --dry-run
-# 完整字段说明与默认值见 README 第 3 节; 依赖安装 (pip_deps.txt) 与 evalscope 均无需配置
+# 单机用例模板（用法见 README 快速上手，精度用例见 1.4）
 
 run:
-  workspace: /root/sglang_local_pipeline   # [必填] 节点工作目录 (sglang 仓固定 {workspace}/sglang)
-  docker:
-    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试容器镜像
+  workspace: /root/sglang_local_pipeline   # [必填] 节点上的工作目录
 
-  # ---- 可选字段, 按需取消注释 (说明见 README 3.1) ----
-  # extra_mounts:                          # 额外 docker -v 挂载 (如模型权重)
-  #   - "/data/weights/your_model:/root/.cache/modelscope/hub/models/Eco-Tech/your_model"
-  # datasets:                              # 预置数据集 (节点本地绝对路径, 不存在回退在线下载)
-  #   - /root/.cache/modelscope/hub/datasets/tmp/test.jsonl
-  # code:                                  # 执行机仓缺失时自动 git clone (已存在则不动, 见 README 3.1)
-  #   git_remote: https://github.com/sgl-project/sglang.git
-  #   ref: main                            # clone -b {ref}, 不配用远端默认分支
-  # env:                                   # 覆盖/追加内置容器环境变量 (默认值见 README 3.4)
-  #   STREAMS_PER_DEVICE: "32"
-  # a5_env:                                # 仅 a5 节点单机用例容器注入 (覆盖 env 同名键)
-  #   ASCEND_USE_FIA: "1"
-  # init_timeout_minutes: 120              # 共享容器初始化超时 (分钟), 默认 120
+  docker:
+    image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试镜像
+
+    # extra_mounts:                     # 额外挂载宿主机目录，如模型权重
+    #   - "/data/weights:/root/.cache/modelscope/hub/models"
+
+  # datasets:                           # 预置数据集，自动软链到 /tmp
+  #   - /data/datasets/ShareGPT_V3_unfiltered_cleaned_split.json
+  #   - /data/datasets/test.jsonl
+
 
 nodes:
-  - host: 192.168.10.1   # [必填] 节点 IP; 指向执行机本身时本地执行 (不走 SSH)
-    arch: a3             # [必填] a3=16 卡 / a5=8 卡
-    # user: root         # SSH 用户名, 默认 root
-    # port: 22           # SSH 端口, 默认 22
-  # - host: 192.168.10.5 # A5 (8 卡) 节点示例
-  #   arch: a5
+  - host: 192.168.10.1                  # [必填] 节点 IP
+    arch: a3
+
 
 suites:
-  # 单机用例: node 指定执行节点 (与 roles/multinode 互斥)
-  # name 可省略 (默认取 file basename); node 也可省略:
-  #   - nodes 仅定义 1 个节点: 默认用该节点
-  #   - 多节点: 用例按负载均分到各节点并行执行 (node 显式指定则固定不动)
-  - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例路径, 相对 repo
-    timeout_minutes: 60     # 用例超时 (分钟), 默认 60
-    node: 192.168.10.1      # 执行节点 (多节点配置时可省略以均分)
+  - file: test/registered/npu/llm_models/test_npu_qwen3_32b.py   # [必填] 用例路径（相对 sglang 仓）
+  - file: test/registered/npu/llm_models/test_npu_qwen3_30b.py
+  - file: test/registered/npu/basic_function/runtime_options/test_npu_random_seed.py

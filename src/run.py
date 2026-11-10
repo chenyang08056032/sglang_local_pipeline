@@ -3,7 +3,7 @@
 """sglang 本地测试流水线 (最小可用版)。
 
 用法:
-    python3 src/run.py --config configs/example_single.yaml   # 单机 / example_pd.yaml (PD 分离) / example_tp.yaml (混布 TP)
+    python3 src/run.py --config configs/example_single.yaml   # 单机 / example_multinode_pd.yaml (PD 分离) / example_multinode_mixed.yaml (多机混布)
     python3 src/run.py --config configs/example_single.yaml --suite qwen3-32b-gsm8k
     python3 src/run.py --config configs/example_single.yaml --dry-run
     python3 src/run.py --config configs/example_single.yaml --at "2026-09-17 18:00:00"
@@ -37,7 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pipeline import (_ARCH_NPUS, _MULTI_ROLES, _log, SingleNodeContainers,
                       cleanup_node_sglang, execute_multinode_suite,
                       execute_multinode_tp_suite, execute_suite,
-                      prepare_evalscope, prepare_local_repo, prepare_node)
+                      preflight_check, prepare_evalscope,
+                      prepare_local_repo, prepare_node)
 
 
 # A3 NPU 环境的标准环境变量, 注入每个测试容器
@@ -633,6 +634,36 @@ def _is_accuracy_suite(cfg, suite):
     return any(m in content for m in _ACCURACY_MARKERS)
 
 
+def _check_accuracy_network(cfg):
+    """精度用例的出网前提检查: 要么配了代理, 要么离线准备齐全。
+
+    离线 (无代理) 需同时满足两项, 缺一都会在运行时失败:
+      ① evalscope 源码已预置到执行机 {workspace}/evalscope (非空);
+      ② run.datasets 已配置离线数据集路径 (否则容器内在线下载)。
+    不满足时打印缺哪项并返回 False, 调用方按配置错误终止 (rc=2),
+    避免新手等到 clone 超时/数据集下载失败才发现。纯性能用例不检查。
+    """
+    if any(cfg.run.env.get(k) for k in
+           ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")):
+        return True
+    staging = f"{cfg.run.workspace}/evalscope"
+    try:
+        has_src = os.path.isdir(staging) and bool(os.listdir(staging))
+    except OSError:
+        has_src = False
+    has_datasets = bool(cfg.run.datasets)
+    if has_src and has_datasets:
+        return True
+    _log("[错误] 配置了精度用例, 但未配代理, 离线准备也不完整 (缺一项都会运行时报错):")
+    _log(f"[错误]   ① evalscope 源码预置在执行机 {staging} -> "
+         f"{'已就绪' if has_src else '缺失'}")
+    _log(f"[错误]   ② run.datasets 配置离线数据集路径 -> "
+         f"{'已配置' if has_datasets else '未配置 (将在线下载)'}")
+    _log("[错误] 解决方案: 配代理 run.env.http_proxy / https_proxy "
+         '(如 "http://代理地址:30066"), 或补齐上面缺的项')
+    return False
+
+
 def prepare_nodes(cfg, dry_run):
     """先在执行机准备代码仓 (唯一 git 操作点), 再逐节点准备。
 
@@ -641,9 +672,23 @@ def prepare_nodes(cfg, dry_run):
 
     返回 {host: 是否就绪}; 节点未定义或执行机代码仓就绪失败时返回 None。
     """
+    # 开跑前统一预检 (SSH 免密 / docker / workspace / 数据集存在性): 一次查完
+    # 集中报错, 新手不必逐个撞; 不通过的项直接终止 (rc=2), 不进入耗时的准备阶段
+    if not preflight_check(
+            cfg,
+            [h for s in cfg.suites for h in _suite_hosts(s)],
+            [_suite_master_host(s) for s in cfg.suites],
+            dry_run):
+        return None
     # 代码准备只发生在执行机; 失败则所有节点都无代码可分发, 直接终止
     if not prepare_local_repo(cfg, dry_run):
         _log("[错误] 执行机代码仓准备失败, 各节点无法分发代码, 终止")
+        return None
+    # 精度用例出网检查放在节点准备之前 (此时 repo 已就绪, 判定准确):
+    # 既不配代理又没预置 evalscope 源码时直接按配置错误终止, 省掉无意义
+    # 的节点准备与后续超时等待
+    acc_suites = [s for s in cfg.suites if _is_accuracy_suite(cfg, s)]
+    if acc_suites and not _check_accuracy_network(cfg):
         return None
     prepared = {}
     for host in dict.fromkeys(h for s in cfg.suites for h in _suite_hosts(s)):
@@ -659,10 +704,8 @@ def prepare_nodes(cfg, dry_run):
             # 就绪后清理 sglang 残留 (宿主机进程 + 容器), 确保 NPU 卡无占用;
             # 失败不阻断 (用例报卡占用时按 [cleanup] 提示手动检查)
             cleanup_node_sglang(cfg, node, dry_run)
-    # evalscope 源码 (固定 {workspace}/evalscope): 仅配置了精度用例才准备
-    # (按用例文件内容判定, 见 _is_accuracy_suite); 执行机 clone 一次 + 仅分发
-    # 到精度用例跑测试的节点 (去重); 失败不阻断 (回退在线安装)
-    acc_suites = [s for s in cfg.suites if _is_accuracy_suite(cfg, s)]
+    # evalscope 源码 (固定 {workspace}/evalscope): 执行机 clone 一次 + 仅分发
+    # 到精度用例跑测试的节点 (去重); clone 失败不阻断 (回退在线安装)
     if acc_suites:
         prepare_evalscope(
             cfg,
@@ -920,6 +963,13 @@ def main():
 
     prepared = prepare_nodes(cfg, args.dry_run)
     if prepared is None:
+        # 预检/代码准备失败时回收本 run 的结果目录 (仅当为空, 即前台执行且
+        # 未产出任何内容), 避免 results/{run_id}/ 空目录被误认为"跑过了";
+        # 后台模式的 console.log 在里面, rmdir 自然失败, 目录保留
+        try:
+            os.rmdir(run_dir)
+        except OSError:
+            pass
         return 2
 
     results = run_suites(cfg, prepared, run_id, run_dir, args.dry_run)

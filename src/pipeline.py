@@ -192,10 +192,11 @@ def ssh_run(node, command, log_path=None, diag_path=None,
     else:
         # BatchMode=yes: 禁止交互式提示 (host key 未知/需 passphrase 时直接失败而非挂死);
         # StrictHostKeyChecking=accept-new: 首次连接自动接受 host key, 避免提示;
-        # LogLevel=ERROR: 抑制登录 banner ("Authorized users only..."), 纯噪音
+        # LogLevel=ERROR: 抑制登录 banner ("Authorized users only..."), 纯噪音;
+        # ConnectTimeout=10: 节点不可达时 10 秒失败 (只限建连阶段), 避免预检逐个卡死
         proc = subprocess.Popen(
             ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-             "-o", "LogLevel=ERROR",
+             "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
              "-p", str(node.port), f"{node.user}@{node.host}", command],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="ignore", bufsize=1,
@@ -989,6 +990,89 @@ def prepare_evalscope(cfg, master_hosts, dry_run=False):
                  f"手动检查: ssh {node.user}@{node.host} 'ls {staging}'")
 
 
+def preflight_check(cfg, all_hosts, test_hosts, dry_run=False):
+    """开跑前的环境预检: 一次性查完并集中报出所有阻塞项, 避免逐个撞错。
+
+    检查内容 (只读探测, 唯一写操作是为节点创建 workspace 目录):
+      - 执行机: workspace 可创建; sglang 仓存在, 或已配 run.code.git_remote
+      - 每个节点: SSH 免密可连; docker 可用; workspace 可创建
+      - 跑测试的节点: run.datasets 配置的文件确实存在
+    返回 True=全部通过; False=有阻塞项 (调用方按配置错误退出 rc=2)。
+    纯性能/精度用例共用本检查, 精度出网另由 run.py 的 _check_accuracy_network 负责。
+    """
+    problems = []
+
+    def ok(msg):
+        _log(f"[preflight] OK   {msg}")
+
+    def bad(msg, fix):
+        _log(f"[preflight] FAIL {msg}")
+        _log(f"[preflight]      修复: {fix}")
+        problems.append(msg)
+
+    ws = cfg.run.workspace
+    if not dry_run:
+        try:
+            os.makedirs(ws, exist_ok=True)
+            ok(f"执行机 workspace 可写: {ws}")
+        except OSError as e:
+            bad(f"执行机 workspace 不可创建: {ws} ({e})",
+                f"mkdir -p {ws} 或改 run.workspace 到可写目录")
+    repo = cfg.run.repo
+    if os.path.isdir(repo) and os.listdir(repo):
+        ok(f"执行机代码仓就绪: {repo}")
+    elif cfg.run.git_remote:
+        ok(f"执行机代码仓将由流水线自动 clone: {cfg.run.git_remote}")
+    else:
+        bad(f"执行机代码仓不存在且未配 run.code.git_remote: {repo}",
+            f"把 sglang 代码放到 {repo}，或在 YAML 配 code.git_remote 让流水线自动 clone")
+
+    for host in dict.fromkeys(all_hosts):
+        node = cfg.find_node(host)
+        if node is None:
+            bad(f"用例引用的节点未在 nodes 中定义: {host}",
+                "在 nodes 里补上该 host, 或修正 suites 里的节点")
+            continue
+        where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
+        if dry_run:
+            ok(f"{where} 跳过 SSH/docker 检查 (dry-run)")
+            continue
+        if ssh_run(node, "echo preflight", dry_run=dry_run, silent=True) != 0:
+            bad(f"SSH 连接失败 (需免密): {where}",
+                f"ssh-copy-id {node.user}@{node.host}"
+                + ("" if node.port == 22 else f" -p {node.port}"))
+            continue
+        ok(f"SSH 连接: {where}")
+        if ssh_run(node, "docker info >/dev/null 2>&1",
+                   dry_run=dry_run, silent=True) != 0:
+            bad(f"docker 不可用: {where}",
+                f"在 {where} 执行 'docker info' 检查 docker 服务与用户权限")
+            continue
+        ok(f"docker 可用: {where}")
+        if ssh_run(node, f"mkdir -p {shlex.quote(ws)}",
+                   dry_run=dry_run, silent=True) != 0:
+            bad(f"节点 workspace 不可创建: {where}:{ws}",
+                f"ssh {node.user}@{node.host} 'mkdir -p {ws}' 检查目录权限")
+
+    # 数据集只需跑测试的节点具备 (PD 的 prefill/decode、混布的 worker 不读数据集)
+    for host in dict.fromkeys(test_hosts):
+        node = cfg.find_node(host)
+        if node is None:
+            continue
+        where = "本机" if _is_local(node) else f"{node.user}@{node.host}:{node.port}"
+        for f in cfg.run.datasets:
+            if ssh_run(node, f"test -f {shlex.quote(f)}",
+                       dry_run=dry_run, silent=True) != 0:
+                bad(f"数据集不存在: {where}:{f}",
+                    "把数据集放到该路径, 或修正 run.datasets (须为节点本地绝对路径)")
+
+    if problems:
+        _log(f"[preflight] 共 {len(problems)} 项阻塞, 修复后重跑")
+        return False
+    _log("[preflight] 全部检查通过")
+    return True
+
+
 def prepare_node(cfg, node, dry_run=False):
     """执行前准备一个节点。
 
@@ -1107,25 +1191,31 @@ def _vendor_env_parts():
     ]
 
 
-# 临时规避 (仅测试用): 关闭容器系统 python 的 requests SSL 校验。
-# 企业代理以自签证书劫持外网 HTTPS, 用例内 requests 请求/下载报
+# 临时规避 (仅测试用): 关闭容器 python 的 requests SSL 校验。
+# 企业代理以自签证书劫持外网 HTTPS, 用例/evalscope 下载数据集报
 # CERTIFICATE_VERIFY_FAILED (sitecustomize 里的补丁仅覆盖 evalscope venv);
 # 直接改容器内 requests/sessions.py 的 Session.__init__:
 # self.verify = True → False, 对该 python 的所有 requests 会话生效。
+# 覆盖范围: PATH 上的 python3 + /usr/local/python*/bin/python3 全部解释器
+# (镜像里常同时存在多个 python, evalscope 走哪个就补哪个, 如
+# /usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py)。
 # 用 requests.sessions.__file__ 定位 (requests.__file__ 是包内 __init__.py,
 # 里面没有 self.verify, 会静默改错文件); 不写死 python 版本目录, 镜像升级
 # python 后自动跟随。执行点放在依赖安装之后 (见 _build_cmd /
 # _build_shared_container_cmd), 避免 pip 重装 requests 把补丁覆盖掉。
-# 结果打一行 [requests-patch] 便于核对 (单机落 .init.log, 多机落角色容器输出):
+# 结果按解释器打 [requests-patch] 便于核对 (单机落 .init.log, 多机落角色容器输出):
 # OK=文件中已是 False, WARN=未匹配到 self.verify = True / requests 缺失 /
 # 文件不可写; 只记日志不终止容器初始化。
 _REQUESTS_NO_VERIFY_SH = (
-    "python3 -c \"import requests.sessions as rs; p = rs.__file__; "
+    "for _py in $(command -v python3) "
+    "$(ls /usr/local/python*/bin/python3 2>/dev/null | sort -u); do "
+    "\"$_py\" -c \"import requests.sessions as rs; p = rs.__file__; "
     "s = open(p).read(); n = s.replace('self.verify = True', "
     "'self.verify = False'); open(p, 'w').write(n); "
     "print('[requests-patch]', 'OK' if 'self.verify = False' in n else "
-    "'[WARN] sessions.py 未匹配 self.verify = True', p)\" 2>/dev/null "
-    "|| echo '[requests-patch] [WARN] 未生效 (requests 缺失或文件不可写)'"
+    "'[WARN] 未匹配 self.verify = True', p)\" 2>/dev/null "
+    "|| echo \"[requests-patch] [WARN] $_py 未生效 (requests 缺失或文件不可写)\"; "
+    "done"
 )
 
 
