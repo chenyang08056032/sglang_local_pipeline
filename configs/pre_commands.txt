@@ -1,0 +1,15 @@
+# 容器内预执行命令（零配置：本文件存在且包含有效命令即生效，全部注释/删除 = 不执行）
+#
+# 内容不是独立脚本，不会以文件方式执行；流水线读取后原样嵌入容器命令：
+# 单机用例在节点共享容器初始化时执行一次（该节点全部单机用例复用），
+# 多机用例每个角色/节点容器启动用例前各执行一次。
+# 支持注释和多行 shell 写法；任一条命令返回非 0 即中止该用例。
+# 命令要用的文件放到流水线的 assets/patch/ 目录（已预建, 与 assets/numactl 等内置资产分开）：
+# 该目录内除 .gitignore 外的文件不入库, 可直接放本地补丁文件；
+# 命令里引用 $SGLANG_PIPELINE_ASSETS 时，流水线会自动分发 assets/ 到各节点，
+# 容器内该变量即 /tmp/sglang_pipeline_assets。
+# 其他宿主机路径仍可用 run.docker.extra_mounts 挂载（需每个节点都有）。
+#
+# 示例：临时替换镜像内的 sglang 文件（decode.py/scheduler.py 放 assets/patch/）
+# cp $SGLANG_PIPELINE_ASSETS/patch/decode.py /sgl-workspace/sglang/python/sglang/srt/disaggregation/decode.py
+# cp $SGLANG_PIPELINE_ASSETS/patch/scheduler.py /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py

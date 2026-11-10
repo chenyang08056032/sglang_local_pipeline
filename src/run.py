@@ -96,9 +96,8 @@ class RunConfig:
     # 由用例在线下载或自行读取
     datasets: List[str] = field(default_factory=list)
     # 容器内用例启动前执行的自定义命令 (内容读自流水线 configs/pre_commands.txt,
-    # 文件存在且非空即生效): 每条用例启动前在容器内执行一次, 单机/多机均生效,
-    # 用于临时替换容器内文件、打补丁等。命令引用的宿主机文件须先经 extra_mounts
-    # 挂载进容器
+    # 文件存在且非空即生效): 单机/多机均生效, 用于临时替换容器内文件、打补丁等。
+    # 文件放 assets/patch/ 时自动分发, 其他宿主机路径须经 extra_mounts 挂载
     pre_commands: str = ""
     # 单机共享容器启动时执行的依赖安装命令 (读自流水线 configs/pip_deps.txt,
     # 固定路径零配置: 文件存在即生效, 不存在跳过; # 注释/空行剔除后逐条嵌入

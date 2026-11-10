@@ -442,11 +442,11 @@ run:
 
 ```bash
 # configs/pre_commands.txt
-cp $SGLANG_PIPELINE_ASSETS/decode.py /sgl-workspace/sglang/python/sglang/srt/disaggregation/decode.py
-cp $SGLANG_PIPELINE_ASSETS/scheduler.py /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py
+cp $SGLANG_PIPELINE_ASSETS/patch/decode.py /sgl-workspace/sglang/python/sglang/srt/disaggregation/decode.py
+cp $SGLANG_PIPELINE_ASSETS/patch/scheduler.py /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py
 ```
 
-命令要用的文件直接放在流水线已有的 `assets/` 目录（不用新建目录），流水线会自动分发到每个节点，容器内用 `$SGLANG_PIPELINE_ASSETS` 引用（即 `/tmp/sglang_pipeline_assets`），**文件只需在执行机保留一份**。
+命令要用的文件放在流水线已有的 `assets/patch/` 目录（已预建，与 `assets/numactl` 等内置资产分开，不用新增顶层目录）。该目录内除 `.gitignore` 外的文件不入库，可直接放本地补丁文件。流水线会自动分发到每个节点，容器内用 `$SGLANG_PIPELINE_ASSETS/patch/` 引用（即 `/tmp/sglang_pipeline_assets/patch`），**文件只需在执行机保留一份**。
 
 - 命令在**容器内**执行：单机用例在该节点共享容器初始化时执行一次（该节点全部单机用例复用）；多机用例每个角色/节点容器启动用例前各执行一次
 - 文件内容原样作为 shell 命令嵌入执行，支持注释和多行语法；任一条返回非 0 即中止：单机=该节点共享容器初始化失败（该节点单机用例全部跳过），多机=该角色用例失败。单机日志在 `runs/{run_id}/.init.log.{host}`，多机在对应角色容器输出里；均有 `[pre_commands] 执行 configs/pre_commands.txt` 标记

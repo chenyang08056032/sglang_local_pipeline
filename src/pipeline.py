@@ -1245,8 +1245,8 @@ def _pre_command_parts(cfg):
     容器脚本: 单机用例在节点共享容器初始化时执行一次 (该节点全部单机用例
     复用); 多机用例每个角色/节点容器启动用例前执行一次。整段命令在外层
     set -e 环境下执行, 任一条返回非 0 即中止该用例 (不静默忽略, 便于发现
-    替换/补丁失败)。命令里引用的宿主机文件须先经 extra_mounts 挂载进容器,
-    否则容器内不可见。文件由执行机读取后嵌入命令, 无需分发到节点。
+    替换/补丁失败)。命令要用的文件放 assets/patch/ 时由流水线自动分发 (容器内
+    $SGLANG_PIPELINE_ASSETS/patch), 其他宿主机路径须先经 extra_mounts 挂载。
     """
     script = cfg.run.pre_commands
     if not script:
