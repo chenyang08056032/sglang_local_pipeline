@@ -8,6 +8,8 @@
 
 ### 第 1 步：一次性环境准备（只有下面几件事需要人工）
 
+**执行机必须是 Linux**：流水线要用 `ssh`/`docker`/`bash`，`-d` 后台模式还依赖 `os.fork`，Windows 上只能写配置、不能执行。执行机只需 Python 3 + `pip install pyyaml`（唯一依赖），不需要 NPU/Docker；代码只放在执行机，各节点由流水线自动复制。
+
 | 需要人工准备 | 说明 |
 |---|---|
 | SSH 免密 | 执行机免密登录每台节点（附录 A）；执行机就是节点时可跳过 |
@@ -15,9 +17,19 @@
 | 模型权重 + 镜像 | 权重提前放节点 `~/.cache`；镜像缺失会尝试自动 `docker pull`，离线节点需手动 pull |
 | 出网手段（仅精度用例） | `run.env` 配代理，或按 4.3 ② 离线预置 evalscope + 配置 `run.datasets` |
 
-其余全部自动：执行机只需 Python 3 + `pip install pyyaml`（唯一依赖），不需要 NPU/Docker；代码只放在执行机，各节点由流水线自动复制。
+准备完先自己核对一遍，全绿再往下走（IP 换你的节点、`{workspace}` 换实际路径）：
 
-**流水线启动时会先做统一预检**：SSH 免密、docker 可用性、workspace 可写、数据集是否存在、代码仓是否就绪，一次性列出所有问题并附修复命令，全部通过才开始跑，不用逐个试错。
+```bash
+python3 -V && python3 -c "import yaml; print('pyyaml OK')"           # 执行机：Python + 唯一依赖
+ssh -o BatchMode=yes root@192.168.10.1 'echo ssh OK'                  # SSH 免密（每台节点）
+ls {workspace}/sglang/test/registered/npu                             # 代码就位，顺便挑用例
+ssh root@192.168.10.1 'docker info >/dev/null && echo "docker OK"'    # 节点 docker
+ssh root@192.168.10.1 'ls ~/.cache'                                   # 模型权重
+```
+
+其余全部自动：预检、代码复制、容器初始化、结果汇总都不用人工介入。
+
+**流水线启动时会先做统一预检**：SSH 免密、docker 可用性、workspace 可写、`suites[].file` 在仓内是否存在、数据集是否存在、代码仓是否就绪，一次性列出所有问题并附修复命令，全部通过才开始跑，不用逐个试错。
 
 ### 第 2 步：复制模板，改 5 处必填
 
@@ -67,6 +79,43 @@ results/{run_id}/
     ├── ssh.log           # SSH 诊断
     └── plog/             # NPU 底层日志
 ```
+
+### 第一次跑：控制台会看到什么
+
+正常输出大致如下（省略了 `[ssh]` 连接诊断行和时间戳，IP、镜像、条数、耗时随实际变化），认准三个节点：预检全 OK、初始化心跳在动、最后有汇总。
+
+```text
+[配置] configs/my.yaml: 节点=1 用例=1 repo=/root/sglang_local_pipeline/sglang
+[配置] 镜像: <镜像地址>
+===== 流水线 run_id=my-20261110-100000  用例=1 =====
+[preflight] OK   执行机 workspace 可写: /root/sglang_local_pipeline
+[preflight] OK   执行机代码仓就绪: /root/sglang_local_pipeline/sglang
+[preflight] OK   SSH 连接: root@192.168.10.1:22
+[preflight] OK   docker 可用: root@192.168.10.1:22
+[preflight] 全部检查通过
+
+----- [prepare] 192.168.10.1 -----
+[prepare] 检查镜像 (不存在则尝试 pull): <镜像地址>
+[execute] root@192.168.10.1:22 启动单机共享容器 sgl-pipeline-single (pip 依赖: configs/pip_deps.txt 共 12 条命令)
+[execute] 192.168.10.1 共享容器初始化中... (已等 60s, 最长 7200s)
+[execute] 192.168.10.1 共享容器初始化完成 (耗时 613.0s)
+[pip_deps] 汇总: 共 12 条, 成功 12 条, 失败 0 条
+[execute] @ root@192.168.10.1:22 共享容器执行 (超时=120分钟)
+...
+[execute] 用例正常结束 (rc=0, 耗时 812s)
+[cleanup] 192.168.10.1 删除单机共享容器 sgl-pipeline-single
+
+===== 汇总 =====
+  [PASS] test/registered/npu/llm_models/test_npu_qwen3_32b.py  812s
+共 1 条: 通过 1 / 失败 0
+结果: /root/sglang_local_pipeline/results/my-20261110-100000
+```
+
+看着像卡住、其实正常的情况：
+
+- **`共享容器初始化中...` 每分钟一行**：首次要装 `pip_deps.txt` 依赖，几十分钟正常。进度看节点 `{workspace}/runs/{run_id}/.init.log`，控制台不刷 pip 日志；`pip_deps.txt` 为空时直接打印"无 pip 依赖安装"。
+- **用例执行期间控制台很安静**：用例自身输出写日志文件，只在结束时回显一行。想实时看：`tail -f results/{run_id}/{用例名}/{脚本名}.log`（执行机侧），或 `docker exec -it sgl-pipeline-single bash` 进容器。
+- **真卡住会自动报错**：初始化超过 `run.init_timeout_minutes`（默认 120 分钟）、用例超过 `timeout_minutes`，都会报错退出并清理容器，不会无限等。
 
 到这里单机场景就已经能用了。三种场景的具体配置与执行细节见下。
 
@@ -167,6 +216,42 @@ suites:
 - **结果**：精度分数与阈值断言在该用例的 `{脚本名}.log` 末尾，`summary.json` 记录断言结果。
 
 执行命令同 1.2，无需任何变化。
+
+**最小可跑配方（有代理；把 workspace、镜像、代理、节点 IP/arch、用例路径换成实际值即可）**：
+
+```yaml
+run:
+  workspace: /root/sglang_local_pipeline       # 节点工作目录
+  docker:
+    image: <镜像地址>
+  env:                                         # 代理（执行机 clone、容器下载都走它）
+    http_proxy: http://<代理IP>:30066
+    https_proxy: http://<代理IP>:30066
+
+nodes:
+  - host: 192.168.10.1                         # a3=16 卡 / a5=8 卡
+    arch: a3
+
+suites:
+  - file: test/registered/npu/accuracy/<精度用例>.py
+    timeout_minutes: 120
+```
+
+除这些外不需要任何配置：evalscope 自动 clone 到 `{workspace}/evalscope`，gsm8k/gpqa 等数据集自动在线下载。
+
+**节点不出网（离线）**：去掉 `run.env` 代理，改为下面两项准备，缺任一项预检会直接报配置错误（退出码 `2`）：
+
+```bash
+# ① 执行机放 evalscope 源码（目录非空即跳过自动 clone）
+git clone --depth 1 https://github.com/modelscope/evalscope.git {workspace}/evalscope
+# ② 数据集提前放到节点，下面配绝对路径（只需跑测试的节点有）
+```
+
+```yaml
+run:
+  datasets:
+    - /data/datasets/<数据集文件>
+```
 
 ## <a id="sec-2"></a>2. 多机（PD 分离）用例（含多机精度）
 
@@ -501,7 +586,7 @@ suites:
 
 `run.py` 启动后依次做 5 件事（三种场景通用）：
 
-1. **预检**（只读）：SSH 免密、docker 可用、workspace 可写、`run.datasets` 文件存在、代码仓就绪——所有问题一次性列出并给修复命令，有问题立即退出（退出码 `2`），不浪费时间，也不残留空的 `results/{run_id}/` 目录（后台模式的 `console.log` 例外，会保留目录）。
+1. **预检**（只读）：SSH 免密、docker 可用、workspace 可写、`suites[].file` 在仓内是否存在、`run.datasets` 文件存在、代码仓就绪——所有问题一次性列出并给修复命令，有问题立即退出（退出码 `2`），不浪费时间，也不残留空的 `results/{run_id}/` 目录（后台模式的 `console.log` 例外，会保留目录）。
 2. **准备代码**（执行机）：`{workspace}/sglang` 有代码就直接用（不动 git）；没有且配了 `git_remote` 就自动 clone；没有又没配则报错。
 3. **准备节点**（每个用到的节点一次）：缺镜像尝试 `docker pull`（失败不阻断）；远程节点清理旧仓后从执行机整仓复制代码（含 `.git`，保证多节点版本一致）；杀残留 sglang 进程、删旧容器，确保 NPU 卡干净。配了精度用例时**在此阶段**（任何用例执行之前）扫全部用例判定精度用例，一次 clone evalscope 并分发到跑测试的节点；容器内的 `pip install -e` 属于各容器初始化，不在本阶段。
 4. **执行用例**：单机用例共用共享容器逐条 `docker exec`（见 1.2）；多机用例每角色一个容器编排执行（见 2.2 / 3.2）；每完成一条即重写 `summary.json`（中途被杀也能看到已完成结果）。

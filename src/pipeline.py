@@ -1014,6 +1014,7 @@ def preflight_check(cfg, all_hosts, test_hosts, dry_run=False):
 
     检查内容 (只读探测, 唯一写操作是为节点创建 workspace 目录):
       - 执行机: workspace 可创建; sglang 仓存在, 或已配 run.code.git_remote
+      - 执行机: 用例 file (相对路径) 在仓内确实存在 (仓就绪时)
       - 每个节点: SSH 免密可连; docker 可用; workspace 可创建
       - 跑测试的节点: run.datasets 配置的文件确实存在
     返回 True=全部通过; False=有阻塞项 (调用方按配置错误退出 rc=2)。
@@ -1038,13 +1039,29 @@ def preflight_check(cfg, all_hosts, test_hosts, dry_run=False):
             bad(f"执行机 workspace 不可创建: {ws} ({e})",
                 f"mkdir -p {ws} 或改 run.workspace 到可写目录")
     repo = cfg.run.repo
-    if os.path.isdir(repo) and os.listdir(repo):
+    repo_ready = os.path.isdir(repo) and bool(os.listdir(repo))
+    if repo_ready:
         ok(f"执行机代码仓就绪: {repo}")
     elif cfg.run.git_remote:
         ok(f"执行机代码仓将由流水线自动 clone: {cfg.run.git_remote}")
     else:
         bad(f"执行机代码仓不存在且未配 run.code.git_remote: {repo}",
             f"把 sglang 代码放到 {repo}，或在 YAML 配 code.git_remote 让流水线自动 clone")
+
+    # 用例文件存在性: 相对路径按 sglang 仓解析。绝对路径可能只在节点可见
+    # (如 ~/.cache 下的自定义用例), 执行机上查不到, 跳过; 仓待 clone 时无法校验,
+    # 同样跳过。校验放在预检是为了避免 file 写错却先拉镜像/复制代码/装依赖
+    # (可能几十分钟), 最后才报文件不存在
+    if repo_ready:
+        checked = set()
+        for suite in cfg.suites:
+            if suite.file.startswith("/") or suite.file in checked:
+                continue
+            checked.add(suite.file)
+            if not os.path.isfile(os.path.join(repo, suite.file)):
+                bad(f"用例文件不存在: {suite.file} (相对路径按 sglang 仓解析)",
+                    f"改成仓内真实路径 (如 test/registered/npu/xxx.py), "
+                    f"查看已有用例: ls {repo}/test/registered/npu")
 
     for host in dict.fromkeys(all_hosts):
         node = cfg.find_node(host)
