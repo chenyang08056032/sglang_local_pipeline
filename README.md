@@ -436,7 +436,32 @@ run:
 
 流水线还会自动注入（一般无需关心）：`TZ=Asia/Shanghai`、`no_proxy`（节点间直连不受代理影响）、`PYTHONPATH=/output`（多机协调桥接 + evalscope SSL 规避）；并临时关闭容器内各 python（PATH 上的 `python3` 及 `/usr/local/python*/bin/python3`，含 evalscope 实际使用的解释器）requests 的 SSL 校验（规避企业代理自签证书报 `CERTIFICATE_VERIFY_FAILED`，日志里每个解释器一行 `[requests-patch] OK` 即生效，问题消失后可移除）。
 
-### 4.5 完整配置示例（仓缺失时由流水线 clone）
+### 4.5 容器内预执行命令（configs/pre_commands.txt）
+
+需要在用例启动前临时改动容器（替换 sglang 文件、打补丁、清理现场等）时，直接编辑流水线里的 `configs/pre_commands.txt`。固定路径、零配置：文件存在且包含有效命令即生效，全为注释/空行或删除文件 = 不执行，无需改 YAML。
+
+```bash
+# configs/pre_commands.txt
+cp $SGLANG_PIPELINE_ASSETS/decode.py /sgl-workspace/sglang/python/sglang/srt/disaggregation/decode.py
+cp $SGLANG_PIPELINE_ASSETS/scheduler.py /sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py
+```
+
+命令要用的文件直接放在流水线已有的 `assets/` 目录（不用新建目录），流水线会自动分发到每个节点，容器内用 `$SGLANG_PIPELINE_ASSETS` 引用（即 `/tmp/sglang_pipeline_assets`），**文件只需在执行机保留一份**。
+
+- 命令在**容器内**执行：单机用例在该节点共享容器初始化时执行一次（该节点全部单机用例复用）；多机用例每个角色/节点容器启动用例前各执行一次
+- 文件内容原样作为 shell 命令嵌入执行，支持注释和多行语法；任一条返回非 0 即中止：单机=该节点共享容器初始化失败（该节点单机用例全部跳过），多机=该角色用例失败。单机日志在 `runs/{run_id}/.init.log.{host}`，多机在对应角色容器输出里；均有 `[pre_commands] 执行 configs/pre_commands.txt` 标记
+- 若文件放在其他路径且各节点都有（如共享 NFS），也可以继续用 `extra_mounts` 挂载：
+
+```yaml
+run:
+  docker:
+    extra_mounts:
+      - "/data/patch:/data/patch"
+```
+
+- 改 sglang 代码前先确认用例实际加载的路径：`python3 -c "import sglang; print(sglang.__file__)"`。流水线挂载的仓在 `{workspace}/sglang`，镜像自带的代码常在 `/sgl-workspace/sglang`，两者不是同一份
+
+### 4.6 完整配置示例（仓缺失时由流水线 clone）
 
 ```yaml
 run:

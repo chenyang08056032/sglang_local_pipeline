@@ -788,34 +788,53 @@ def _stage_run_wrapper(node, run_dir, dry_run=False):
     return ssh_run(node, cmd)
 
 
-def _stage_pipeline_assets(node, host_dir, dry_run=False):
-    """把流水线自带资产 (流水线仓 assets/) 分发到节点 tmp 目录。
+def _stage_dir_from_executor(node, src, host_dir, label, dry_run=False):
+    """把执行机目录分发到节点 host_dir: 本地节点直接复制, 远程 tar 经 ssh 推送。
 
-    host_dir = runs/{run_id}/tmp.{host}/sglang_pipeline_assets, 容器内即
-    /tmp/sglang_pipeline_assets (pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用)。
-    流水线是独立仓、节点上只有 sglang 仓副本, 资产只能由执行机读取后随 run
-    分发: 本地节点直接复制, 远程节点 tar 经 ssh 推送。资产目录缺失 (裁剪过的
-    拷贝) 时跳过分发, 由 pip_deps 各条命令自行报 WARN, 不中断初始化。
+    节点上只有 sglang 仓副本, 流水线自带文件只能由执行机读取后随 run 分发。
+    远程先清旧目录 (跨 run 复用同一 tmp 目录时防残留) 再推送。
     """
-    if not os.path.isdir(_PIPELINE_ASSETS):
-        _log(f"[execute] [WARN] 流水线资产目录不存在, 跳过分发: {_PIPELINE_ASSETS}")
-        return 0
     if dry_run:
-        print(f"[dry-run] 分发流水线资产 {_PIPELINE_ASSETS} -> "
-              f"{node.host}:{host_dir}")
+        print(f"[dry-run] 分发{label} {src} -> {node.host}:{host_dir}")
         return 0
     if _is_local(node):
         shutil.rmtree(host_dir, ignore_errors=True)
         try:
-            shutil.copytree(_PIPELINE_ASSETS, host_dir)
+            shutil.copytree(src, host_dir)
         except OSError as e:
-            _log(f"[execute] [WARN] 本机复制流水线资产失败: {e}")
+            _log(f"[execute] [WARN] 本机复制{label}失败: {e}")
             return 1
         return 0
-    # 远程: 先清旧目录 (跨 run 复用同一 tmp 目录时防残留), 再 tar 推送
     if ssh_run(node, f"rm -rf {shlex.quote(host_dir)}", silent=True) != 0:
         return 1
-    return ssh_push_dir(node, _PIPELINE_ASSETS, host_dir)
+    return ssh_push_dir(node, src, host_dir)
+
+
+def _stage_pipeline_assets(node, host_dir, dry_run=False):
+    """把流水线自带资产 (流水线仓 assets/) 分发到节点 tmp 目录。
+
+    host_dir = runs/{run_id}/tmp.{host}/sglang_pipeline_assets, 容器内即
+    /tmp/sglang_pipeline_assets (pip_deps.txt / pre_commands.txt 用
+    $SGLANG_PIPELINE_ASSETS 引用)。资产目录缺失 (裁剪过的拷贝) 时跳过分发,
+    由引用它的命令自行报错, 不中断初始化。
+    """
+    if not os.path.isdir(_PIPELINE_ASSETS):
+        _log(f"[execute] [WARN] 流水线资产目录不存在, 跳过分发: {_PIPELINE_ASSETS}")
+        return 0
+    return _stage_dir_from_executor(node, _PIPELINE_ASSETS, host_dir,
+                                    "流水线资产", dry_run)
+
+
+def _uses_pipeline_assets(cfg):
+    """pip_deps.txt 或 pre_commands.txt 是否引用了流水线资产。"""
+    needle = "SGLANG_PIPELINE_ASSETS"
+    return (any(needle in c for c in cfg.run.pip_cmds)
+            or _pre_commands_use_assets(cfg))
+
+
+def _pre_commands_use_assets(cfg):
+    """多机容器不执行 pip_deps.txt, 只看预执行命令是否引用资产。"""
+    return "SGLANG_PIPELINE_ASSETS" in cfg.run.pre_commands
 
 
 class _ExecMachine:
@@ -1219,12 +1238,34 @@ _REQUESTS_NO_VERIFY_SH = (
 )
 
 
+def _pre_command_parts(cfg):
+    """容器内用例启动前执行的自定义命令段 (configs/pre_commands.txt)。
+
+    文件内容由 run.py 加载时读入 (零配置: 存在且非空即生效), 原样嵌入
+    容器脚本: 单机用例在节点共享容器初始化时执行一次 (该节点全部单机用例
+    复用); 多机用例每个角色/节点容器启动用例前执行一次。整段命令在外层
+    set -e 环境下执行, 任一条返回非 0 即中止该用例 (不静默忽略, 便于发现
+    替换/补丁失败)。命令里引用的宿主机文件须先经 extra_mounts 挂载进容器,
+    否则容器内不可见。文件由执行机读取后嵌入命令, 无需分发到节点。
+    """
+    script = cfg.run.pre_commands
+    if not script:
+        return []
+    return ["echo '[pre_commands] 执行 configs/pre_commands.txt'", script]
+
+
 def _container_init_parts(cfg):
     """容器初始化命令段 (单机共享容器与多机角色容器共用): Ascend 环境 (toolkit/atb/vendor) →
     覆盖 ascend 测试工具 → /root/sglang 与 evalscope 软链 → 预置数据集到 /tmp。
     单机共享容器在此基础上追加 configs/pip_deps.txt 依赖安装 (见 _build_shared_container_cmd)。"""
     repo = cfg.run.repo
     parts = list(_vendor_env_parts())
+    # 流水线资产 (assets/) 已由调用方分发到节点 tmp 目录 (容器内 /tmp/...),
+    # pip_deps.txt 与 pre_commands.txt 均可用 $SGLANG_PIPELINE_ASSETS 引用;
+    # 未引用时不注入, 避免无关环境变量干扰
+    if _uses_pipeline_assets(cfg):
+        parts.append(
+            f"export SGLANG_PIPELINE_ASSETS={shlex.quote(_PIPELINE_ASSETS_CONTAINER)}")
     # 覆盖镜像内 ascend 工具 (学 CI nightly 做法)
     # 注意: 对完整路径做 shlex.quote, 不能只引用前缀 (否则 /python/... 落在引号外,
     # 路径含空格时会被 shell 拆断); glob * 留在引号外以便 shell 展开
@@ -1348,10 +1389,9 @@ def _build_cmd(cfg, suite, node, node_run_dir, role=None, extra_env=None,
     d = cfg.run.docker
     container = f"sgl-pipeline-{suite.name}" + (f"-{role}" if role else "")
 
-    # 容器内命令; requests 补丁放在初始化之后、用例之前 (多机容器无 pip 依赖安装,
-    # 仍放最后与单机共享容器保持同一语义: 用例启动前最终状态已打补丁)
+    # 容器内命令: 初始化 → requests 补丁 → 自定义预执行命令 → 用例
     parts = (["set -euo pipefail"] + _container_init_parts(cfg)
-             + [_REQUESTS_NO_VERIFY_SH])
+             + [_REQUESTS_NO_VERIFY_SH] + _pre_command_parts(cfg))
     cmd = (f"cd {shlex.quote(cfg.run.repo)} && "
            f"python3 -u {shlex.quote(suite.file)} -f")
     # 不用 "| tee": 用例泄漏的子进程 (如 PD 分离 router 的 sglang_router) 会继承
@@ -1430,11 +1470,6 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     n_pip = len(cfg.run.pip_cmds)
     if n_pip:
         init.append("_pip_fail=0")
-        # 流水线自带资产 (assets/, 如 numactl 二进制) 已由 SingleNodeContainers
-        # 预分发到 /tmp 下 (见 _stage_pipeline_assets); 这里只暴露容器内路径,
-        # pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用, 不再依赖 sglang 仓路径
-        init.append(
-            f"export SGLANG_PIPELINE_ASSETS={shlex.quote(_PIPELINE_ASSETS_CONTAINER)}")
     for i, c in enumerate(cfg.run.pip_cmds, 1):
         q = c.replace("'", "'\\''")
         init += [
@@ -1456,6 +1491,10 @@ def _build_shared_container_cmd(cfg, node, runs_dir):
     # requests 补丁必须放在全部 pip 依赖安装之后 (依赖可能重装/降级 requests
     # 覆盖 sessions.py, 放前面会被静默还原), 且在任何单机用例 docker exec 之前
     init.append(_REQUESTS_NO_VERIFY_SH)
+    # 自定义预执行命令: 节点共享容器初始化时执行一次, 该节点全部单机用例
+    # 复用 (文件替换/打补丁类命令无需逐条重复执行); 失败则初始化失败,
+    # 该节点单机用例全部跳过
+    init += _pre_command_parts(cfg)
     inner = (
         "(\n" + "\n".join(["set -euo pipefail"] + init) + "\n)"
         f" > /output/.init.log{tag} 2>&1\n"
@@ -1522,6 +1561,8 @@ def _single_case_exec_cmd(cfg, suite, container, node_run_dir, tp_halving,
         _RESIDUAL_KILL_SH,
     ]
     parts += _vendor_env_parts()
+    # 自定义预执行命令 (configs/pre_commands.txt) 在共享容器初始化时执行一次,
+    # 见 _build_shared_container_cmd; 此处不再逐条用例重复执行
     # 前台同步预建日志, 用例后台改为追加: /output 落在 NFS 等慢速共享存储时,
     # 后台子 shell 的建文件 (RPC 往返) 可能晚于 tail -f 的打开 —— tail 无
     # --retry, 文件不存在即报错退出 rc=1, 整条用例被误判失败 (真实用例
@@ -1626,10 +1667,11 @@ class SingleNodeContainers:
                     and _stage_run_wrapper(node, runs_dir, self._dry_run) != 0):
                 self._failed.add(node.host)
                 raise RuntimeError(f"节点 {node.host} 写入 run_case.py 失败")
-            # 流水线自带资产 (pip_deps.txt 用 $SGLANG_PIPELINE_ASSETS 引用时才有
-            # 必要): 分发到容器 /tmp 挂载目录下 (宿主机 = runs/{run_id}/tmp.{host})
-            if any("SGLANG_PIPELINE_ASSETS" in c
-                   for c in self._cfg.run.pip_cmds):
+            # 流水线资产 (pip_deps.txt / pre_commands.txt 用 $SGLANG_PIPELINE_ASSETS
+            # 引用时才有必要): 分发到容器 /tmp 挂载目录下 (宿主机 =
+            # runs/{run_id}/tmp.{host}); 预执行命令要替换的文件放 assets/ 即可,
+            # 只需在执行机保留一份
+            if _uses_pipeline_assets(self._cfg):
                 assets_dir = (f"{runs_dir}/tmp.{node.host}/"
                               f"{_PIPELINE_ASSETS_DIRNAME}")
                 if _stage_pipeline_assets(node, assets_dir,
@@ -1910,6 +1952,14 @@ def execute_multinode_suite(cfg, suite, run_id, local_run_dir, dry_run=False):
                     rc[key] = -1
                     errs[key] = "写入 sitecustomize.py 失败"
                     return
+                # 流水线资产 (pre_commands.txt 引用了 $SGLANG_PIPELINE_ASSETS
+                # 时): 分发到本角色 tmp 目录, 容器内即 /tmp/sglang_pipeline_assets
+                if _pre_commands_use_assets(cfg) and _stage_pipeline_assets(
+                        node, f"{node_run_dir}/tmp/{_PIPELINE_ASSETS_DIRNAME}",
+                        dry_run) != 0:
+                    rc[key] = -1
+                    errs[key] = "分发流水线资产失败"
+                    return
                 # PD 节点比 router 多留 2 分钟: router 结束后它们
                 # 还需一个轮询周期 (~30s) 才收到结束信号退出,
                 # 不留余量会被 timeout 误杀造成假失败
@@ -2134,6 +2184,14 @@ def execute_multinode_tp_suite(cfg, suite, run_id, local_run_dir, dry_run=False)
                                         diag_path=diag_path) != 0:
                     rc[key] = -1
                     errs[key] = "写入 sitecustomize.py 失败"
+                    return
+                # 流水线资产 (pre_commands.txt 引用了 $SGLANG_PIPELINE_ASSETS
+                # 时): 分发到本角色 tmp 目录, 容器内即 /tmp/sglang_pipeline_assets
+                if _pre_commands_use_assets(cfg) and _stage_pipeline_assets(
+                        node, f"{node_run_dir}/tmp/{_PIPELINE_ASSETS_DIRNAME}",
+                        dry_run) != 0:
+                    rc[key] = -1
+                    errs[key] = "分发流水线资产失败"
                     return
                 # worker 比 master 多留 2 分钟: master 结束后 worker
                 # 还需一个轮询周期才收到结束信号退出

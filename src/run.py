@@ -95,6 +95,11 @@ class RunConfig:
     # 所在目录自动挂载进容器 (同路径映射)。未配置时不预置任何数据集,
     # 由用例在线下载或自行读取
     datasets: List[str] = field(default_factory=list)
+    # 容器内用例启动前执行的自定义命令 (内容读自流水线 configs/pre_commands.txt,
+    # 文件存在且非空即生效): 每条用例启动前在容器内执行一次, 单机/多机均生效,
+    # 用于临时替换容器内文件、打补丁等。命令引用的宿主机文件须先经 extra_mounts
+    # 挂载进容器
+    pre_commands: str = ""
     # 单机共享容器启动时执行的依赖安装命令 (读自流水线 configs/pip_deps.txt,
     # 固定路径零配置: 文件存在即生效, 不存在跳过; # 注释/空行剔除后逐条嵌入
     # 容器初始化脚本, 如 CI Install dependencies 步骤的 pip install ...)
@@ -241,6 +246,20 @@ def load_config(path):
             raise ValueError(
                 f"run.datasets 不支持根目录直属文件 (所在目录会整盘挂载), "
                 f"请移入子目录: {x!r}")
+    # 容器内预执行命令固定读流水线 configs/pre_commands.txt (零配置: 文件存在
+    # 且非空即生效, 不存在/为空跳过——删文件 = 不执行); 内容原样嵌入容器脚本,
+    # 支持注释和多行 shell 语法; 命令引用的宿主机文件须经 extra_mounts 挂载
+    _pre_file = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "configs", "pre_commands.txt")
+    pre_commands = ""
+    if os.path.isfile(_pre_file):
+        # utf-8-sig 兼容 Windows BOM; 内容原样保留 (多行 shell 语法), 但
+        # 全为注释/空行时视为未配置 (模板默认状态, 不打印执行日志)
+        with open(_pre_file, "r", encoding="utf-8-sig") as pf:
+            _pre_text = pf.read()
+        if any(ln.strip() and not ln.lstrip().startswith("#")
+               for ln in _pre_text.splitlines()):
+            pre_commands = _pre_text.strip()
     # 依赖安装命令固定读流水线 configs/pip_deps.txt (零配置: 存在即生效,
     # 不存在跳过不报错——空文件/删文件 = 不装); 用 __file__ 定位, 不受
     # run.py 调用 cwd 影响 (支持任意路径执行)
@@ -285,6 +304,7 @@ def load_config(path):
              **{str(k): str(v) for k, v in env_raw.items()}},
         a5_env={str(k): str(v) for k, v in a5_env_raw.items()},
         datasets=list(datasets_raw),
+        pre_commands=pre_commands,
         pip_cmds=pip_cmds,
         init_timeout_minutes=120 if itmo is None else itmo,
     )
