@@ -6,7 +6,7 @@ run:
   docker:
     image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3   # [必填] 测试镜像
 
-    # extra_mounts:                     # 额外挂载宿主机目录，如模型权重（所有节点都要有）
+    # extra_mounts:                     # 权重不在节点 ~/.cache 时挂载（所有节点都要有）
     #   - "/data/weights:/root/.cache/modelscope/hub/models"
 
   # datasets:                           # 预置数据集，自动软链到 /tmp（只需 master 节点有）

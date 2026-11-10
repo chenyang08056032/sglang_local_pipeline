@@ -14,7 +14,7 @@
 |---|---|
 | SSH 免密 | 执行机免密登录每台节点（附录 A）；执行机就是节点时可跳过 |
 | sglang 代码 | 放到执行机 `{workspace}/sglang`；或在 YAML 配 `code.git_remote` 让流水线自动 clone |
-| 模型权重 + 镜像 | 权重提前放节点 `~/.cache`；镜像缺失会尝试自动 `docker pull`，离线节点需手动 pull |
+| 模型权重 + 镜像 | 权重需在容器内可见：默认把节点登录用户的 `~/.cache` 挂到容器 `/root/.cache`，权重已在该处则零配置；在别处（如 `/data/models`）须用 `run.docker.extra_mounts` 挂到用例读取的路径（见 4.1 说明）。镜像缺失会尝试自动 `docker pull`，离线节点需手动 pull |
 | 出网手段（仅精度用例） | `run.env` 配代理，或按 4.3 ② 离线预置 evalscope + 配置 `run.datasets` |
 
 准备完先自己核对一遍，全绿再往下走（IP 换你的节点、`{workspace}` 换实际路径）：
@@ -24,7 +24,7 @@ python3 -V && python3 -c "import yaml; print('pyyaml OK')"           # 执行机
 ssh -o BatchMode=yes root@192.168.10.1 'echo ssh OK'                  # SSH 免密（每台节点）
 ls {workspace}/sglang/test/registered/npu                             # 代码就位，顺便挑用例
 ssh root@192.168.10.1 'docker info >/dev/null && echo "docker OK"'    # 节点 docker
-ssh root@192.168.10.1 'ls ~/.cache'                                   # 模型权重
+ssh root@192.168.10.1 'ls ~/.cache'                                   # 权重在此则零配置；不在则记下实际路径，配 extra_mounts
 ```
 
 其余全部自动：预检、代码复制、容器初始化、结果汇总都不用人工介入。
@@ -337,7 +337,7 @@ suites:
 |---|---|
 | 节点间网络互通 | router 访问 PD 的 8000 端口；另用到 8995、24666 端口，防火墙需放行 |
 | 节点可达执行机 | 各节点容器要访问执行机协调服务（固定 9377 端口）；执行机在 NAT 后不支持 |
-| 模型缓存 | prefill/decode 节点均需预置 `~/.cache` |
+| 模型缓存 | prefill/decode 节点均需有权重：默认挂 `~/.cache`，其他路径用 `extra_mounts`（见 4.1） |
 | 镜像 | router 节点镜像需含 `sglang_router`（与 CI 一致的镜像已含，缺失时 router 日志报 ModuleNotFoundError） |
 
 ## <a id="sec-3"></a>3. 多机混布用例（含多机精度）
@@ -390,7 +390,7 @@ results/{run_id}/{用例名}/
 
 ### 3.5 前置条件
 
-与 PD 分离相同（节点间互通、可达执行机 9377 协调端口），但无 router 端口需求；**所有节点**均需预置模型缓存。
+与 PD 分离相同（节点间互通、可达执行机 9377 协调端口），但无 router 端口需求；**所有节点**均需有权重（默认 `~/.cache`，其他路径用 `extra_mounts`）。
 
 ### PD 分离 vs 多机混布速查
 
@@ -420,11 +420,22 @@ results/{run_id}/{用例名}/
 | `run.docker.devices` | `auto` | 否 | `auto`=按 arch 挂卡（a3=16、a5=8）；或显式卡号列表如 `[0,1,2,3]` |
 | `run.docker.net` | `host` | 否 | 容器网络模式 |
 | `run.docker.shm_size` | `16g` | 否 | 共享内存大小（固定附加 `--privileged --ipc=host`） |
-| `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载，格式同 docker -v。节点上路径不存在时自动跳过并 `[WARN]`（避免 docker 静默挂成空目录难排查） |
+| `run.docker.extra_mounts` | `[]` | 否 | 额外 `-v` 挂载，格式同 docker -v（权重不在 `~/.cache` 时用，见下方说明）。节点上路径不存在时自动跳过并 `[WARN]`（避免 docker 静默挂成空目录难排查） |
 | `run.env` | 内置 7 项（见 4.4） | 否 | 注入容器的环境变量，按 key 覆盖默认值，可追加新键 |
 | `run.a5_env` | `{}` | 否 | 仅注入 a5 节点单机用例容器（如灵衢互联 `ASCEND_USE_FIA: "1"`），覆盖 `run.env` 同名键 |
 | `run.datasets` | `[]` | 否 | 预置数据集，见 4.3 ① |
 | `run.init_timeout_minutes` | `120` | 否 | 单机共享容器初始化（含 pip 依赖安装）的最长等待，慢代理冷缓存可调大 |
+
+**模型权重怎么让容器看到**：流水线默认只把节点登录用户的 `~/.cache` 挂到容器 `/root/.cache`。权重一般不在这个目录，所以二选一：放到节点 `~/.cache`，或用 `extra_mounts` 把实际目录挂到容器内用例读取的路径（`SGLANG_USE_MODELSCOPE=true` 下通常为 `/root/.cache/modelscope/hub/models`）：
+
+```yaml
+run:
+  docker:
+    extra_mounts:
+      - "/data/models:/root/.cache/modelscope/hub/models"
+```
+
+每个要起 server 的节点都得挂：单机=执行节点，PD 分离=prefill/decode，混布=全部节点。
 
 **nodes 段**
 
@@ -439,7 +450,7 @@ results/{run_id}/{用例名}/
 
 | 参数 | 默认值 | 必填 | 说明 |
 |---|---|---|---|
-| `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo 或 `~/.cache`） |
+| `suites[].file` | 无 | 是 | 用例文件路径，相对 repo；绝对路径须在容器可见挂载内（repo、`~/.cache`，或 `extra_mounts` 挂进来的目录） |
 | `suites[].name` | file 去扩展名 | 否 | 用例名称（`--suite` 过滤用） |
 | `suites[].node` | 自动分配 | 三选一 | 单机用例：执行节点。单节点配置可省略；多节点时省略则按负载均分并行执行 |
 | `suites[].roles` | 无 | 三选一 | 多机 PD 分离用例（第 2 节） |
@@ -490,7 +501,7 @@ run:
 |---|---|---|
 | 出网手段 | 二选一：① `run.env` 配 `http_proxy`/`https_proxy`（推荐）；② 离线预置——evalscope 源码放执行机 `{workspace}/evalscope` **且** 配 `run.datasets` | 缺任一项都在 prepare 阶段报配置错误（退出码 `2`），并列出缺哪项 |
 | 执行机可达 GitHub | 首次自动 `git clone --depth 1` evalscope 到 `{workspace}/evalscope`；代理取 `run.env`（执行机 shell 里的代理变量不生效） | 用上面的离线方式：源码放进该目录（非空即跳过 clone） |
-| 节点模型缓存 | 与性能用例一致，模型权重需在 `~/.cache` | 运行时在线下载，慢且易失败 |
+| 节点模型缓存 | 与性能用例一致，权重需在容器可见（默认 `~/.cache`，其他路径配 `extra_mounts`） | 运行时在线下载，慢且易失败 |
 | 数据集 | gsm8k/gpqa 默认在线下载；离线节点提前下载后配 `run.datasets` 绝对路径 | 下载失败导致用例失败 |
 | 依赖 | 单机精度用例由 `pip_deps.txt` 在共享容器初始化时安装（含 sgl_eval、lmms-eval 等） | 镜像已含这些依赖可清空该文件；否则用例 import 报错 |
 
@@ -634,7 +645,7 @@ suites:
 仓已存在时流水线不动 git：自己 `git checkout <commit>` / `git remote set-url` + fetch 即可，换 fork 也一样。想让它 clone 指定版本：`run.code.ref` 填分支/tag/commit。
 
 **Q: `file` 能配 repo 外的自定义用例吗？**
-能，但文件必须在容器可见的挂载内。最简单：放到节点 `~/.cache/` 下，`file` 配绝对路径（如 `/root/.cache/my_tests/test_foo.py`）。其他路径容器内不可见。
+能，但文件必须在容器可见的挂载内。最简单：放到节点 `~/.cache/` 下，`file` 配绝对路径（如 `/root/.cache/my_tests/test_foo.py`）；放在其他目录则用 `extra_mounts` 把该目录挂进容器，再配容器内绝对路径。
 
 **Q: 需要登录的私有镜像？**
 节点上提前 `docker login`，缺镜像时流水线自动 pull。
