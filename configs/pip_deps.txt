@@ -26,20 +26,40 @@ echo "Source code path: ${sglang_source_path}"
 . "${sglang_source_path}/scripts/ci/utils/sgl_eval_ref.sh"
 pip install "$SGL_EVAL_SPEC"
 
-# ---- lmms-eval (源码安装 + 去掉 decord 依赖) ----
+# ---- lmms-eval (源码安装 + 去掉 decord 依赖, 只装包本体不装依赖) ----
 # clone 到 /tmp (容器内 = runs/{run_id}/tmp, 随 run 自动清理): 不能 clone 到当前目录,
 # /root/sglang 是执行机持久仓的软链, 落进去会污染仓且二次 run 时 clone 目标已存在必失败;
 # 全程绝对路径不 cd: clone 失败时后续行各自失败被逐条跳过, 不会误在别的目录执行
+# --no-deps 对齐 CI: lmms-eval 的依赖会把 numpy 钉回 1.26 (与镜像 numpy 2.x 编译的
+# 扩展不兼容, 报 C-API 0x12/0x11), 且会破坏 sgl-eval/modelscope 相关工作量
 git clone --branch v0.3.3 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
 sed -i "/decord; platform_system/d" /tmp/lmms-eval/pyproject.toml
-python3 -m pip install /tmp/lmms-eval > /tmp/lmms-eval/lmmslog.txt 2>&1 || { cat /tmp/lmms-eval/lmmslog.txt; false; }
-python3 -c "import lmms_eval"
+python3 -m pip install /tmp/lmms-eval --no-deps > /tmp/lmms-eval/lmmslog.txt 2>&1 || { cat /tmp/lmms-eval/lmmslog.txt; false; }
+python3 -c "import lmms_eval" || { echo "lmms_eval import check failed"; cat /tmp/lmms-eval/lmmslog.txt; false; }
 hf download MMMU/MMMU --repo-type dataset
 pip install opentelemetry-api opentelemetry-sdk opentelemetry-exporter-otlp opentelemetry-exporter-otlp-proto-grpc opentelemetry-exporter-otlp-proto-http
+
+# ---- datasets 自检 (对齐 CI): modelscope 依赖 from datasets import LargeList ----
+# 镜像内 datasets 缺符号时用 CI 指定版本覆盖; 复核仍失败则本条记 WARN, 不中断初始化
+python3 -c "from datasets import LargeList" 2>/dev/null || pip install --force-reinstall --no-deps "datasets==4.8.5"
+python3 -c "from datasets import LargeList"
+
+# ---- antlr4 版本自检 (对齐 CI): 只接受这几个版本, 其他版本会导致部分评测脚本解析失败 ----
+# 失败记 WARN; 不想保证某版本时可手动 pip install 对应版
+python3 -c "from importlib.metadata import version; v = version('antlr4-python3-runtime'); assert v in ('4.9.3', '4.11.0', '4.13.2'), 'antlr4-python3-runtime is ' + v"
+
+# ---- hellaswag 预载 (对齐 CI): accuracy-floor 类用例读 /tmp/hellaswag_val.jsonl ----
+# 容器 /tmp 是每次 run 独立挂载, 故每次初始化都会重新生成该文件; 数据集本体命中
+# ~/.cache/huggingface (已挂载), 第 2 次起只做转换不再下载。不需要可删掉本行
+python3 -c "import json; from datasets import load_dataset; ds = load_dataset('Rowan/hellaswag', split='validation'); f = open('/tmp/hellaswag_val.jsonl', 'w'); [f.write(json.dumps({**dict(r), 'label': int(r['label'])}) + '\n') for r in ds]; f.close(); print('preloaded hellaswag:', len(ds))"
 
 # ---- sglang_router ----
 apt-get install -y libssl-dev
 pip install sglang_router
+
+# /v1/responses 相关用例需要 (openai-harmony 不声明 openai 依赖, 不钉会沿用镜像版本);
+# 放最后: 前面的 sgl-eval/lmms-eval/router 安装可能改动 openai, 此处统一压回 (对齐 CI 主脚本)
+pip install "openai==2.8.0" "openai-harmony==0.0.4"
 
 # ---- numactl (流水线自带 aarch64 二进制: 本流水线仓 assets/numactl/) ----
 # 镜像缺 numactl/libnuma 时手动装 (apt 源不可用场景); 装到 /usr/local/bin 与
@@ -53,8 +73,5 @@ install -m 755 "$SGLANG_PIPELINE_ASSETS/numactl/numactl" /usr/local/bin/
 install -m 644 "$SGLANG_PIPELINE_ASSETS/numactl/libnuma.so.1" /usr/local/lib/
 ldconfig
 
-# ---- pyarrow/numpy 兼容 ----
-# pyarrow>=19 要求 numpy>=2.0, 但 lmms-eval v0.3.3 会把 numpy 钉回 1.26.4,
-# 导致 import datasets/pyarrow 报 "pyarrow requires NumPy 2.0 or newer, found 1.26.4"
-# 放末尾: 保证后续安装不再把 pyarrow 拉回 >=19, 最终统一降到 18.x (兼容 numpy 1.26)
-pip install "pyarrow<19"
+# 注: 不再需要 pyarrow<19 / ml_dtypes<0.5 之类降级补丁。它们是 lmms-eval 带依赖安装
+# 把 numpy 钉回 1.26 后的连锁补救; 改为 --no-deps 后 numpy 保持镜像自带版本, 无需迁就。
